@@ -3,6 +3,12 @@ name: Import Collector From Btc-bot
 on:
   workflow_dispatch:
 
+# Prevent two copies of this importer workflow
+# from modifying main at the same time.
+concurrency:
+  group: import-collector-main
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -11,15 +17,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Checkout destination repository
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # 1. CHECK OUT DESTINATION REPOSITORY
+      # ============================================================
       - name: Checkout destination repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      # ------------------------------------------------------------
-      # 2. Clone original Btc-bot repository
-      # ------------------------------------------------------------
+      # ============================================================
+      # 2. CLONE ORIGINAL BTC-BOT REPOSITORY
+      # ============================================================
       - name: Clone original Btc-bot repository
         run: |
           set -e
@@ -32,54 +41,53 @@ jobs:
 
           echo "Source repository cloned successfully."
 
-      # ------------------------------------------------------------
-      # 3. Replace destination with collector package
-      #
-      # IMPORTANT:
-      # Keep the nested package structure.
-      #
-      # Destination:
-      # collector/
-      # ├── run_collector.py
-      # ├── collector/
-      # ├── pipeline/
-      # ├── scripts/
-      # └── tests/
-      #
-      # This structure is required by the collector's imports.
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. REPLACE DESTINATION CONTENT WITH COLLECTOR
+      # ============================================================
       - name: Replace repository with collector package
         run: |
           set -e
 
           test -d /tmp/Btc-bot/collector
 
-          # Remove previous imported/generated content.
-          # Preserve Git metadata, workflow files, and .gitignore.
+          # Remove existing repository content while preserving:
+          # - .git
+          # - .github
+          # - .gitignore
           find . -mindepth 1 -maxdepth 1 \
             ! -name ".git" \
             ! -name ".github" \
             ! -name ".gitignore" \
             -exec rm -rf {} +
 
-          # Copy the collector directory exactly as a directory.
+          # IMPORTANT:
+          # Copy the entire collector directory.
+          # This preserves:
+          #
+          # btc-data-collector/
+          # └── collector/
+          #     ├── run_collector.py
+          #     ├── collector/
+          #     ├── pipeline/
+          #     ├── scripts/
+          #     └── tests/
           cp -a /tmp/Btc-bot/collector ./collector
 
-          # Keep the existing Telegram integration untouched.
+          # Keep telegram_bot.py because collector imports it.
           if [ -f /tmp/Btc-bot/telegram_bot.py ]; then
             cp -a /tmp/Btc-bot/telegram_bot.py ./telegram_bot.py
           fi
 
-          echo "Collector package imported."
+          echo "Collector package imported successfully."
 
-      # ------------------------------------------------------------
-      # 4. Verify package structure
-      # ------------------------------------------------------------
+      # ============================================================
+      # 4. VERIFY PACKAGE STRUCTURE
+      # ============================================================
       - name: Verify package structure
         run: |
           set -e
 
-          echo "Checking collector package..."
+          echo "Checking collector package structure..."
 
           # Top-level collector package
           test -f collector/__init__.py
@@ -91,7 +99,7 @@ jobs:
           test -f collector/pytest.ini
           test -f collector/requirements.txt
 
-          # Inner collector package
+          # Inner collector Python package
           test -d collector/collector
           test -f collector/collector/__init__.py
 
@@ -111,41 +119,40 @@ jobs:
           test -d collector/tests
           test -f collector/tests/__init__.py
 
-          # Telegram integration
+          # External Telegram dependency
           test -f telegram_bot.py
 
-          echo "Package structure OK."
+          echo "Package structure verification PASSED."
 
-      # ------------------------------------------------------------
-      # 5. Install dependencies
-      # ------------------------------------------------------------
+      # ============================================================
+      # 5. INSTALL DEPENDENCIES
+      # ============================================================
       - name: Install dependencies
         run: |
           set -e
 
           python -m pip install --upgrade pip
+
           pip install -r collector/requirements.txt
 
           echo "Dependencies installed successfully."
 
-      # ------------------------------------------------------------
-      # 6. Compile Python files
-      #
-      # This may generate __pycache__ and .pyc files.
-      # They will be removed later before git add.
-      # ------------------------------------------------------------
+      # ============================================================
+      # 6. COMPILE PYTHON
+      # ============================================================
       - name: Compile Python files
         run: |
           set -e
 
           python -m compileall -q collector
+
           python -m py_compile telegram_bot.py
 
-          echo "Python compilation OK."
+          echo "Python compilation PASSED."
 
-      # ------------------------------------------------------------
-      # 7. Test Python imports
-      # ------------------------------------------------------------
+      # ============================================================
+      # 7. TEST REQUIRED IMPORTS
+      # ============================================================
       - name: Test Python imports
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
@@ -163,11 +170,11 @@ jobs:
           python -c "import collector.scripts.verify_dataset"
           python -c "import telegram_bot"
 
-          echo "All required imports OK."
+          echo "All required imports PASSED."
 
-      # ------------------------------------------------------------
-      # 8. Run complete test suite
-      # ------------------------------------------------------------
+      # ============================================================
+      # 8. RUN COMPLETE TEST SUITE
+      # ============================================================
       - name: Run complete test suite
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
@@ -176,51 +183,60 @@ jobs:
 
           pytest -q collector/tests
 
-      # ------------------------------------------------------------
-      # 9. Remove generated files
-      #
-      # Tests and compilation can generate:
-      # - __pycache__
-      # - .pyc
-      # - .pyo
-      # - logs
-      # - pytest cache
-      # - accidental ZIP files
-      #
-      # These must NOT be committed.
-      # ------------------------------------------------------------
+          echo "Complete collector test suite PASSED."
+
+      # ============================================================
+      # 9. REMOVE GENERATED ARTIFACTS
+      # ============================================================
       - name: Remove generated files
         run: |
           set -e
 
           echo "Removing generated artifacts..."
 
-          # Python bytecode
+          # Python cache directories
           find . \
             -type d \
             -name "__pycache__" \
             -prune \
             -exec rm -rf {} +
 
+          # Python bytecode
           find . \
             -type f \
             \( -name "*.pyc" -o -name "*.pyo" \) \
             -delete
 
           # Logs
-          rm -rf logs
+          find . \
+            -type f \
+            -name "*.log" \
+            -delete
 
-          # Pytest cache
-          rm -rf .pytest_cache
+          find . \
+            -type d \
+            -name "logs" \
+            -prune \
+            -exec rm -rf {} +
 
-          # Accidental ZIP
-          rm -f btc-data-collector.zip
+          # Pytest cache directories
+          find . \
+            -type d \
+            -name ".pytest_cache" \
+            -prune \
+            -exec rm -rf {} +
+
+          # Accidental ZIP archives
+          find . \
+            -type f \
+            -name "*.zip" \
+            -delete
 
           echo "Generated artifacts removed."
 
-      # ------------------------------------------------------------
-      # 10. Verify generated artifacts are gone
-      # ------------------------------------------------------------
+      # ============================================================
+      # 10. VERIFY NO GENERATED ARTIFACTS REMAIN
+      # ============================================================
       - name: Verify repository is clean
         run: |
           set -e
@@ -249,36 +265,49 @@ jobs:
 
           if find . \
             -type f \
-            \( -name "*.log" \) \
+            -name "*.log" \
             -print -quit | grep -q .; then
 
-            echo "ERROR: log files still exist."
+            echo "ERROR: Log files still exist."
             find . -type f -name "*.log"
             exit 1
           fi
 
-          if [ -d "logs" ]; then
+          if find . \
+            -type d \
+            -name "logs" \
+            -print -quit | grep -q .; then
+
             echo "ERROR: logs directory still exists."
+            find . -type d -name "logs"
             exit 1
           fi
 
-          if [ -d ".pytest_cache" ]; then
+          if find . \
+            -type d \
+            -name ".pytest_cache" \
+            -print -quit | grep -q .; then
+
             echo "ERROR: .pytest_cache still exists."
+            find . -type d -name ".pytest_cache"
             exit 1
           fi
 
-          if [ -f "btc-data-collector.zip" ]; then
-            echo "ERROR: ZIP artifact still exists."
+          if find . \
+            -type f \
+            -name "*.zip" \
+            -print -quit | grep -q .; then
+
+            echo "ERROR: ZIP archive still exists."
+            find . -type f -name "*.zip"
             exit 1
           fi
 
-          echo "Repository generated-artifact check PASSED."
+          echo "Generated-artifact verification PASSED."
 
-      # ------------------------------------------------------------
-      # 11. Create/update .gitignore
-      #
-      # This protects the repository from future generated files.
-      # ------------------------------------------------------------
+      # ============================================================
+      # 11. CREATE / UPDATE .gitignore
+      # ============================================================
       - name: Create .gitignore
         run: |
           set -e
@@ -301,7 +330,7 @@ jobs:
           venv/
           env/
 
-          # IDE/editor files
+          # IDE / editor files
           .vscode/
           .idea/
 
@@ -312,41 +341,68 @@ jobs:
 
           echo ".gitignore created/updated."
 
-      # ------------------------------------------------------------
-      # 12. Final source/package verification
-      # ------------------------------------------------------------
+      # ============================================================
+      # 12. FINAL STRUCTURE VERIFICATION
+      # ============================================================
       - name: Verify final repository
         run: |
           set -e
 
-          echo "Performing final verification..."
+          echo "Performing final repository verification..."
 
           test -f .gitignore
 
+          # Top-level collector package
           test -f collector/__init__.py
           test -f collector/run_collector.py
-          test -f collector/collector/__init__.py
-          test -f collector/collector/utils.py
-          test -f collector/collector/config.py
-          test -f collector/pipeline/__init__.py
-          test -f collector/scripts/__init__.py
-          test -f collector/tests/__init__.py
           test -f collector/requirements.txt
           test -f collector/pytest.ini
 
+          # Inner collector package
+          test -f collector/collector/__init__.py
+          test -f collector/collector/utils.py
+          test -f collector/collector/config.py
+
+          # Other packages
+          test -f collector/pipeline/__init__.py
+          test -f collector/scripts/__init__.py
+          test -f collector/tests/__init__.py
+
+          # Telegram dependency
           test -f telegram_bot.py
 
-          echo "Final repository verification OK."
+          echo "Final repository verification PASSED."
 
-      # ------------------------------------------------------------
-      # 13. Commit only actual repository changes
-      # ------------------------------------------------------------
+      # ============================================================
+      # 13. SYNCHRONIZE WITH LATEST REMOTE MAIN
+      # ============================================================
+      - name: Synchronize with latest remote main
+        run: |
+          set -e
+
+          echo "Fetching latest origin/main..."
+
+          git fetch origin main
+
+          echo "Rebasing onto latest origin/main..."
+
+          # The collector cleanup changes are currently uncommitted.
+          # --autostash temporarily stores them while Git rebases.
+          git pull --rebase --autostash origin main
+
+          echo "Remote synchronization PASSED."
+
+      # ============================================================
+      # 14. STAGE AND COMMIT CHANGES
+      # ============================================================
       - name: Commit corrected collector
         run: |
           set -e
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@github.com"
+
+          echo "Staging final repository..."
 
           git add -A
 
@@ -359,6 +415,18 @@ jobs:
           git diff --cached --name-status
 
           git commit -m "Clean generated collector artifacts"
-          git push
+
+          echo "Commit created successfully."
+
+      # ============================================================
+      # 15. PUSH TO MAIN
+      # ============================================================
+      - name: Push corrected collector
+        run: |
+          set -e
+
+          echo "Pushing synchronized main branch..."
+
+          git push origin HEAD:main
 
           echo "Changes committed and pushed successfully."
