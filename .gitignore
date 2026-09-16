@@ -15,7 +15,7 @@ logs/
 venv/
 env/
 
-# IDE/editor files
+# IDE / editor files
 .vscode/
 .idea/
 
