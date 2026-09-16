@@ -25,27 +25,21 @@ jobs:
 
           test -d /tmp/Btc-bot/collector
 
-          # Remove the previous flattened collector.
           find . -mindepth 1 -maxdepth 1 \
             ! -name ".git" \
             ! -name ".github" \
             -exec rm -rf {} +
 
-          # Import the COMPLETE collector directory.
           cp -a /tmp/Btc-bot/collector ./collector
 
       - name: Verify package structure
         run: |
           set -e
 
-          echo "Checking collector package..."
-
           test -f collector/__init__.py
           test -f collector/run_collector.py
 
-          test -d collector/collector
           test -f collector/collector/__init__.py
-
           test -d collector/collector/adapters
           test -f collector/collector/adapters/__init__.py
 
@@ -64,20 +58,17 @@ jobs:
           echo "Package structure OK."
 
       - name: Install dependencies
-        working-directory: collector
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r collector/requirements.txt
 
       - name: Compile Python files
-        working-directory: collector
         run: |
           set -e
-          python -m compileall -q .
+          python -m compileall -q collector
 
       - name: Test Python imports
-        working-directory: collector
         run: |
           set -e
 
@@ -92,12 +83,12 @@ jobs:
           echo "Python imports OK."
 
       - name: Run complete test suite
-        working-directory: collector
         run: |
           set -e
+          cd collector
           pytest -q
 
-      - name: Remove accidental ZIP if present
+      - name: Remove accidental ZIP
         run: |
           set -e
           rm -f btc-data-collector.zip
