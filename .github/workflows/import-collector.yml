@@ -24,6 +24,7 @@ jobs:
           set -e
 
           test -d /tmp/Btc-bot/collector
+          test -f /tmp/Btc-bot/telegram_bot.py
 
           find . -mindepth 1 -maxdepth 1 \
             ! -name ".git" \
@@ -31,15 +32,20 @@ jobs:
             -exec rm -rf {} +
 
           cp -a /tmp/Btc-bot/collector ./collector
+          cp -a /tmp/Btc-bot/telegram_bot.py ./telegram_bot.py
 
       - name: Verify package structure
         run: |
           set -e
 
+          echo "Checking collector package..."
+
           test -f collector/__init__.py
           test -f collector/run_collector.py
 
+          test -d collector/collector
           test -f collector/collector/__init__.py
+
           test -d collector/collector/adapters
           test -f collector/collector/adapters/__init__.py
 
@@ -55,22 +61,33 @@ jobs:
           test -f collector/requirements.txt
           test -f collector/pytest.ini
 
+          test -f telegram_bot.py
+
           echo "Package structure OK."
 
       - name: Install dependencies
         run: |
           set -e
+
           python -m pip install --upgrade pip
           pip install -r collector/requirements.txt
 
       - name: Compile Python files
         run: |
           set -e
+
           python -m compileall -q collector
+          python -m py_compile telegram_bot.py
+
+          echo "Python compilation OK."
 
       - name: Test Python imports
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
         run: |
           set -e
+
+          echo "Testing collector imports..."
 
           python -c "import collector"
           python -c "import collector.collector"
@@ -79,19 +96,33 @@ jobs:
           python -c "import collector.collector.adapters.binance"
           python -c "import collector.pipeline.dataset_assembler"
           python -c "import collector.scripts.verify_dataset"
+          python -c "import telegram_bot"
 
-          echo "Python imports OK."
+          echo "All required imports OK."
 
       - name: Run complete test suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
         run: |
           set -e
-          cd collector
-          pytest -q
+
+          pytest -q collector/tests
 
       - name: Remove accidental ZIP
         run: |
           set -e
           rm -f btc-data-collector.zip
+
+      - name: Verify final repository
+        run: |
+          set -e
+
+          test -f collector/run_collector.py
+          test -f collector/collector/utils.py
+          test -f collector/collector/config.py
+          test -f telegram_bot.py
+
+          echo "Final repository verification OK."
 
       - name: Commit corrected collector
         run: |
@@ -107,5 +138,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Fix collector package structure and verify tests"
+          git commit -m "Fix collector package structure and dependencies"
           git push
