@@ -1,0 +1,86 @@
+import asyncio
+import json
+import time
+import websockets
+from typing import Callable, Awaitable, Optional
+from .utils import logger
+
+class WebSocketClient:
+    def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None, stream_group: str = "websocket"):
+        self.url = url
+        self.stream_group = stream_group
+        self.on_message = on_message
+        self.on_reconnect = on_reconnect
+        self.on_quality_event = on_quality_event
+        self.running = False
+        self.connected = False
+        self.retry_delay = 1.0
+        self.attempt = 0
+        self.connection_id = None
+        self._connection_serial = 0
+
+    async def start(self):
+        self.running = True
+        logger.info("Starting WebSocket client", url=self.url)
+
+        while self.running:
+            try:
+                connection = websockets.connect(self.url)
+                if hasattr(connection, "__await__"):
+                    connection = await connection
+
+                async with connection as ws:
+                    self.connected = True
+                    self._connection_serial += 1
+                    self.connection_id = f"{self.stream_group}-{self._connection_serial}"
+                    self.retry_delay = 1.0
+                    self.attempt = 0
+                    logger.info("WebSocket connected")
+
+                    if self.on_quality_event:
+                        self.on_quality_event("CONNECT", "websocket_connected", self.connection_id, self.stream_group)
+
+                    if self.on_reconnect:
+                        self.on_reconnect()
+
+                    async for msg in ws:
+                        if not self.running:
+                            break
+                        try:
+                            # Capture arrival time before decoding so downstream
+                            # research can distinguish network arrival from work
+                            # performed after JSON parsing.
+                            local_receive_ts = int(time.time() * 1000)
+                            data = json.loads(msg)
+                            await self.on_message(data, local_receive_ts)
+                        except json.JSONDecodeError:
+                            logger.error("Failed to parse JSON from WebSocket", msg=msg)
+
+            except websockets.ConnectionClosed as e:
+                self.connected = False
+                logger.warning("WebSocket connection closed", error=str(e))
+                if self.on_quality_event:
+                    self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
+            except Exception as e:
+                self.connected = False
+                logger.error("WebSocket error", error=str(e))
+                if self.on_quality_event:
+                    self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
+
+            if self.running:
+                self.attempt += 1
+                logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=self.retry_delay)
+                await asyncio.sleep(self.retry_delay)
+                self.retry_delay = min(self.retry_delay * 2, 60.0)
+
+    async def wait_connected(self, timeout_seconds: float = 30.0) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        while asyncio.get_event_loop().time() < deadline:
+            if self.connected:
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    def stop(self):
+        self.running = False
+        self.connected = False
