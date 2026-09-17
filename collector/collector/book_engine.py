@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from threading import RLock
 from .canonical import CanonicalOrderBookEvent
-from .quality_events import BookQuality, BookQualityStateMachine
+from .quality_events import BookQuality, BookQualityStateMachine, QualityEvent, QualityEventType
 from .sequence import BinanceSequenceComparator, BybitSequenceComparator, OKXSequenceComparator, binance_snapshot_bridge
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ class LocalBook:
         self.venue=venue; self.bids={}; self.asks={}; self.previous=None; self.buffer=[]; self.max_buffer_events=max_buffer_events
         self.buffer_overflow_count=0; self.buffer_overflowed=False; self.state=BookQualityStateMachine()
         self.last_reason=""; self.duplicate_count=0; self.last_transition=None; self.recovery_generation=0
-        self.committed_recovery_events=[]
+        self.committed_recovery_events=[]; self.quality_events=[]
         self._lock=RLock()
         self.comparator={"BINANCE":BinanceSequenceComparator(),"BYBIT":BybitSequenceComparator(),"OKX":OKXSequenceComparator()}[venue]
 
@@ -59,9 +59,9 @@ class LocalBook:
     def _buffer_event(self, event):
         """Buffer only causally usable post-overflow events.
 
-        Once capacity is exhausted the old chain is irrecoverable.  The event
-        that triggered overflow is therefore discarded, and the book remains
-        untrusted until a fresh REST snapshot bridges a new post-overflow chain.
+        Once capacity is exhausted the old chain is irrecoverable. The event
+        that triggered overflow is discarded, and the book remains untrusted
+        until a fresh REST snapshot bridges a new post-overflow chain.
         """
         if self.buffer_overflowed:
             if len(self.buffer) < self.max_buffer_events:
@@ -71,6 +71,7 @@ class LocalBook:
             self.buffer.clear(); self.buffer_overflow_count += 1; self.buffer_overflowed=True
             old=self.state.state; self.state.gap(); self.last_reason="buffer_overflow"
             self.last_transition=BookTransition(old,self.state.state,event,self.last_reason,getattr(self.previous,"update_id",None))
+            self.quality_events.append(QualityEvent(exchange=self.venue, stream="orderbook", event_type=QualityEventType.DATA_DROP, reason="buffer_overflow", rows_lost=self.max_buffer_events, quality_state=self.state.state.value))
             return False
         self.buffer.append(event)
         return True
@@ -116,6 +117,9 @@ class LocalBook:
             self.buffer=[]; self.buffer_overflowed=False; self.state.recovered(); self.recovery_generation = generation; self.duplicate_count += candidate_duplicates; self.committed_recovery_events=committed; self.last_reason=""
             self.last_transition=BookTransition(BookQuality.RECOVERING,BookQuality.VALID,previous)
             return True
+
+    def drain_quality_events(self):
+        events=self.quality_events; self.quality_events=[]; return events
 
     def invalidate(self, reason="reconnect"):
         with self._lock:
