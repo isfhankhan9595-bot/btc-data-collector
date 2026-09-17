@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 from collector import run_collector as _run_collector
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent
@@ -10,7 +12,7 @@ CollectorApp = _run_collector.CollectorApp
 
 def _app_for_quality_test():
     app = CollectorApp.__new__(CollectorApp)
-    app.quality_writer = __import__("unittest").mock.MagicMock()
+    app.quality_writer = MagicMock()
     app.binance_book = LocalBook("BINANCE", max_buffer_events=2)
     app.validator = Validator()
     return app
