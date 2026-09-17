@@ -71,7 +71,7 @@ class LocalBook:
             self.buffer.clear(); self.buffer_overflow_count += 1; self.buffer_overflowed=True
             old=self.state.state; self.state.gap(); self.last_reason="buffer_overflow"
             self.last_transition=BookTransition(old,self.state.state,event,self.last_reason,getattr(self.previous,"update_id",None))
-            self.quality_events.append(QualityEvent(exchange=self.venue, stream="orderbook", event_type=QualityEventType.DATA_DROP, reason="buffer_overflow", rows_lost=self.max_buffer_events, quality_state=self.state.state.value))
+            self.quality_events.append(QualityEvent(exchange=self.venue, stream="orderbook", event_type=QualityEventType.BUFFER_OVERFLOW, reason="buffer_overflow", rows_lost=self.max_buffer_events, quality_state=self.state.state.value))
             return False
         self.buffer.append(event)
         return True
@@ -85,8 +85,7 @@ class LocalBook:
     def binance_snapshot(self,last_update_id,event):
         """Prove a snapshot plus ordered buffered chain before atomically committing it."""
         with self._lock:
-            original=list(self.buffer)
-            candidates=[]
+            original=list(self.buffer); candidates=[]
             for diff in original:
                 if not isinstance(diff.update_id, int) or not isinstance(diff.first_update_id, int):
                     self.buffer=original; self.last_reason="malformed_update_ids"; return False
@@ -100,8 +99,7 @@ class LocalBook:
             if maps is None:
                 self.buffer=original; self.last_reason="invalid_snapshot"; self.state.gap(); return False
             candidate_bids, candidate_asks=maps; previous=None; candidate_duplicates=0
-            generation=self.recovery_generation + 1
-            committed=[]
+            generation=self.recovery_generation + 1; committed=[]
             for index, diff in enumerate(candidates):
                 if index:
                     result=self.comparator.check(diff,previous)
