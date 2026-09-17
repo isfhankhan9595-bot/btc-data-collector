@@ -36,7 +36,6 @@ Documentation is never a substitute for implementation.
 
 | # | Defect | Phase |
 |---|---|---|
-| D9 | `scripts/replay_test.py` is not a replay engine. It loads a derived Parquet file and asserts bounds on columns. There is no recorded-clock replay, no raw event source, no determinism check. | 8 |
 | D10 | No raw wire capture layer. `binance_orderbook_raw` stores normalised levels, not exact payloads; there is no connection id, no REST request/response lineage. Deterministic replay is not currently possible from stored data. | 6 |
 | D11 | OKX adapter declares `trades`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders` in `channel_event_types` but `normalize()` only implements `books`. Everything else silently returns `[]`. | 14 |
 | D12 | Bybit adapter merges ticker deltas into shared `_ticker_state` and emits merged values without marking which fields were carried forward. Staleness is not observable. | 13 |
@@ -154,7 +153,47 @@ every subsequent phase meaningless.
   REST snapshot body were written to parquet and read back; the snapshot's
   `lastUpdateId` round-trips off disk, which is the property replay needs.
 
-### Phases 3+ — NOT STARTED
+### Phase 3 — Deterministic replay and live/replay parity — **COMPLETE**
+
+- **Branch:** `phase-03-deterministic-replay` (base: `phase-02-raw-wire-capture`, **stacked** — Phase 2 is unmerged)
+- **Objective:** replace the fake replay with a real one. Closes **D9**.
+  Also closes **D17**, a false-VALID found while building it.
+- **Changes:**
+  - New `collector/collector/replay.py`. Recorded websocket frames and
+    recorded REST snapshot responses merge into one time-ordered stream;
+    a frame is available at `local_receive_ts`, a snapshot at
+    `response_receive_ts`, so a snapshot can never bridge a gap that
+    predates its arrival. Total ordering key `(timestamp, kind_rank,
+    source_index)` makes ties independent of filesystem order.
+  - Replay drives `BinanceAdapter` and `LocalBook` — **the same objects as
+    live**. There is no replay-only reconstruction path.
+  - `ReplayResult.digest` covers book states *and* quality transitions, so
+    the same prices reached via a different quality path do not compare equal.
+  - New `collector/scripts/replay.py` CLI with `--verify-determinism`.
+  - **Deleted `collector/scripts/replay_test.py`** — it loaded a derived
+    Parquet file and asserted column bounds. No clock, no raw source, no
+    reconstruction; it could not have caught a reconstruction bug.
+- **Tests:** `tests/test_replay.py` (23).
+- **Suite:** 335 passed, 0 failed.
+- **Live verification:** replayed recorded segments from disk —
+  `snapshots_applied=1`, `final_state=VALID`, `deterministic=True`, and the
+  recorded corrupt frame surfaced as `frames_undecodable=1`.
+
+#### D17 — false VALID on an unbridged book (found in Phase 3)
+
+`BookQualityStateMachine` initialised to `VALID`. A `LocalBook` that had
+never been bridged by a snapshot therefore reported `VALID`, and that value
+was written into quality events and raw records via
+`self.binance_book.state.state.value`. This violates master acceptance
+invariant #2 ("No false VALID state").
+
+Fixed: the initial state is now `RECOVERING` — awaiting a bridge. Two
+existing tests depended on the old behaviour; both fed diff-depth messages
+to an unbridged book and expected them applied, which is the bug itself.
+They now establish a snapshot bridge first, and a regression test pins that
+an unbridged book never reports `VALID` and buffers rather than applies.
+
+### Phases 4+ — NOT STARTED
 
 Remaining scope is tracked in the defect table above (D9–D14), plus D16 below.
 
