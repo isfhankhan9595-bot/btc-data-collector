@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from types import SimpleNamespace
@@ -217,10 +218,19 @@ async def test_poll_openinterest_writes_valid_rest_response(monkeypatch):
     app.running = True
     app.stream_counters["openinterest"] = {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0}
     app.oi_writer = MagicMock()
+    captured = []
+    app._capture_rest = captured.append
+    body = json.dumps({"openInterest": "2.5", "time": str(int(time.time() * 1000)), "price": "100.0"})
     class FakeResponse:
+        # Models the aiohttp response surface the collector actually uses:
+        # status and text() are required so the REST body can be captured
+        # verbatim for replay, not just parsed and discarded.
+        status = 200
         async def __aenter__(self): return self
         async def __aexit__(self, exc_type, exc, tb): return False
-        async def json(self): return {"openInterest": "2.5", "time": str(int(time.time() * 1000)), "price": "100.0"}
+        async def text(self): return body
+        async def json(self): return json.loads(body)
+        def raise_for_status(self): return None
     class FakeSession:
         def __init__(self, *args, **kwargs): pass
         async def __aenter__(self): return self
@@ -237,6 +247,15 @@ async def test_poll_openinterest_writes_valid_rest_response(monkeypatch):
     app.oi_writer.write.assert_called_once()
     app.health_monitor.record_message.assert_any_call("openinterest", ANY)
     assert app.stream_counters["openinterest"]["written"] == 1
+    # REST lineage must be captured verbatim, with request and response
+    # timestamps kept distinct from the exchange observation time.
+    assert captured, "OI poll must record REST lineage"
+    record = captured[-1]
+    assert record.purpose == "open_interest"
+    assert record.ok is True
+    assert record.http_status == 200
+    assert record.payload == body
+    assert record.request_ts <= record.response_receive_ts
 
 
 @pytest.mark.asyncio

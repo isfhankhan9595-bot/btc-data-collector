@@ -1,13 +1,16 @@
 from __future__ import annotations
 import time
 from typing import Optional
-from .base import ExchangeAdapter
+from .base import ExchangeAdapter, UnhandledReason
 from ..canonical import CanonicalLiquidationEvent, CanonicalMarkPriceEvent, CanonicalOIEvent, CanonicalOrderBookEvent, CanonicalTradeEvent, OISource
 from ..sequence import BybitSequenceComparator
 class BybitAdapter(ExchangeAdapter):
+    venue="BYBIT"
     channel_event_types={"orderbook.{depth}.BTCUSDT":("CanonicalOrderBookEvent",),"publicTrade.BTCUSDT":("CanonicalTradeEvent",),"tickers.BTCUSDT":("CanonicalMarkPriceEvent","CanonicalOIEvent"),"allLiquidation.BTCUSDT":("CanonicalLiquidationEvent",)}
     sequence_comparator=BybitSequenceComparator()
-    def __init__(self): self._ticker_state = {}
+    def __init__(self):
+        super().__init__()
+        self._ticker_state = {}
     def connect(self): return None
     def subscribe_message(self,streams): return {"op":"subscribe","args":list(streams)}
     def route_message(self,raw):
@@ -23,4 +26,6 @@ class BybitAdapter(ExchangeAdapter):
             if d.get("openInterest") is not None: events.append(CanonicalOIEvent("BYBIT","openinterest",ts,None,now,open_interest=float(d["openInterest"]),source=OISource.WS_PUSH))
             return events
         if route=="liquidation": return [CanonicalLiquidationEvent("BYBIT","liquidation",x.get("T",ts),None,now,side=x.get("S"),price=float(x["p"]),quantity=float(x["v"])) for x in d]
-        return []
+        if raw.get("op") or raw.get("success") is not None:
+            return self.unhandled(UnhandledReason.CONTROL_FRAME, raw, local_receive_ts=now)
+        return self.unhandled(UnhandledReason.NO_ROUTE, raw, channel=raw.get("topic"), local_receive_ts=now)
