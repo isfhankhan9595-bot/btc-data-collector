@@ -29,13 +29,9 @@ STREAM_SCHEMAS: dict[str, pa.Schema] = {
 }
 ALL_STREAMS = tuple(STREAM_SCHEMAS.keys())
 TIMESTAMP_TYPE = pa.timestamp("ms", tz="UTC")
-DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-\d{2}(?:-\d{6}\.seg|\.parquet)$")
 DEFAULT_GUARD_SECONDS = 90
 class CompactionError(RuntimeError):
-    """Raised when a daily compaction input fails validation.
-    Args:
-        RuntimeError: Base exception type for compaction validation failures.
-    """
+    """Raised when a daily compaction input fails validation."""
 @dataclass(frozen=True)
 class _HourSource:
     path: Path
@@ -63,16 +59,7 @@ def compact_daily(
     force: bool = False,
     guard_seconds: int = DEFAULT_GUARD_SECONDS,
 ) -> bool:
-    """Compact one stream/date pair into a daily Parquet file.
-    Args:
-        date: Date to compact in YYYY-MM-DD form.
-        stream: Stream name to compact.
-        data_dir: Root data directory containing raw/ and daily/.
-        force: Whether to overwrite an existing daily file.
-        guard_seconds: File modification-time guard window in seconds.
-    Returns:
-        True when compaction wrote a file or safely skipped; False on no sources.
-    """
+    """Compact one stream/date pair into a daily Parquet file."""
     data_root = Path(data_dir)
     schema = _schema_for_stream(stream)
     raw_dir = data_root / "raw" / stream
@@ -87,7 +74,7 @@ def compact_daily(
         _remove_stale_tmp(meta_path, stream, date)
         for hourly_tmp_path in list(raw_dir.glob(f"{date}-*.parquet.tmp")) + list(raw_dir.glob(f"{date}-*.seg.tmp")):
             _remove_stale_tmp(hourly_tmp_path.with_suffix(""), stream, date)
-    discovered = _discover_hourly_files(raw_dir, date, guard_seconds=guard_seconds)
+    discovered = _discover_hourly_files(data_root, raw_dir, date, guard_seconds=guard_seconds)
     if not discovered.present_files:
         logger.warning("compact_daily_no_sources", stream=stream, date=date)
         return False
@@ -98,52 +85,19 @@ def compact_daily(
     out_dir.mkdir(parents=True, exist_ok=True)
     _stream_write_parquet(sources, final_path, schema)
     if discovered.skipped_hours:
-        logger.warning(
-            "compact_daily_skipped_hours_present",
-            stream=stream,
-            date=date,
-            skipped_hours=discovered.skipped_hours,
-            message=(
-                "Hourly files were skipped during compaction. "
-                "Skipped data is recoverable from raw hourly files. "
-                "Re-run with --force after resolving stale .tmp files to include skipped hours."
-            ),
-        )
+        logger.warning("compact_daily_skipped_hours_present", stream=stream, date=date, skipped_hours=discovered.skipped_hours,
+                       message="Hourly files were skipped during compaction.")
     stats = _verify_parquet_output(final_path, schema, expected_rows)
-    metadata = _build_metadata(
-        stats=stats,
-        stream=stream,
-        date=date,
-        source_files=[source.path for source in sources],
-        missing_hours=discovered.missing_hours,
-        skipped_hours=discovered.skipped_hours,
-    )
-    if (
-        stream == "liquidation"
-        and metadata["coverage_hours"] is not None
-        and metadata["coverage_hours"] < 23.75
-    ):
-        logger.warning(
-            "compact_daily_low_liquidation_coverage",
-            date=date,
-            coverage_hours=metadata["coverage_hours"],
-        )
+    metadata = _build_metadata(stats=stats, stream=stream, date=date,
+                               source_files=[source.path for source in sources],
+                               missing_hours=discovered.missing_hours,
+                               skipped_hours=discovered.skipped_hours)
+    if stream == "liquidation" and metadata["coverage_hours"] is not None and metadata["coverage_hours"] < 23.75:
+        logger.warning("compact_daily_low_liquidation_coverage", date=date, coverage_hours=metadata["coverage_hours"])
     _write_json_atomic(metadata, meta_path)
     logger.info("compact_daily", stream=stream, date=date, rows=stats.rows)
     return True
-def verify_daily(
-    date: str,
-    stream: str,
-    data_dir: Path | str = Path("data"),
-) -> bool:
-    """Verify one compacted daily Parquet file and its metadata sidecar.
-    Args:
-        date: Date to verify in YYYY-MM-DD form.
-        stream: Stream name to verify.
-        data_dir: Root data directory containing daily/.
-    Returns:
-        True when the compacted output and metadata are consistent.
-    """
+def verify_daily(date: str, stream: str, data_dir: Path | str = Path("data")) -> bool:
     schema = _schema_for_stream(stream)
     final_path = Path(data_dir) / "daily" / stream / f"{date}_{stream}.parquet"
     meta_path = final_path.parent / f"{date}_{stream}.meta.json"
@@ -162,24 +116,14 @@ def verify_daily(
     if not isinstance(metadata.get("source_hourly_files"), list):
         raise CompactionError("source_hourly_files must be a list")
     missing_hours = metadata.get("missing_hours")
-    if not isinstance(missing_hours, list):
-        raise CompactionError("missing_hours must be a list")
-    if not all(isinstance(hour, int) for hour in missing_hours):
+    if not isinstance(missing_hours, list) or not all(isinstance(hour, int) for hour in missing_hours):
         raise CompactionError("missing_hours must be a list of ints")
     skipped_hours = metadata.get("skipped_hours")
-    if not isinstance(skipped_hours, list):
-        raise CompactionError("skipped_hours must be a list")
-    if not all(isinstance(hour, int) for hour in skipped_hours):
+    if not isinstance(skipped_hours, list) or not all(isinstance(hour, int) for hour in skipped_hours):
         raise CompactionError("skipped_hours must be a list of ints")
     logger.info("compact_daily_verify", stream=stream, date=date, rows=stats.rows)
     return True
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the daily compaction command-line interface.
-    Args:
-        argv: Optional argument vector. Uses sys.argv when omitted.
-    Returns:
-        Process exit code: 0 on success, 1 if any compaction or verification failed.
-    """
     args = _parse_args(argv)
     streams = list(args.streams or ALL_STREAMS)
     data_dir = Path(args.data_dir)
@@ -221,7 +165,7 @@ def _schema_for_stream(stream: str) -> pa.Schema:
         raise ValueError(f"unknown stream: {stream}") from exc
 def _parse_date(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
-def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _DiscoveredFiles:
+def _discover_hourly_files(data_root: Path, raw_dir: Path, date: str, *, guard_seconds: int) -> _DiscoveredFiles:
     present: list[Path] = []
     missing: list[int] = []
     skipped: list[int] = []
@@ -229,7 +173,7 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
     current_date = now.strftime("%Y-%m-%d")
     current_hour = now.hour
     for hour in range(24):
-        paths = list(iter_segments(raw_dir.parent.parent, raw_dir.name, date=date, hour=hour))
+        paths = list(iter_segments(data_root, raw_dir.name, date=date, hour=hour, on_collision="prefer_segments"))
         tmp_paths = list(raw_dir.glob(f"{date}-{hour:02d}-*.seg.tmp")) + list(raw_dir.glob(f"{date}-{hour:02d}.parquet.tmp"))
         if any(path.exists() for path in tmp_paths):
             is_current_hour = date == current_date and hour == current_hour
@@ -238,16 +182,8 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
                 skipped.append(hour)
                 continue
             if paths:
-                logger.warning(
-                    "compact_daily_stale_tmp_ignored",
-                    stream=raw_dir.name,
-                    date=date,
-                    hour=hour,
-                    message=(
-                        "Stale .tmp found alongside .parquet for historical hour; "
-                        "ignoring .tmp and compacting."
-                    ),
-                )
+                logger.warning("compact_daily_stale_tmp_ignored", stream=raw_dir.name, date=date, hour=hour,
+                               message="Stale .tmp found alongside published raw data; ignoring .tmp.")
         if not paths:
             logger.warning("compact_daily_missing_hour", stream=raw_dir.name, date=date, hour=hour)
             missing.append(hour)
@@ -256,14 +192,8 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
         if is_current_hour:
             age_seconds = min(datetime.now(UTC).timestamp() - path.stat().st_mtime for path in paths)
             if age_seconds < guard_seconds:
-                logger.warning(
-                    "compact_daily_skip_current_hour",
-                    stream=raw_dir.name,
-                    date=date,
-                    hour=hour,
-                    age_seconds=age_seconds,
-                    guard_seconds=guard_seconds,
-                )
+                logger.warning("compact_daily_skip_current_hour", stream=raw_dir.name, date=date, hour=hour,
+                               age_seconds=age_seconds, guard_seconds=guard_seconds)
                 skipped.append(hour)
                 continue
         present.extend(paths)
@@ -274,7 +204,7 @@ def _discover_all_dates(data_dir: Path, streams: Sequence[str]) -> set[str]:
         raw_dir = data_dir / "raw" / stream
         if not raw_dir.exists():
             continue
-        for path in iter_segments(data_dir, stream):
+        for path in iter_segments(data_dir, stream, on_collision="prefer_segments"):
             parsed = parse_segment_name(path)
             if parsed:
                 dates.add(parsed[0])
@@ -295,11 +225,7 @@ def _inspect_sources(paths: Sequence[Path], stream: str, schema: pa.Schema) -> l
 def _read_hourly_table(path: Path, schema: pa.Schema) -> pa.Table:
     table = pq.read_table(path)
     if table.schema.field("timestamp").type != TIMESTAMP_TYPE:
-        table = table.set_column(
-            table.schema.get_field_index("timestamp"),
-            "timestamp",
-            table.column("timestamp").cast(TIMESTAMP_TYPE),
-        )
+        table = table.set_column(table.schema.get_field_index("timestamp"), "timestamp", table.column("timestamp").cast(TIMESTAMP_TYPE))
     return _align_to_schema(table, schema)
 def _align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     arrays = []
@@ -416,15 +342,9 @@ def _validate_schema_compatible(actual: pa.Schema, expected: pa.Schema) -> None:
         raise CompactionError("daily parquet schema field count does not match expected stream schema")
     for index, (actual_field, expected_field) in enumerate(zip(actual, expected, strict=True)):
         if actual_field.name != expected_field.name:
-            raise CompactionError(
-                f"daily parquet schema field {index} name mismatch: "
-                f"{actual_field.name} != {expected_field.name}"
-            )
+            raise CompactionError(f"daily parquet schema field {index} name mismatch: {actual_field.name} != {expected_field.name}")
         if actual_field.type != expected_field.type:
-            raise CompactionError(
-                f"daily parquet schema field {actual_field.name} type mismatch: "
-                f"{actual_field.type} != {expected_field.type}"
-            )
+            raise CompactionError(f"daily parquet schema field {actual_field.name} type mismatch: {actual_field.type} != {expected_field.type}")
 def _timestamp_range_from_metadata(parquet_file: pq.ParquetFile, schema: pa.Schema) -> tuple[int | None, int | None]:
     metadata = parquet_file.metadata
     start_ts: int | None = None
@@ -450,7 +370,6 @@ def _timestamp_range_from_metadata(parquet_file: pq.ParquetFile, schema: pa.Sche
 def _timestamp_stat_to_ms(value: Any) -> int | None:
     if value is None:
         return None
-    # PyArrow scalar — unwrap to Python first.
     if hasattr(value, "as_py"):
         value = value.as_py()
         if value is None:
@@ -459,32 +378,21 @@ def _timestamp_stat_to_ms(value: Any) -> int | None:
         return int(value.timestamp() * 1000)
     try:
         import pandas as pd
-
         if isinstance(value, pd.Timestamp):
             return int(value.timestamp() * 1000)
     except Exception:
         pass
     try:
         import numpy as np
-
         if isinstance(value, np.datetime64):
             return int(value.astype("datetime64[ms]").astype("int64"))
     except Exception:
         pass
     return int(value)
-def _build_metadata(
-    *,
-    stats: _OutputStats,
-    stream: str,
-    date: str,
-    source_files: Sequence[Path],
-    missing_hours: Sequence[int],
-    skipped_hours: Sequence[int],
-) -> dict[str, Any]:
+def _build_metadata(*, stats: _OutputStats, stream: str, date: str, source_files: Sequence[Path], missing_hours: Sequence[int], skipped_hours: Sequence[int]) -> dict[str, Any]:
     coverage_hours = None
     if stats.start_timestamp_ms is not None and stats.end_timestamp_ms is not None:
         coverage_hours = (stats.end_timestamp_ms - stats.start_timestamp_ms) / 3600000.0
-
     return {
         "date": date,
         "stream": stream,
