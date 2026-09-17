@@ -7,9 +7,9 @@ from collector.collector.storage_layout import iter_segments
 
 
 def _read_stream(data_dir: str, stream: str, date_str: str) -> list[pd.DataFrame]:
-    """Read all published raw segments for one stream/date (legacy included)."""
+    """Read one unambiguous representation for each raw logical hour."""
     frames = []
-    for path in iter_segments(data_dir, stream, date=date_str):
+    for path in iter_segments(data_dir, stream, date=date_str, on_collision="prefer_segments"):
         frame = pd.read_parquet(path)
         if "timestamp" in frame and pd.api.types.is_datetime64_any_dtype(frame["timestamp"]):
             # Arrow/Pandas may preserve a millisecond physical timestamp; force
@@ -17,7 +17,8 @@ def _read_stream(data_dir: str, stream: str, date_str: str) -> list[pd.DataFrame
             frame["timestamp"] = (
                 pd.to_datetime(frame["timestamp"], utc=True)
                 .astype("datetime64[ns, UTC]")
-                .astype("int64") // 1_000_000
+                .astype("int64")
+                // 1_000_000
             )
         frames.append(frame)
     return frames

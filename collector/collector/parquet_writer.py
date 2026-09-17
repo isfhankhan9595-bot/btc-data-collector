@@ -1,9 +1,4 @@
-"""Crash-bounded raw parquet storage.
-
-Parquet row groups are only discoverable from the footer.  An open writer is
-therefore *not* recoverable after a process crash.  This module deliberately
-uses small, closed segments and never reads ``.seg.tmp`` files.
-"""
+"""Crash-bounded raw parquet storage."""
 from __future__ import annotations
 
 import json
@@ -17,7 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .utils import logger
-from .storage_layout import iter_segments, segment_path
+from .storage_layout import SegmentKind, iter_segments, parse_segment_name, segment_path
 
 
 class ParquetWriter:
@@ -44,6 +39,7 @@ class ParquetWriter:
         self.record_count = 0
         self._first_record_ts: Optional[int] = None
         self._last_record_ts: Optional[int] = None
+        self._sequence_cache: dict[str, int] = {}
         self._seq = self._next_sequence(self.current_hour)
         self._recover_orphans()
         self._open_segment()
@@ -51,24 +47,63 @@ class ParquetWriter:
     def _get_current_hour_str(self) -> str:
         return datetime.utcnow().strftime("%Y-%m-%d-%H")
 
+    def _emit_quality(self, event_type: str, reason: str) -> None:
+        event = {
+            "exchange": "BINANCE",
+            "stream": self.stream_name,
+            "event_type": event_type,
+            "reason": reason,
+            "gap_size_ms": None,
+            "rows_lost": None,
+            "local_ts": int(time.time() * 1000),
+        }
+        logger.warning("storage_quality_event", **event)
+        if self.quality_event_sink:
+            self.quality_event_sink(event)
+
     def _next_sequence(self, hour: str) -> int:
-        prefix = f"{hour}-"
-        values = []
-        for path in iter_segments(self.base_dir, self.stream_name):
-            if path.suffix != ".seg" or not path.name.startswith(prefix):
+        cached = self._sequence_cache.get(hour)
+        if cached is not None:
+            return cached
+
+        date, hour_number = hour.rsplit("-", 1)
+        entries = list(
+            iter_segments(
+                self.base_dir,
+                self.stream_name,
+                date=date,
+                hour=int(hour_number),
+                on_collision="raise",
+            )
+        )
+        values: list[int] = []
+        has_legacy = False
+        for path in entries:
+            parsed = parse_segment_name(path)
+            if parsed is None:
                 continue
-            try:
-                values.append(int(path.stem.removeprefix(prefix)))
-            except ValueError:
-                continue
-        return (max(values) + 1) if values else 0
+            _, _, sequence, kind = parsed
+            if kind is SegmentKind.LEGACY_HOURLY:
+                has_legacy = True
+            elif sequence is not None:
+                values.append(sequence)
+
+        if values:
+            next_sequence = max(values) + 1
+        elif has_legacy:
+            next_sequence = 1
+            self._emit_quality("STORAGE_MIGRATION", "legacy_hourly_file_present; starting sequenced writer at 1")
+        else:
+            next_sequence = 0
+
+        self._sequence_cache[hour] = next_sequence
+        return next_sequence
 
     def _segment_paths(self) -> tuple[Path, Path, Path]:
         final = segment_path(self.base_dir, self.stream_name, self.current_hour, self._seq)
         return final, Path(str(final) + ".tmp"), Path(str(final) + ".count.json")
 
     def _get_filename(self, hour_str: str) -> str:
-        """Compatibility helper: return this writer's current segment pathname."""
         return str(segment_path(self.base_dir, self.stream_name, hour_str, self._seq))
 
     def _emit_drop(self, rows_lost: Optional[int], reason: str = "crashed_segment_discarded") -> None:
@@ -80,13 +115,11 @@ class ParquetWriter:
             self.quality_event_sink(event)
 
     def _recover_orphans(self) -> None:
-        # Metadata is advisory; an interrupted publication leaves only an orphan temp.
         for meta_tmp in self.stream_dir.glob("*.meta.json.tmp"):
             try:
                 meta_tmp.unlink()
             except OSError as exc:
                 logger.error("metadata_orphan_discard_failed", file=str(meta_tmp), error=str(exc))
-        # Never attempt pq.read_table/ParquetFile on an unclosed segment.
         for tmp in self.stream_dir.glob("*.seg.tmp"):
             count_path = Path(str(tmp).removesuffix(".tmp") + ".count.json")
             rows: Optional[int] = None
@@ -101,13 +134,13 @@ class ParquetWriter:
             except OSError as exc:
                 logger.error("segment_orphan_discard_failed", file=str(tmp), error=str(exc))
                 continue
-            # A missing counter is itself material uncertainty; a persisted
-            # zero counter proves no rows were flushed and emits no drop.
             if rows is None or rows > 0:
                 self._emit_drop(rows)
 
     def _open_segment(self) -> None:
-        _, tmp, counter = self._segment_paths()
+        final, tmp, counter = self._segment_paths()
+        if final.exists():
+            raise FileExistsError(f"refusing to overwrite published segment: {final}")
         self._tmp_filepath, self._counter_filepath = tmp, counter
         self.writer = pq.ParquetWriter(str(tmp), self.schema, compression="snappy")
         self.record_count = 0
@@ -134,8 +167,6 @@ class ParquetWriter:
         if self._first_record_ts is None:
             self._first_record_ts = ts
         self._last_record_ts = ts
-        # A bounded conversion buffer reduces tiny row groups.  The sidecar is
-        # persisted on every write_table call in flush().
         if (len(self.buffer) >= 1_000 or self.record_count + len(self.buffer) >= self.segment_rows
                 or time.monotonic() - self._segment_opened_monotonic >= self.segment_seconds):
             self.flush()
@@ -161,14 +192,14 @@ class ParquetWriter:
         self.writer = None
         with tmp.open("rb") as handle:
             os.fsync(handle.fileno())
+        if final.exists():
+            raise FileExistsError(f"refusing to overwrite published segment: {final}")
         os.replace(tmp, final)
         parent_fd = os.open(str(final.parent), os.O_RDONLY)
         try:
             os.fsync(parent_fd)
         finally:
             os.close(parent_fd)
-        # Metadata is advisory: recovery relies only on .seg.tmp and its durable
-        # count sidecar. Publish metadata atomically so it never affects data durability.
         counter.unlink(missing_ok=True)
         meta = Path(str(final) + ".meta.json")
         meta_tmp = Path(str(meta) + ".tmp")
@@ -184,12 +215,12 @@ class ParquetWriter:
         finally:
             os.close(parent_fd)
         logger.info("closed_parquet_segment", stream=self.stream_name, file=str(final), rows=self.record_count)
+        self._sequence_cache[self.current_hour] = self._seq + 1
         if open_next:
             self._seq += 1
             self._open_segment()
 
     def close(self) -> None:
-        # Avoid publishing empty segments, but remove their harmless temporary state.
         if self.writer is None:
             return
         if self.record_count == 0 and not self.buffer:
