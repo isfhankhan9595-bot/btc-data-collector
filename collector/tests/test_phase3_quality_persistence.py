@@ -62,6 +62,6 @@ def test_drain_persists_buffer_overflow_with_rows_lost_and_clears_book_queue():
     assert app.binance_book.quality_events == []
     rows = [call.args[0] for call in app.quality_writer.write.call_args_list]
     assert len(rows) == 1
-    assert rows[0]["event_type"] == QualityEventType.DATA_DROP.value
+    assert rows[0]["event_type"] == QualityEventType.BUFFER_OVERFLOW.value
     assert rows[0]["reason"] == "buffer_overflow"
     assert rows[0]["rows_lost"] == "2"
