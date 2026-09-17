@@ -1,0 +1,96 @@
+name: CI
+
+# Read-only by design. This repository previously carried a workflow that
+# could clone an upstream repository and force-push over main; nothing here
+# is permitted to write to the repository.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r collector/requirements.txt
+
+      - name: Compile all sources
+        run: python -m compileall -q collector
+
+      - name: Import checks from repository root
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
+        run: |
+          python -c "import collector"
+          python -c "import collector.collector"
+          python -c "import collector.collector.config"
+          python -c "import collector.collector.utils"
+          python -c "import collector.collector.adapters.binance"
+          python -c "import collector.collector.adapters.bybit"
+          python -c "import collector.collector.adapters.okx"
+          python -c "import collector.collector.book_engine"
+          python -c "import collector.collector.parquet_writer"
+          python -c "import collector.collector.storage_layout"
+          python -c "import collector.pipeline.dataset_assembler"
+          python -c "import collector.scripts.verify_dataset"
+          python -c "import collector.scripts.gap_report"
+
+      - name: Run test suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
+        working-directory: collector
+        run: pytest -q tests
+
+      - name: Assert collector does not import the trading bot
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
+        run: |
+          # The collector must stand alone. A hard dependency on the
+          # repository-root telegram_bot.py is a standalone-ness violation.
+          python - <<'PY'
+          import ast, pathlib, sys
+          offenders = []
+          for path in pathlib.Path("collector").rglob("*.py"):
+              if "tests" in path.parts:
+                  continue
+              tree = ast.parse(path.read_text(), filename=str(path))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      names = [node.module or ""]
+                  else:
+                      continue
+                  for name in names:
+                      if name.split(".")[0] == "telegram_bot":
+                          offenders.append(f"{path}:{node.lineno}")
+          if offenders:
+              print("Hard telegram_bot import(s) found:")
+              print("\n".join(offenders))
+              sys.exit(1)
+          print("No hard telegram_bot imports.")
+          PY

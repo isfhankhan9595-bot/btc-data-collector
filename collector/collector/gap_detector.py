@@ -28,6 +28,7 @@ class GapDetector:
         if last_ts > 0 and current_ts < last_ts:
             logger.warning("Clock regression detected", stream=stream_name, last_ts=last_ts, current_ts=current_ts)
             return "clock_regression"
+        alert_message = None
         if last_ts > 0:
             gap_duration = current_ts - last_ts
             if gap_duration > threshold:
@@ -37,9 +38,20 @@ class GapDetector:
                                gap_end=current_ts,
                                duration_ms=gap_duration)
                 if gap_duration > 2000:
-                    send_telegram_alert(f"Gap > 2s detected in {stream_name}: {gap_duration}ms")
+                    alert_message = f"Gap > 2s detected in {stream_name}: {gap_duration}ms"
 
+        # Commit hot-path state BEFORE notifying. Notification is an
+        # operational convenience; a backend that raises must never cost us
+        # gap-tracking state, which would silently corrupt every later gap
+        # measurement for this stream.
         self.last_seen[stream_name] = current_ts
+
+        if alert_message is not None:
+            try:
+                send_telegram_alert(alert_message)
+            except Exception as exc:  # noqa: BLE001 - alerting fails open
+                logger.warning("Gap alert failed open",
+                               stream=stream_name, error=str(exc))
 
     def reset_stream(self, stream_name: str):
         if stream_name in self.last_seen:
