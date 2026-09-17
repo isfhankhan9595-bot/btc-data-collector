@@ -74,14 +74,11 @@ class CollectorApp:
 
         self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, segment_rows=1, segment_seconds=1)
         self._quality_journal_path = self.quality_writer.stream_dir / "quality_queue.pending.json"
-        # A SIGKILL cannot drain RAM.  A durable pending marker makes that
-        # uncertainty visible on the next process rather than claiming zero loss.
         if self._quality_journal_path.exists():
             self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,
                 "reason":"quality_queue_unfinished_on_previous_process", "rows_lost":None})
             self._quality_journal_path.unlink(missing_ok=True)
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
-        # Raw reconstructed state is independently durable; legacy feature stream remains compatible.
         self.raw_book_writer = ParquetWriter("binance_orderbook_raw", BINANCE_ORDERBOOK_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
         self.raw_trades_writer = ParquetWriter("binance_trades_raw", BINANCE_TRADES_RAW_SCHEMA)
@@ -105,7 +102,6 @@ class CollectorApp:
         ]
 
         self.health_monitor = HealthMonitor(self.disk_monitor, self.validator, self)
-
         self.tasks = []
 
     @property
@@ -120,7 +116,6 @@ class CollectorApp:
     def _route_stream(self, stream: str):
         normalized_stream = stream.lower()
         symbol_prefix = f"{SYMBOL.lower()}@"
-
         if not normalized_stream.startswith(symbol_prefix):
             return None
         if "@depth" in normalized_stream:
@@ -144,18 +139,32 @@ class CollectorApp:
         reasons = self.validation_fail_reasons.setdefault(stream_name, {})
         reasons[reason] = reasons.get(reason, 0) + 1
 
+    def _drain_integrity_quality_events(self):
+        """Move validator/book integrity events into the durable quality stream.
+
+        Validation and reconstruction create events in bounded-in-scope in-memory
+        queues so the hot path never performs parquet I/O. The collector drains
+        them immediately after processing each event and uses the existing quality
+        writer, preserving event metadata such as drift and rows_lost.
+        """
+        for source in (getattr(self, "binance_book", None), getattr(self, "validator", None)):
+            drain = getattr(source, "drain_quality_events", None)
+            if drain is None:
+                continue
+            for event in drain():
+                if isinstance(event, QualityEvent):
+                    self._persist_quality_event(event.record())
+                elif isinstance(event, dict):
+                    self._persist_quality_event(event)
+
     async def handle_message(self, msg: dict, local_receive_ts: int | None = None):
-        # Tests and offline callers may supply decoded events directly.  The
-        # WebSocket client supplies the authoritative pre-decode timestamp.
         if local_receive_ts is None:
             local_receive_ts = int(time.time() * 1000)
         if "stream" not in msg or "data" not in msg:
             return
-
         stream = msg["stream"]
         data = msg["data"]
         self._log_raw_sample(stream, msg)
-
         route = self._route_stream(stream)
         if route is None:
             self.stream_counters["unrouted"]["received"] += 1
@@ -168,7 +177,7 @@ class CollectorApp:
             self._handle_markprice(data, stream)
         elif route == "liquidation":
             self._handle_liquidation(data, stream)
-
+        self._drain_integrity_quality_events()
         if self.validator.check_failure_rate():
             logger.error("Validation spike detected: >0.1% failures in 60s window")
             send_telegram_alert("Validation spike detected: >0.1% failures in 60s window")
@@ -178,14 +187,12 @@ class CollectorApp:
         event={"exchange":"BINANCE", "stream":stream_group, "event_type":event_type, "reason":reason,
                "connection_id":connection_id, "local_ts":int(time.time()*1000)}
         if not hasattr(self, "_quality_queue"):
-            # Legacy/offline callers have no websocket worker; this branch is not used by WebSocketClient.
             self._persist_quality_event(event)
             return
         try:
             self._quality_queue.put_nowait(event)
             self._write_quality_pending_marker()
         except asyncio.QueueFull:
-            # The drop is observable in logs/counters and a later persistence task writes one aggregate marker.
             self._quality_overflow += 1
             logger.error("quality_event_queue_overflow", dropped=self._quality_overflow)
 
@@ -238,13 +245,11 @@ class CollectorApp:
             "local_receive_ts":getattr(event,"local_receive_ts",None), "local_process_ts":getattr(event,"local_process_ts",None)})
 
     async def _recover_binance_book(self, reason: str):
-        """Fetch outside the state lock; live diffs buffer while REST is outstanding."""
         async with self._book_snapshot_lock:
-            old=self.binance_book.state.state; self.binance_book.state.resync()
+            self.binance_book.state.resync()
             self._record_book_quality(QualityEventType.RESYNC, reason)
         try:
             import aiohttp
-            request_ts=int(time.time()*1000)
             timeout=aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(BINANCE_DEPTH_SNAPSHOT_URL) as response:
@@ -257,13 +262,13 @@ class CollectorApp:
                 bids=tuple((Decimal(p),Decimal(q)) for p,q in snapshot["bids"]), asks=tuple((Decimal(p),Decimal(q)) for p,q in snapshot["asks"]),
                 update_id=int(snapshot["lastUpdateId"]),is_snapshot=True,book_source="DIFF_DEPTH_RECONSTRUCTED")
             async with self._book_snapshot_lock:
-                old=self.binance_book.state.state
                 if not self.binance_book.binance_snapshot(snapshot_event.update_id,snapshot_event):
                     self._record_book_quality(QualityEventType.ERROR, self.binance_book.last_reason)
                     return False
                 self._persist_reconstructed_books(self.binance_book.committed_recovery_events)
                 self.binance_book.committed_recovery_events=[]
                 self._record_book_quality(QualityEventType.RECOVERY,"snapshot_bridge_completed")
+                self._drain_integrity_quality_events()
                 return True
         except asyncio.TimeoutError:
             why="snapshot_timeout"
@@ -273,8 +278,9 @@ class CollectorApp:
             why="snapshot_http_error"
             logger.error("binance_book_snapshot_failed", error=str(exc))
         async with self._book_snapshot_lock:
-            old=self.binance_book.state.state; self.binance_book.state.gap()
+            self.binance_book.state.gap()
             self._record_book_quality(QualityEventType.ERROR,why)
+        self._drain_integrity_quality_events()
         return False
 
     async def _handle_binance_orderbook(self, raw: dict, local_receive_ts: int):
@@ -291,8 +297,8 @@ class CollectorApp:
                     self._record_book_quality(QualityEventType.SEQUENCE_GAP,self.binance_book.last_reason,event=event)
                 needs_recovery=applied is None and after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING)
                 if self.binance_book.duplicate_count:
-                    # bounded: one durable counter event per observed duplicate; reset after recording.
                     self._record_book_quality(QualityEventType.DUPLICATE,"binance_duplicate_update",event=event); self.binance_book.duplicate_count=0
+            self._drain_integrity_quality_events()
             if needs_recovery:
                 if self._recovery_task is None or self._recovery_task.done(): self._recovery_task=asyncio.create_task(self._recover_binance_book("sequence_gap_or_initial_snapshot"))
                 return
@@ -305,7 +311,6 @@ class CollectorApp:
             self._write_orderbook_features(features)
 
     def _persist_reconstructed_books(self, rows):
-        """Raw reconstructed book is exact and independent of lossy features."""
         raw_writer=getattr(self, "raw_book_writer", None)
         if raw_writer is None:
             return
@@ -319,6 +324,7 @@ class CollectorApp:
     def _write_orderbook_features(self, features: dict):
         self.stream_counters["orderbook"]["computed"] += 1
         valid, reason = self.validator.validate_orderbook(features)
+        self._drain_integrity_quality_events()
         if not valid:
             self.stream_counters["orderbook"]["rejected"] += 1
             self._record_validation_rejection("orderbook", reason)
@@ -331,7 +337,6 @@ class CollectorApp:
 
     @staticmethod
     def _lossless_legacy_trade_id(value):
-        """Adapt a native ID only when the legacy int64 column can represent it exactly."""
         if value is None:
             raise ValueError("missing_native_trade_id")
         if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
@@ -345,8 +350,6 @@ class CollectorApp:
         self.stream_counters["trades"]["received"] += 1
         events = self.binance_adapter.normalize(raw, local_receive_ts=local_receive_ts)
         for event in events:
-            # Legacy parquet schema is int64. Preserve canonical IDs only when
-            # conversion is exact; otherwise reject visibly instead of truncating.
             try: trade_id = self._lossless_legacy_trade_id(event.trade_id)
             except (TypeError, ValueError): trade_id = None
             process_ts = int(time.time() * 1000)
@@ -356,8 +359,6 @@ class CollectorApp:
                     "exchange_timestamp":event.exchange_transaction_ts or event.exchange_event_ts, "trade_id":trade_id,
                     "native_trade_id":event.trade_id, "price":event.price, "quantity":event.quantity})
             if trade_id is None:
-                # Raw native record is durable first; old int64 feature stream
-                # cannot faithfully represent this identifier.
                 self.stream_counters["trades"]["rejected"] += 1
                 self._record_validation_rejection("trades", "legacy_trade_id_not_lossless")
                 self._persist_quality_event({"stream":"trades", "event_type":QualityEventType.ERROR, "reason":"legacy_trade_id_not_lossless"})
@@ -371,10 +372,12 @@ class CollectorApp:
                 "signed_qty": -event.quantity if event.side == "SELL" else event.quantity,
             }
             self._handle_trade_features(features)
+        self._drain_integrity_quality_events()
 
     def _handle_trade_features(self, features: dict):
         self.stream_counters["trades"]["computed"] += 1
         valid, reason = self.validator.validate_trade(features)
+        self._drain_integrity_quality_events()
         if not valid:
             self.stream_counters["trades"]["rejected"] += 1
             self._record_validation_rejection("trades", reason)
@@ -392,15 +395,14 @@ class CollectorApp:
             self.stream_counters["orderbook"]["empty_features"] += 1
             logger.warning("Feature extraction returned empty", stream="orderbook", raw_stream=stream, keys=sorted(data.keys()))
             return
-
         self.stream_counters["orderbook"]["computed"] += 1
         valid, reason = self.validator.validate_orderbook(features)
+        self._drain_integrity_quality_events()
         if not valid:
             self.stream_counters["orderbook"]["rejected"] += 1
             self._record_validation_rejection("orderbook", reason)
             logger.info("Validation result", stream="orderbook", validation_pass=False, validation_fail_reason=reason)
             return
-
         self.stream_counters["orderbook"]["validated"] += 1
         logger.info("Validation result", stream="orderbook", validation_pass=True, validation_fail_reason="")
         self.gap_detector.check_gap("orderbook", features["exchange_timestamp"])
@@ -415,15 +417,14 @@ class CollectorApp:
             self.stream_counters["trades"]["empty_features"] += 1
             logger.warning("Feature extraction returned empty", stream="trades", raw_stream=stream, keys=sorted(data.keys()))
             return
-
         self.stream_counters["trades"]["computed"] += 1
         valid, reason = self.validator.validate_trade(features)
+        self._drain_integrity_quality_events()
         if not valid:
             self.stream_counters["trades"]["rejected"] += 1
             self._record_validation_rejection("trades", reason)
             logger.info("Validation result", stream="trades", validation_pass=False, validation_fail_reason=reason)
             return
-
         self.stream_counters["trades"]["validated"] += 1
         logger.info("Validation result", stream="trades", validation_pass=True, validation_fail_reason="")
         self.gap_detector.check_gap("trades", features["exchange_timestamp"])
@@ -439,15 +440,14 @@ class CollectorApp:
                 self.stream_counters["liquidation"]["empty_features"] += 1
                 logger.warning("Feature extraction returned empty", stream="liquidation", raw_stream=stream, keys=sorted(data.keys()))
                 return
-
             self.stream_counters["liquidation"]["computed"] += 1
             valid, reason = self.validator.validate_liquidation(features)
+            self._drain_integrity_quality_events()
             if not valid:
                 self.stream_counters["liquidation"]["rejected"] += 1
                 self._record_validation_rejection("liquidation", reason)
                 logger.info("Validation result", stream="liquidation", validation_pass=False, validation_fail_reason=reason)
                 return
-
             self.stream_counters["liquidation"]["validated"] += 1
             logger.info("Validation result", stream="liquidation", validation_pass=True, validation_fail_reason="")
             self.liq_writer.write(features)
@@ -465,15 +465,14 @@ class CollectorApp:
             self.stream_counters["markprice"]["empty_features"] += 1
             logger.warning("Feature extraction returned empty", stream="markprice", raw_stream=stream, keys=sorted(data.keys()))
             return
-
         self.stream_counters["markprice"]["computed"] += 1
         valid, reason = self.validator.validate_markprice(features)
+        self._drain_integrity_quality_events()
         if not valid:
             self.stream_counters["markprice"]["rejected"] += 1
             self._record_validation_rejection("markprice", reason)
             logger.info("Validation result", stream="markprice", validation_pass=False, validation_fail_reason=reason)
             return
-
         self.stream_counters["markprice"]["validated"] += 1
         logger.info("Validation result", stream="markprice", validation_pass=True, validation_fail_reason="")
         self.gap_detector.check_gap("markprice", features["exchange_timestamp"])
@@ -483,7 +482,6 @@ class CollectorApp:
 
     def _make_reconnect_handler(self, url: str):
         streams_for_url = self._requested_streams(url)
-
         def handler():
             logger.info("Resetting validation and gap tracking on reconnect", url=url, streams=streams_for_url)
             for stream_name_fragment in streams_for_url:
@@ -498,7 +496,7 @@ class CollectorApp:
                         if getattr(self, "binance_book", None) is None:
                             self.binance_book = LocalBook("BINANCE")
                         self.binance_book.invalidate("websocket_reconnect")
-
+            self._drain_integrity_quality_events()
         return handler
 
     async def start(self):
@@ -506,32 +504,21 @@ class CollectorApp:
         logger.info("Collector WebSocket subscription", url=BINANCE_PUBLIC_WS_URL, requested_streams=self._requested_streams(BINANCE_PUBLIC_WS_URL))
         logger.info("Collector WebSocket subscription", url=BINANCE_MARKET_WS_URL, requested_streams=self._requested_streams(BINANCE_MARKET_WS_URL))
         send_telegram_alert("Collector Application Started")
-
         self.running = True
         self._quality_task = asyncio.create_task(self._quality_persistence_loop())
-
-        # BUG 4 FIX: Register signals inside the running event loop for safe async shutdown.
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(self._async_shutdown(s))
-            )
-
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._async_shutdown(s)))
         for ws_client in self.ws_clients:
             self.tasks.append(asyncio.create_task(ws_client.start()))
-
-        # Wait for both WebSocket connections before starting OI polling and health monitor.
         for ws_client in self.ws_clients:
             connected = await ws_client.wait_connected(timeout_seconds=30.0)
             if not connected:
                 logger.warning("ws_client_pre_connect_timeout", url=ws_client.url)
-
         await self._recover_binance_book("startup")
         self.tasks.append(asyncio.create_task(self.health_monitor.start()))
         self.tasks.append(asyncio.create_task(self._poll_openinterest()))
         self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
-
         try:
             await asyncio.gather(*self.tasks)
         except asyncio.CancelledError:
@@ -540,6 +527,7 @@ class CollectorApp:
             if self._recovery_task is not None and not self._recovery_task.done():
                 self._recovery_task.cancel()
                 await asyncio.gather(self._recovery_task, return_exceptions=True)
+            self._drain_integrity_quality_events()
             await self._quality_queue.join()
             self.running = False
             if self._quality_task is not None:
@@ -548,7 +536,6 @@ class CollectorApp:
 
     async def _poll_openinterest(self):
         import aiohttp
-
         timeout = aiohttp.ClientTimeout(total=5)
         while self.running:
             try:
@@ -574,11 +561,7 @@ class CollectorApp:
 
     async def _verify_startup_streams(self):
         await asyncio.sleep(STREAM_INACTIVE_STARTUP_SECONDS)
-        inactive_streams = [
-            stream_name
-            for stream_name in ("orderbook", "trades", "markprice")
-            if self.stream_counters[stream_name]["received"] == 0
-        ]
+        inactive_streams = [stream_name for stream_name in ("orderbook", "trades", "markprice") if self.stream_counters[stream_name]["received"] == 0]
         if inactive_streams:
             msg = f"Startup stream inactivity after {STREAM_INACTIVE_STARTUP_SECONDS}s: {', '.join(inactive_streams)}"
             logger.error(msg, stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
@@ -592,6 +575,7 @@ class CollectorApp:
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
             await asyncio.gather(self._recovery_task, return_exceptions=True)
+        self._drain_integrity_quality_events()
         if self._quality_task is not None:
             await self._quality_task
         self.shutdown()
@@ -602,19 +586,16 @@ class CollectorApp:
         if self._closed:
             return
         self._closed = True
-
         logger.info("Shutting down Collector Application...", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
         self.running = False
-
         for ws_client in self.ws_clients:
             ws_client.stop()
         self.health_monitor.stop()
-
+        self._drain_integrity_quality_events()
         for task in self.tasks:
             task.cancel()
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
-
         self.ob_writer.close()
         self.raw_book_writer.close()
         self.trades_writer.close()
@@ -623,7 +604,6 @@ class CollectorApp:
         self.oi_writer.close()
         self.liq_writer.close()
         self.quality_writer.close()
-
         msg = "Collector Application Shutdown"
         logger.info(msg)
         send_telegram_alert(msg)
