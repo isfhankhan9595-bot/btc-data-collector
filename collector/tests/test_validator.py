@@ -1,10 +1,14 @@
-import pytest
 import time
+
+import pytest
+
 from collector.collector.validator import Validator
+
 
 @pytest.fixture
 def validator():
     return Validator()
+
 
 def test_validate_orderbook(validator):
     ts = int(time.time() * 1000)
@@ -17,7 +21,7 @@ def test_validate_orderbook(validator):
         "spread_bps": 10.0,
         "total_bid_qty": 10.0,
         "total_ask_qty": 10.0,
-        "obi": 0.0
+        "obi": 0.0,
     }
 
     valid, reason = validator.validate_orderbook(record)
@@ -62,9 +66,9 @@ def test_validate_orderbook_rejects_empty_book(validator):
     }
 
     valid, reason = validator.validate_orderbook(record)
-
     assert not valid
     assert reason == "Empty book"
+
 
 def test_validate_orderbook_crossed(validator):
     ts = int(time.time() * 1000)
@@ -77,12 +81,13 @@ def test_validate_orderbook_crossed(validator):
         "spread_bps": -10.0,
         "total_bid_qty": 10.0,
         "total_ask_qty": 10.0,
-        "obi": 0.0
+        "obi": 0.0,
     }
 
     valid, reason = validator.validate_orderbook(record)
     assert not valid
     assert reason == "Crossed book"
+
 
 def test_validate_trade_duplicate(validator):
     ts = int(time.time() * 1000)
@@ -90,31 +95,31 @@ def test_validate_trade_duplicate(validator):
         "timestamp": ts,
         "trade_id": 100,
         "price": 100.0,
-        "quantity": 1.0
+        "quantity": 1.0,
     }
 
     valid, _ = validator.validate_trade(record)
     assert valid
 
-    # Duplicate ID
     record["timestamp"] += 1
     valid, reason = validator.validate_trade(record)
     assert not valid
     assert "Duplicate/Regressive" in reason
 
-def test_validate_markprice_extreme_funding(validator):
+
+def test_validate_markprice_accepts_extreme_funding(validator):
     ts = int(time.time() * 1000)
     record = {
         "timestamp": ts,
         "mark_price": 100.0,
-        "funding_rate": 0.05, # > 1%
+        "funding_rate": 0.05,
         "exchange_timestamp": ts,
-        "next_funding_time": ts + 1000
+        "next_funding_time": ts + 1000,
     }
 
     valid, reason = validator.validate_markprice(record)
-    assert not valid
-    assert "Funding rate out of bounds" in reason
+    assert valid, reason
+
 
 def test_timestamp_regression(validator):
     ts = int(time.time() * 1000)
@@ -127,13 +132,12 @@ def test_timestamp_regression(validator):
         "spread_bps": 10.0,
         "total_bid_qty": 10.0,
         "total_ask_qty": 10.0,
-        "obi": 0.0
+        "obi": 0.0,
     }
 
     valid, _ = validator.validate_orderbook(record)
     assert valid
 
-    # Same timestamp
     valid, reason = validator.validate_orderbook(record)
     assert not valid
     assert "Timestamp regression" in reason
@@ -262,4 +266,64 @@ def test_validate_liquidation_allows_same_millisecond(validator):
     valid, reason = validator.validate_liquidation(first)
     assert valid, reason
     valid, reason = validator.validate_liquidation(second)
+    assert valid, reason
+
+
+def test_validate_orderbook_accepts_wide_spread(validator):
+    ts = int(time.time() * 1000)
+    record = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "bids_price": [100.0],
+        "asks_price": [200.0],
+        "best_bid": 100.0,
+        "best_ask": 200.0,
+        "spread_bps": 10_000.0,
+        "total_bid_qty": 1.0,
+        "total_ask_qty": 1.0,
+        "obi": 0.0,
+    }
+
+    valid, reason = validator.validate_orderbook(record)
+    assert valid, reason
+
+
+def test_validate_trade_accepts_large_price_dislocation(validator):
+    ts = int(time.time() * 1000)
+    first = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "trade_id": 100,
+        "price": 100.0,
+        "quantity": 1.0,
+    }
+    second = {
+        "timestamp": ts + 1,
+        "exchange_timestamp": ts + 1,
+        "trade_id": 101,
+        "price": 110.0,
+        "quantity": 1.0,
+    }
+
+    assert validator.validate_trade(first)[0]
+    valid, reason = validator.validate_trade(second)
+    assert valid, reason
+
+
+def test_validate_orderbook_accepts_exchange_clock_offset(validator):
+    ts = int(time.time() * 1000)
+    record = {
+        "timestamp": ts,
+        "exchange_timestamp": ts - 60_000,
+        "bids_price": [100.0],
+        "asks_price": [101.0],
+        "best_bid": 100.0,
+        "best_ask": 101.0,
+        "spread_bps": 10.0,
+        "total_bid_qty": 1.0,
+        "total_ask_qty": 1.0,
+        "obi": 0.0,
+    }
+
+    valid, reason = validator.validate_orderbook(record)
     assert valid, reason
