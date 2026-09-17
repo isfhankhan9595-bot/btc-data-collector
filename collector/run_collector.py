@@ -24,6 +24,8 @@ from collector.collector.config import (
 )
 from collector.collector.adapters.binance import BinanceAdapter
 from collector.collector.raw_capture import RawCapture, RawRestRecord, RawWireRecord
+from collector.collector.backoff import ExponentialBackoff, rate_limit_penalty
+from collector.collector.recovery_control import RecoveryController
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent
 from collector.collector.quality_events import BookQuality, QualityEvent, QualityEventType
@@ -73,6 +75,12 @@ class CollectorApp:
         self.binance_book = LocalBook("BINANCE")
         self._book_snapshot_lock = asyncio.Lock()
         self._recovery_task = None
+        # One gap must not become hundreds of REST snapshot requests.
+        self.recovery_controller = RecoveryController(
+            name="binance_orderbook", min_interval_s=1.0, max_per_window=5,
+            window_s=60.0,
+            backoff=ExponentialBackoff(base_delay=1.0, max_delay=60.0, max_attempts=10),
+            quality_sink=self._persist_quality_event)
         self._quality_queue = asyncio.Queue(maxsize=1024)
         self._quality_task = None
         self._quality_overflow = 0
@@ -322,11 +330,43 @@ class CollectorApp:
             "first_update_id":getattr(event,"first_update_id",None), "previous_update_id":getattr(event,"previous_update_id",None),
             "local_receive_ts":getattr(event,"local_receive_ts",None), "local_process_ts":getattr(event,"local_process_ts",None)})
 
+    def _schedule_recovery(self, reason: str) -> bool:
+        """Start a recovery only if the controller permits it.
+
+        Suppressed requests are counted by the controller and surfaced as
+        transition events, not one event per suppressed gap.
+        """
+        controller = getattr(self, "recovery_controller", None)
+        if controller is None:
+            if self._recovery_task is None or self._recovery_task.done():
+                self._recovery_task = asyncio.create_task(
+                    self._recover_binance_book(reason))
+                return True
+            return False
+        # Ask the controller first. Checking the task handle first would
+        # short-circuit before the suppression could be counted, so a gap
+        # burst would be silently invisible in the counters -- the very
+        # thing this controller exists to surface.
+        if not controller.request(reason).allowed:
+            return False
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return False
+        self._recovery_task = asyncio.create_task(self._recover_binance_book(reason))
+        # Mark in flight synchronously: between create_task and the
+        # coroutine's first line there is a window in which further gaps
+        # would otherwise be allowed through.
+        if not controller.in_flight:
+            controller.begin()
+        return True
+
     async def _recover_binance_book(self, reason: str):
         async with self._book_snapshot_lock:
             self.binance_book.state.resync()
             self._record_book_quality(QualityEventType.RESYNC, reason)
         request_ts=int(time.time()*1000); status=None; body=None
+        controller=getattr(self, "recovery_controller", None)
+        if controller is not None and not controller.in_flight:
+            controller.begin()
         try:
             import aiohttp
             timeout=aiohttp.ClientTimeout(total=5)
@@ -337,6 +377,24 @@ class CollectorApp:
                     # response is captured rather than discarded.
                     body=await response.text()
                     receive_ts=int(time.time()*1000)
+                    penalty=rate_limit_penalty(status, getattr(response, "headers", None))
+                    if penalty is not None:
+                        # The venue's Retry-After overrides local pacing.
+                        if controller is not None:
+                            controller.note_rate_limit(penalty)
+                        self._capture_rest(RawRestRecord(
+                            request_ts=request_ts, response_receive_ts=receive_ts,
+                            endpoint=BINANCE_DEPTH_SNAPSHOT_URL, purpose="orderbook_snapshot",
+                            request_params={"symbol": SYMBOL, "limit": 1000},
+                            http_status=status, ok=False,
+                            error=f"rate_limited:{penalty.status}:{penalty.source}",
+                            payload=body, symbol=SYMBOL))
+                        async with self._book_snapshot_lock:
+                            self.binance_book.state.gap()
+                            self._record_book_quality(QualityEventType.RATE_LIMIT,
+                                                      f"snapshot_rate_limited:{penalty.status}")
+                        self._drain_integrity_quality_events()
+                        return False
                     response.raise_for_status()
                     snapshot=json.loads(body)
             process_ts=int(time.time()*1000)
@@ -356,11 +414,13 @@ class CollectorApp:
             async with self._book_snapshot_lock:
                 if not self.binance_book.binance_snapshot(snapshot_event.update_id,snapshot_event):
                     self._record_book_quality(QualityEventType.ERROR, self.binance_book.last_reason)
+                    if controller is not None: controller.fail(self.binance_book.last_reason)
                     return False
                 self._persist_reconstructed_books(self.binance_book.committed_recovery_events)
                 self.binance_book.committed_recovery_events=[]
                 self._record_book_quality(QualityEventType.RECOVERY,"snapshot_bridge_completed")
                 self._drain_integrity_quality_events()
+                if controller is not None: controller.succeed()
                 return True
         except asyncio.TimeoutError:
             why="snapshot_timeout"
@@ -376,6 +436,8 @@ class CollectorApp:
             endpoint=BINANCE_DEPTH_SNAPSHOT_URL, purpose="orderbook_snapshot",
             request_params={"symbol": SYMBOL, "limit": 1000},
             http_status=status, ok=False, error=why, payload=body, symbol=SYMBOL))
+        if controller is not None:
+            controller.fail(why)
         async with self._book_snapshot_lock:
             self.binance_book.state.gap()
             self._record_book_quality(QualityEventType.ERROR,why)
@@ -399,7 +461,7 @@ class CollectorApp:
                     self._record_book_quality(QualityEventType.DUPLICATE,"binance_duplicate_update",event=event); self.binance_book.duplicate_count=0
             self._drain_integrity_quality_events()
             if needs_recovery:
-                if self._recovery_task is None or self._recovery_task.done(): self._recovery_task=asyncio.create_task(self._recover_binance_book("sequence_gap_or_initial_snapshot"))
+                self._schedule_recovery("sequence_gap_or_initial_snapshot")
                 return
             if applied is None: return
             self._persist_reconstructed_books([(applied, "NORMAL_INCREMENTAL", self.binance_book.recovery_generation)])
