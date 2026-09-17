@@ -51,6 +51,9 @@ def test_binance_recovery_buffer_overflow_discards_trigger_and_requires_new_brid
     assert book.buffer_overflow_count == 1
     assert book.last_reason == "buffer_overflow"
     assert book.buffer_overflowed is True
+    overflow_events = book.drain_quality_events()
+    assert len(overflow_events) == 1
+    assert overflow_events[0].reason == "buffer_overflow"
 
     # A snapshot cannot manufacture continuity from the discarded chain.
     assert book.binance_snapshot(3, _snapshot(3)) is False
