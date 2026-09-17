@@ -39,7 +39,6 @@ Documentation is never a substitute for implementation.
 | D9 | `scripts/replay_test.py` is not a replay engine. It loads a derived Parquet file and asserts bounds on columns. There is no recorded-clock replay, no raw event source, no determinism check. | 8 |
 | D10 | No raw wire capture layer. `binance_orderbook_raw` stores normalised levels, not exact payloads; there is no connection id, no REST request/response lineage. Deterministic replay is not currently possible from stored data. | 6 |
 | D11 | OKX adapter declares `trades`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders` in `channel_event_types` but `normalize()` only implements `books`. Everything else silently returns `[]`. | 14 |
-| D12 | Bybit adapter merges ticker deltas into shared `_ticker_state` and emits merged values without marking which fields were carried forward. Staleness is not observable. | 13 |
 | D14 | `binance_snapshot_bridge` and the USD-M sequence rules are implemented from assumption and have not been re-verified against current official Binance documentation. | 4 |
 
 ---
