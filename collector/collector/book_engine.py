@@ -16,8 +16,10 @@ class BookTransition:
 
 class LocalBook:
     """Authoritative in-memory book; non-VALID Binance diffs are buffered."""
-    def __init__(self, venue: str):
-        self.venue=venue; self.bids={}; self.asks={}; self.previous=None; self.buffer=[]; self.state=BookQualityStateMachine()
+    def __init__(self, venue: str, max_buffer_events: int = 10_000):
+        if max_buffer_events <= 0: raise ValueError("max_buffer_events must be positive")
+        self.venue=venue; self.bids={}; self.asks={}; self.previous=None; self.buffer=[]; self.max_buffer_events=max_buffer_events
+        self.buffer_overflow_count=0; self.state=BookQualityStateMachine()
         self.last_reason=""; self.duplicate_count=0; self.last_transition=None; self.recovery_generation=0
         # Only populated after a fully committed recovery transaction.  The
         # caller persists these rows after releasing the state lock.
@@ -54,6 +56,13 @@ class LocalBook:
             self.last_transition=BookTransition(old,self.state.state,event,self.last_reason,getattr(self.previous,"update_id",None)); return None
         self.bids, self.asks=maps; self.previous=event
         return replace(event,bids=tuple(sorted(self.bids.items(),reverse=True)),asks=tuple(sorted(self.asks.items())),quality_state=self.state.state.value)
+
+    def _buffer_event(self, event):
+        if len(self.buffer) >= self.max_buffer_events:
+            self.buffer.clear(); self.buffer_overflow_count += 1
+            old=self.state.state; self.state.gap(); self.last_reason="buffer_overflow"
+            self.last_transition=BookTransition(old,self.state.state,event,self.last_reason,getattr(self.previous,"update_id",None))
+        self.buffer.append(event)
 
     def snapshot(self,event):
         maps=self._validated_maps(event, {}, {})
@@ -107,17 +116,17 @@ class LocalBook:
 
     def apply(self,event):
         if self.venue=="BINANCE" and (self.state.state != BookQuality.VALID or self.previous is None):
-            self.buffer.append(event); return None
+            self._buffer_event(event); return None
         if event.is_snapshot:
             if self.snapshot(event): self.state.recovered(); return self._apply(event)
             self.state.gap(); return None
         expected=getattr(self.previous,"update_id",None)
         result=self.comparator.check(event,self.previous)
         if result.is_resync_signal:
-            old=self.state.state; self.last_reason=result.reason; self.state.resync(); self.buffer.append(event)
+            old=self.state.state; self.last_reason=result.reason; self.state.resync(); self._buffer_event(event)
             self.last_transition=BookTransition(old,self.state.state,event,result.reason,expected); return None
         if result.is_gap:
-            old=self.state.state; self.last_reason=result.reason; self.state.gap(); self.buffer.append(event)
+            old=self.state.state; self.last_reason=result.reason; self.state.gap(); self._buffer_event(event)
             self.last_transition=BookTransition(old,self.state.state,event,result.reason,expected); return None
         if result.reason=="duplicate_update": self.duplicate_count += 1; self.last_reason=result.reason; return None
         return self._apply(event)

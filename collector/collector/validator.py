@@ -1,6 +1,17 @@
+"""Structural validation for collected market data.
+
+Validation is deliberately limited to data-integrity invariants.  Extreme but
+real market states (wide spreads, fast price moves, unusual funding, or clock
+offsets) must remain in the raw dataset so downstream research can measure
+those regimes rather than having the collector censor them.
+"""
+from __future__ import annotations
+
 import time
-from typing import Dict, Any, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
+
 from .utils import logger
+
 
 class Validator:
     def __init__(self):
@@ -19,9 +30,6 @@ class Validator:
     def check_failure_rate(self) -> bool:
         now = time.time()
         if now - self.window_start > 60:
-            # Validation failure alerts are intentionally evaluated once per completed
-            # 60-second window, using a snapshot before resetting counters for the
-            # next window so rate calculation and reset stay atomic.
             failures = self.failures_in_window
             total = self.total_in_window
             self.failures_in_window = 0
@@ -29,23 +37,27 @@ class Validator:
             self.window_start = now
             if total == 0:
                 return False
-            rate = failures / total
-            if rate > 0.001:
-                return True
+            return failures / total > 0.001
         return False
 
-    def validate_timestamp(self, stream_name: str, record: Dict[str, Any], allow_equal: bool = False) -> Tuple[bool, str]:
+    def validate_timestamp(
+        self, stream_name: str, record: Dict[str, Any], allow_equal: bool = False
+    ) -> Tuple[bool, str]:
         ts = record.get("timestamp")
-        if ts is None or ts <= 0:
+        if not isinstance(ts, int) or ts <= 0:
             return False, "Invalid timestamp"
 
-        # BUG 3 FIX: Check exchange_timestamp against local clock, not local vs local.
-        exchange_ts = record.get("exchange_timestamp", ts)
-        sys_time = int(time.time() * 1000)
-        if abs(exchange_ts - sys_time) > 5000:
-            return False, f"Exchange timestamp out of 5s tolerance: {exchange_ts} vs {sys_time}"
+        # Exchange/local clock offset is a quality observation, not a reason to
+        # delete the market event.  NTP drift, replay data, and exchange clock
+        # behavior can all legitimately exceed an arbitrary wall-clock bound.
+        exchange_ts = record.get("exchange_timestamp")
+        if exchange_ts is not None and (
+            not isinstance(exchange_ts, int) or exchange_ts <= 0
+        ):
+            return False, "Invalid exchange timestamp"
 
-        if ts < self.last_timestamps[stream_name] or (ts == self.last_timestamps[stream_name] and not allow_equal):
+        previous = self.last_timestamps[stream_name]
+        if ts < previous or (ts == previous and not allow_equal):
             return False, "Timestamp regression"
 
         return True, ""
@@ -72,11 +84,6 @@ class Validator:
 
         if best_ask <= best_bid:
             reason = "Crossed book"
-            self._handle_failure("orderbook", reason, record)
-            return False, reason
-
-        if record.get("spread_bps", 0) >= 100:
-            reason = "Spread > 100bps"
             self._handle_failure("orderbook", reason, record)
             return False, reason
 
@@ -114,12 +121,9 @@ class Validator:
             self._handle_failure("trades", reason, record)
             return False, reason
 
-        if self.last_mid_price is not None:
-            if abs(price - self.last_mid_price) / self.last_mid_price > 0.05:
-                reason = "Price > 5% from mid_price"
-                self._handle_failure("trades", reason, record)
-                return False, reason
-
+        # Do not reject large price dislocations.  A liquidation cascade or
+        # other fast market can legitimately move several percent from the
+        # previous book mid; preserving it is essential for event studies.
         trade_id = record.get("trade_id", -1)
         if self.last_trade_id != -1 and trade_id <= self.last_trade_id:
             reason = "Duplicate/Regressive trade_id"
@@ -164,13 +168,22 @@ class Validator:
             self._handle_failure("markprice", reason, record)
             return False, reason
 
-        funding_rate = record.get("funding_rate", -2)
-        if funding_rate < -0.01 or funding_rate > 0.01:
-            reason = "Funding rate out of bounds"
+        # Funding extremes are valuable observations, not invalid records.
+        funding_rate = record.get("funding_rate")
+        if funding_rate is not None and not isinstance(funding_rate, (int, float)):
+            reason = "Invalid funding rate"
             self._handle_failure("markprice", reason, record)
             return False, reason
 
-        if record.get("next_funding_time", 0) <= record.get("exchange_timestamp", 0):
+        next_funding_time = record.get("next_funding_time")
+        exchange_ts = record.get("exchange_timestamp")
+        if next_funding_time is not None and (
+            not isinstance(next_funding_time, int) or next_funding_time <= 0
+        ):
+            reason = "Invalid next funding time"
+            self._handle_failure("markprice", reason, record)
+            return False, reason
+        if exchange_ts is not None and next_funding_time is not None and next_funding_time <= exchange_ts:
             reason = "Invalid next funding time"
             self._handle_failure("markprice", reason, record)
             return False, reason
@@ -180,7 +193,13 @@ class Validator:
 
     def _handle_failure(self, stream_name: str, reason: str, record: Dict[str, Any]):
         self.failures_in_window += 1
-        logger.error("Validation failed", stream=stream_name, reason=reason, timestamp=record.get("timestamp"), record=record)
+        logger.error(
+            "Validation failed",
+            stream=stream_name,
+            reason=reason,
+            timestamp=record.get("timestamp"),
+            record=record,
+        )
 
     def reset_stream(self, stream_name: str):
         if stream_name in self.last_timestamps:
@@ -191,7 +210,12 @@ class Validator:
             self.last_mid_price = None
 
     def reset(self):
-        self.last_timestamps = {"orderbook": 0, "trades": 0, "markprice": 0, "liquidation": 0}
+        self.last_timestamps = {
+            "orderbook": 0,
+            "trades": 0,
+            "markprice": 0,
+            "liquidation": 0,
+        }
         self.last_trade_id = -1
         self.last_mid_price = None
         self.failures_in_window = 0
