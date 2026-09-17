@@ -4,11 +4,13 @@ import json
 import time
 import websockets
 from typing import Callable, Awaitable, Optional
+from .backoff import BackoffExhausted, ExponentialBackoff
 from .utils import logger
 
 class WebSocketClient:
     def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None, stream_group: str = "websocket",
-                 on_raw_frame: Optional[Callable[..., None]] = None):
+                 on_raw_frame: Optional[Callable[..., None]] = None,
+                 backoff: Optional[ExponentialBackoff] = None):
         self.url = url
         self.stream_group = stream_group
         self.on_message = on_message
@@ -20,8 +22,14 @@ class WebSocketClient:
         self._on_message_takes_connection = self._accepts_connection_id(on_message)
         self.running = False
         self.connected = False
-        self.retry_delay = 1.0
+        # Full jitter and an attempt budget. The previous loop doubled a
+        # bare delay forever, so every client that dropped together
+        # retried together, indefinitely.
+        self.backoff = backoff or ExponentialBackoff(
+            base_delay=1.0, max_delay=60.0, max_attempts=64)
+        self.retry_delay = self.backoff.peek_cap()
         self.attempt = 0
+        self.reconnect_budget_exhausted = False
         self.connection_id = None
         self._connection_serial = 0
         self.malformed_frames = 0
@@ -60,7 +68,8 @@ class WebSocketClient:
                     self.connected = True
                     self._connection_serial += 1
                     self.connection_id = f"{self.stream_group}-{self._connection_serial}"
-                    self.retry_delay = 1.0
+                    self.backoff.reset()
+                    self.retry_delay = self.backoff.peek_cap()
                     self.attempt = 0
                     logger.info("WebSocket connected")
 
@@ -131,9 +140,23 @@ class WebSocketClient:
 
             if self.running:
                 self.attempt += 1
-                logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=self.retry_delay)
-                await asyncio.sleep(self.retry_delay)
-                self.retry_delay = min(self.retry_delay * 2, 60.0)
+                try:
+                    delay = self.backoff.next_delay()
+                except BackoffExhausted:
+                    # A permanently broken endpoint must stop being hammered,
+                    # and that must be visible in the data, not just in logs.
+                    self.reconnect_budget_exhausted = True
+                    self.running = False
+                    logger.error("reconnect_budget_exhausted",
+                                 url=self.url, attempts=self.attempt)
+                    if self.on_quality_event:
+                        self.on_quality_event(
+                            "ERROR", f"reconnect_budget_exhausted:{self.attempt}",
+                            self.connection_id, self.stream_group)
+                    break
+                self.retry_delay = delay
+                logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=delay)
+                await asyncio.sleep(delay)
 
     async def wait_connected(self, timeout_seconds: float = 30.0) -> bool:
         deadline = asyncio.get_event_loop().time() + timeout_seconds

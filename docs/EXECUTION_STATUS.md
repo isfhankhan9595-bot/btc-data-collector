@@ -40,7 +40,6 @@ Documentation is never a substitute for implementation.
 | D10 | No raw wire capture layer. `binance_orderbook_raw` stores normalised levels, not exact payloads; there is no connection id, no REST request/response lineage. Deterministic replay is not currently possible from stored data. | 6 |
 | D11 | OKX adapter declares `trades`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders` in `channel_event_types` but `normalize()` only implements `books`. Everything else silently returns `[]`. | 14 |
 | D12 | Bybit adapter merges ticker deltas into shared `_ticker_state` and emits merged values without marking which fields were carried forward. Staleness is not observable. | 13 |
-| D13 | WebSocket reconnect backoff has no jitter; no maximum retry cap; no recovery deduplication. | 23 |
 | D14 | `binance_snapshot_bridge` and the USD-M sequence rules are implemented from assumption and have not been re-verified against current official Binance documentation. | 4 |
 
 ---
