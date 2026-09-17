@@ -14,7 +14,16 @@ class QualityEvent:
     quality_state: str = "VALID"; connection_id: Optional[str] = None
     def record(self): return asdict(self)
 class BookQualityStateMachine:
-    def __init__(self): self.state = BookQuality.VALID
+    """Starts RECOVERING, not VALID.
+
+    A book that has never been bridged by a snapshot holds no authoritative
+    state, so reporting VALID was a false claim: quality events and raw
+    records written before the first bridge were labelled VALID even though
+    no snapshot had ever been applied. RECOVERING is the truthful initial
+    state -- awaiting a bridge -- and it makes run_collector request the
+    startup snapshot through the normal recovery path.
+    """
+    def __init__(self): self.state = BookQuality.RECOVERING
     def gap(self): self.state = BookQuality.SEQUENCE_GAP; return self.state
     def resync(self): self.state = BookQuality.RECOVERING; return self.state
     def recovered(self): self.state = BookQuality.VALID; return self.state

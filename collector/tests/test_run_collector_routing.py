@@ -37,6 +37,25 @@ def _valid_liquidation_msg():
     return {"o": {"S": "BUY", "p": "100.5", "q": "1.0", "T": int(time.time() * 1000), "X": "FILLED", "f": "IOC"}}
 
 
+def _seed_bridged_book(app, update_id=10):
+    """Bridge the book with a snapshot, as live does at startup.
+
+    A fresh LocalBook is RECOVERING and buffers diffs until a snapshot
+    bridges it. Tests that exercise diff handling must establish that
+    bridge first rather than relying on an unbridged book accepting diffs.
+    """
+    from decimal import Decimal as _D
+    snapshot = CanonicalOrderBookEvent(
+        "BINANCE", "orderbook", None, None, 0,
+        bids=tuple((_D("100.0") - _D("0.1") * i, _D("1.0")) for i in range(10)),
+        asks=tuple((_D("101.0") + _D("0.1") * i, _D("1.0")) for i in range(10)),
+        update_id=update_id, is_snapshot=True,
+    )
+    app.binance_book.snapshot(snapshot)
+    app.binance_book.state.recovered()
+    return app
+
+
 def _app_without_init():
     app = CollectorApp.__new__(CollectorApp)
     app.raw_messages_logged = 20
@@ -87,7 +106,7 @@ def test_route_stream_matches_case_insensitive_required_streams():
 
 @pytest.mark.asyncio
 async def test_handle_message_routes_lowercase_trade_and_markprice_to_health_monitor():
-    app = _app_without_init()
+    app = _seed_bridged_book(_app_without_init())
     await app.handle_message({"stream": "btcusdt@depth@100ms", "data": _valid_depth_msg()})
     await app.handle_message({"stream": "btcusdt@aggtrade", "data": _valid_trade_msg()})
     await app.handle_message({"stream": "btcusdt@markprice@1s", "data": _valid_mark_msg()})
@@ -101,7 +120,7 @@ async def test_handle_message_routes_lowercase_trade_and_markprice_to_health_mon
 
 @pytest.mark.asyncio
 async def test_diff_depth_is_processed_from_local_book_with_received_timestamp():
-    app = _app_without_init()
+    app = _seed_bridged_book(_app_without_init())
     receive_ts = 123_456
     await app.handle_message({"stream": "btcusdt@depth@100ms", "data": _valid_depth_msg()}, local_receive_ts=receive_ts)
     record = app.ob_writer.write.call_args.args[0]
@@ -287,3 +306,25 @@ async def test_forceorder_message_with_real_health_monitor_writes_without_reject
     assert app.stream_counters["liquidation"]["written"] == 1
     assert app.stream_counters["liquidation"]["rejected"] == 0
     assert app.health_monitor.messages_per_minute["liquidation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unbridged_book_never_reports_valid_and_buffers_diffs():
+    """Regression: a book with no snapshot must not claim VALID.
+
+    Previously BookQualityStateMachine started in VALID, so every quality
+    event and raw record written before the first bridge was labelled VALID
+    despite no snapshot having been applied.
+    """
+    from collector.collector.quality_events import BookQuality
+
+    app = _app_without_init()
+    app.binance_book = LocalBook("BINANCE")  # genuinely fresh: never bridged
+    assert app.binance_book.state.state is BookQuality.RECOVERING
+    assert app.binance_book.previous is None
+
+    await app.handle_message({"stream": "btcusdt@depth@100ms", "data": _valid_depth_msg()})
+
+    # Buffered, not applied: no authoritative book existed to update.
+    app.ob_writer.write.assert_not_called()
+    assert app.binance_book.state.state is not BookQuality.VALID
