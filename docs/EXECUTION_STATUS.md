@@ -125,5 +125,50 @@ every subsequent phase meaningless.
 
 ### Phases 2+ — NOT STARTED
 
-Remaining scope is tracked in the defect table above (D9–D14). No later phase
-may be marked complete on the strength of a plan.
+Remaining scope is tracked in the defect table above (D9–D14), plus D16 below.
+
+#### Adapter layer: verified state (audited 2026-09-18, read from source)
+
+The multi-exchange layer is **declared but not built**. Measured sizes:
+`binance.py` 32 lines, `bybit.py` 26, `okx.py` 16. These are stubs written as
+minified one-liners, not implementations.
+
+| Adapter | Channels declared | Channels implemented |
+|---|---|---|
+| Binance | 5 | 5 (unverified against official docs — D14) |
+| Bybit | 4 | 4 (ticker staleness unobservable — D12) |
+| OKX | 7 | **1** (`books` only — D11 confirmed) |
+
+`OKXAdapter.normalize()` early-returns `[]` for any channel that is not
+`books`, so `trades`, `mark-price`, `index-tickers`, `open-interest`,
+`funding-rate` and `liquidation-orders` are advertised as supported and
+silently produce nothing.
+
+| # | Defect | Severity | Phase |
+|---|---|---|---|
+| D16 | Every adapter's `normalize()` ends in a bare `return []`. An unroutable, malformed or unimplemented message is discarded with no quality event, no counter and no log. This is silent data loss and violates the project's core rule that unavailable information must be marked, not dropped. | **High** | 12–15 |
+
+#### Verified dependency order for remaining work
+
+```
+D16 silent-discard  ──┐  (independent, small, unblocks honest measurement)
+D13 recovery bounds ──┤  (independent)
+D14 Binance docs    ──┤  (independent; needs current official Binance USD-M docs)
+                      │
+D10 raw wire capture ─┴──> D9 replay engine ──> live/replay parity
+                                                     │
+D11 OKX, D12 Bybit ─────────────────────────────────┴──> cross-exchange alignment
+                                                              │
+                                                              └──> features ──> labels ──> splits
+```
+
+`D10` is the architectural keystone: deterministic replay is impossible from
+what is currently stored, because `binance_orderbook_raw` persists normalised
+levels rather than exact payloads, with no connection id and no REST
+request/response lineage. Nothing downstream of replay can be validated until
+that layer exists.
+
+**Exchange work requires current official documentation.** D11, D12 and D14
+must not be implemented from memory; the sequence, timestamp, trade-side and
+liquidation-side semantics have to be read from Binance USD-M, Bybit v5 and
+OKX v5 docs at implementation time.
