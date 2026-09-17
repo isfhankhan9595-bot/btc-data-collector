@@ -60,6 +60,8 @@ jobs:
           python -c "import collector.scripts.gap_report"
           python -c "import collector.collector.coverage"
           python -c "import collector.scripts.check_standalone"
+          python -c "import collector.collector.replay"
+          python -c "import collector.scripts.replay"
 
       - name: Run test suite
         env:
