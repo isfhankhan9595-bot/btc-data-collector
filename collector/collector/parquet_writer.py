@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
+from datetime import date as _date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -13,6 +13,47 @@ import pyarrow.parquet as pq
 
 from .utils import logger
 from .storage_layout import SegmentKind, iter_segments, parse_segment_name, segment_path
+
+
+def _epoch_ms(value: Any) -> Optional[int]:
+    """Normalise a schema-legal timestamp value to epoch milliseconds.
+
+    The stream schemas declare ``timestamp`` as ``pa.timestamp("ms", tz="UTC")``,
+    so PyArrow legitimately accepts ints, datetimes and ``pandas.Timestamp``
+    objects for that column. Segment metadata is JSON, which accepts none of the
+    datetime forms. Normalising here keeps a schema-legal record from raising
+    inside ``_close_segment`` and destroying an otherwise publishable segment.
+
+    Unknown types return ``None`` (metadata records absence) rather than raising:
+    losing a metadata hint must never cost us the segment itself.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return None if value != value else int(value)  # NaN -> None
+    if isinstance(value, datetime):
+        moment = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return int(moment.timestamp() * 1000)
+    if isinstance(value, _date):
+        return int(datetime(value.year, value.month, value.day, tzinfo=timezone.utc).timestamp() * 1000)
+    # pandas.Timestamp / numpy.datetime64 and anything else exposing a
+    # conversion protocol, without importing pandas into the hot path.
+    for attribute in ("to_pydatetime", "item"):
+        converter = getattr(value, attribute, None)
+        if callable(converter):
+            try:
+                converted = converter()
+            except (ValueError, TypeError, OverflowError):
+                return None
+            if isinstance(converted, datetime):
+                return _epoch_ms(converted)
+            if isinstance(converted, int):
+                return converted
+    return None
 
 
 class ParquetWriter:
@@ -45,7 +86,7 @@ class ParquetWriter:
         self._open_segment()
 
     def _get_current_hour_str(self) -> str:
-        return datetime.utcnow().strftime("%Y-%m-%d-%H")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
 
     def _emit_quality(self, event_type: str, reason: str) -> None:
         event = {
@@ -62,42 +103,80 @@ class ParquetWriter:
             self.quality_event_sink(event)
 
     def _next_sequence(self, hour: str) -> int:
+        """Return the next unused segment sequence for ``hour``.
+
+        A single directory scan populates the cache for *every* logical hour
+        present on disk. The previous implementation rescanned the stream
+        directory on each hour rollover, which put an O(files) scan on the
+        ingest path of a long-running collector.
+
+        Collision semantics are preserved and kept hour-local: an
+        unresolvable legacy/segment collision in some unrelated hour must not
+        stop us writing the current hour, so such hours are left uncached and
+        raise only when they are actually requested.
+        """
         cached = self._sequence_cache.get(hour)
         if cached is not None:
             return cached
 
         date, hour_number = hour.rsplit("-", 1)
-        entries = list(
-            iter_segments(
-                self.base_dir,
-                self.stream_name,
-                date=date,
-                hour=int(hour_number),
-                on_collision="raise",
-            )
-        )
-        values: list[int] = []
-        has_legacy = False
-        for path in entries:
-            parsed = parse_segment_name(path)
-            if parsed is None:
+        requested = (date, int(hour_number))
+
+        # One pass over the stream directory, grouped by logical hour.
+        max_sequence: dict[tuple[str, int], int] = {}
+        has_legacy: dict[tuple[str, int], bool] = {}
+        # Derived rather than read from self.stream_dir: sequence allocation
+        # runs during __init__ and must not depend on attribute ordering.
+        stream_dir = Path(self.base_dir) / "raw" / self.stream_name
+        if stream_dir.exists():
+            for path in stream_dir.iterdir():
+                if not path.is_file():
+                    continue
+                parsed = parse_segment_name(path)
+                if parsed is None:
+                    continue
+                row_date, row_hour, sequence, kind = parsed
+                key = (row_date, row_hour)
+                if kind is SegmentKind.LEGACY_HOURLY:
+                    has_legacy[key] = True
+                elif sequence is not None:
+                    current = max_sequence.get(key)
+                    if current is None or sequence > current:
+                        max_sequence[key] = sequence
+
+        for key in set(max_sequence) | set(has_legacy):
+            hour_key = f"{key[0]}-{key[1]:02d}"
+            legacy_present = has_legacy.get(key, False)
+            highest = max_sequence.get(key)
+
+            if legacy_present and highest is not None:
+                # Ambiguous logical hour. Never guess: defer to iter_segments,
+                # which is the single authority on collision policy. Only the
+                # hour actually being requested is allowed to raise here.
+                if key == requested:
+                    list(
+                        iter_segments(
+                            self.base_dir,
+                            self.stream_name,
+                            date=key[0],
+                            hour=key[1],
+                            on_collision="raise",
+                        )
+                    )
                 continue
-            _, _, sequence, kind = parsed
-            if kind is SegmentKind.LEGACY_HOURLY:
-                has_legacy = True
-            elif sequence is not None:
-                values.append(sequence)
 
-        if values:
-            next_sequence = max(values) + 1
-        elif has_legacy:
-            next_sequence = 1
-            self._emit_quality("STORAGE_MIGRATION", "legacy_hourly_file_present; starting sequenced writer at 1")
-        else:
-            next_sequence = 0
+            if highest is not None:
+                self._sequence_cache[hour_key] = highest + 1
+            elif legacy_present:
+                self._sequence_cache[hour_key] = 1
+                if key == requested:
+                    self._emit_quality(
+                        "STORAGE_MIGRATION",
+                        "legacy_hourly_file_present; starting sequenced writer at 1",
+                    )
 
-        self._sequence_cache[hour] = next_sequence
-        return next_sequence
+        # An hour with nothing on disk starts at sequence 0.
+        return self._sequence_cache.setdefault(hour, 0)
 
     def _segment_paths(self) -> tuple[Path, Path, Path]:
         final = segment_path(self.base_dir, self.stream_name, self.current_hour, self._seq)
@@ -163,7 +242,7 @@ class ParquetWriter:
             self.current_hour, self._seq = hour, self._next_sequence(hour)
             self._open_segment()
         self.buffer.append(record)
-        ts = record.get("timestamp")
+        ts = _epoch_ms(record.get("timestamp"))
         if self._first_record_ts is None:
             self._first_record_ts = ts
         self._last_record_ts = ts
@@ -201,19 +280,30 @@ class ParquetWriter:
         finally:
             os.close(parent_fd)
         counter.unlink(missing_ok=True)
+        # The segment is already durably published above. A metadata failure
+        # must therefore never propagate: it would kill the ingest task over a
+        # sidecar hint while the data itself is safely on disk. Surface it as a
+        # durable quality event instead of silently swallowing it.
         meta = Path(str(final) + ".meta.json")
         meta_tmp = Path(str(meta) + ".tmp")
-        with meta_tmp.open("w", encoding="utf-8") as handle:
-            json.dump({"record_count": self.record_count, "first_record_ts": self._first_record_ts,
-                       "last_record_ts": self._last_record_ts}, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(meta_tmp, meta)
-        parent_fd = os.open(str(final.parent), os.O_RDONLY)
         try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+            with meta_tmp.open("w", encoding="utf-8") as handle:
+                json.dump({"record_count": self.record_count, "first_record_ts": self._first_record_ts,
+                           "last_record_ts": self._last_record_ts}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(meta_tmp, meta)
+            parent_fd = os.open(str(final.parent), os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except (OSError, TypeError, ValueError) as exc:
+            meta_tmp.unlink(missing_ok=True)
+            self._emit_quality(
+                "STORAGE_METADATA_FAILED",
+                f"segment published but metadata sidecar failed: {type(exc).__name__}: {exc}",
+            )
         logger.info("closed_parquet_segment", stream=self.stream_name, file=str(final), rows=self.record_count)
         self._sequence_cache[self.current_hour] = self._seq + 1
         if open_next:

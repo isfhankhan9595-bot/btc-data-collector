@@ -213,12 +213,12 @@ def test_parquet_sidecar_uses_first_record_timestamp(temp_dir, monkeypatch):
 
     class MockDatetime:
         @classmethod
-        def utcnow(cls):
-            return datetime.datetime(2026, 6, 3, 13)
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 6, 3, 13, tzinfo=tz)
 
         @classmethod
-        def utcfromtimestamp(cls, timestamp):
-            return datetime.datetime.utcfromtimestamp(timestamp)
+        def fromtimestamp(cls, timestamp, tz=None):
+            return datetime.datetime.fromtimestamp(timestamp, tz)
 
     monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
 
@@ -250,12 +250,12 @@ def test_empty_parquet_sidecar_falls_back_to_declared_start(temp_dir, monkeypatc
 
     class MockDatetime:
         @classmethod
-        def utcnow(cls):
-            return datetime.datetime(2026, 6, 3, 13)
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 6, 3, 13, tzinfo=tz)
 
         @classmethod
-        def utcfromtimestamp(cls, timestamp):
-            return datetime.datetime.utcfromtimestamp(timestamp)
+        def fromtimestamp(cls, timestamp, tz=None):
+            return datetime.datetime.fromtimestamp(timestamp, tz)
 
     monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
 
@@ -277,12 +277,12 @@ def test_parquet_sidecar_created_next_to_parquet_file(temp_dir, monkeypatch):
 
     class MockDatetime:
         @classmethod
-        def utcnow(cls):
-            return datetime.datetime(2026, 6, 3, 13)
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 6, 3, 13, tzinfo=tz)
 
         @classmethod
-        def utcfromtimestamp(cls, timestamp):
-            return datetime.datetime.utcfromtimestamp(timestamp)
+        def fromtimestamp(cls, timestamp, tz=None):
+            return datetime.datetime.fromtimestamp(timestamp, tz)
 
     monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
 

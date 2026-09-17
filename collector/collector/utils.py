@@ -2,10 +2,8 @@ import os
 import structlog
 import logging
 import logging.handlers
-from telegram_bot import (
-    send_telegram_message,
-    validate_telegram_startup,
-)
+
+from .notifications import send_alert, validate_startup
 
 def setup_logging(log_dir="logs"):
     os.makedirs(log_dir, exist_ok=True)
@@ -48,8 +46,15 @@ def setup_logging(log_dir="logs"):
 logger = setup_logging()
 
 def send_telegram_alert(message: str) -> bool:
-    try:
-        return send_telegram_message(message, parse_mode=None)
-    except Exception as e:
-        logger.warning("Telegram alert failed open", error=str(e), message=message)
-        return False
+    """Best-effort operator alert.
+
+    Retained under its historical name so existing call sites keep working.
+    Delivery is delegated to the optional notification backend, which fails
+    open: ingestion correctness never depends on an alert being delivered.
+    """
+    return send_alert(message)
+
+
+def validate_telegram_startup():
+    """Best-effort startup probe of the optional notification backend."""
+    return validate_startup()
