@@ -58,6 +58,8 @@ jobs:
           python -c "import collector.pipeline.dataset_assembler"
           python -c "import collector.scripts.verify_dataset"
           python -c "import collector.scripts.gap_report"
+          python -c "import collector.collector.coverage"
+          python -c "import collector.scripts.check_standalone"
 
       - name: Run test suite
         env:
@@ -68,29 +70,4 @@ jobs:
       - name: Assert collector does not import the trading bot
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/collector
-        run: |
-          # The collector must stand alone. A hard dependency on the
-          # repository-root telegram_bot.py is a standalone-ness violation.
-          python - <<'PY'
-          import ast, pathlib, sys
-          offenders = []
-          for path in pathlib.Path("collector").rglob("*.py"):
-              if "tests" in path.parts:
-                  continue
-              tree = ast.parse(path.read_text(), filename=str(path))
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      names = [a.name for a in node.names]
-                  elif isinstance(node, ast.ImportFrom):
-                      names = [node.module or ""]
-                  else:
-                      continue
-                  for name in names:
-                      if name.split(".")[0] == "telegram_bot":
-                          offenders.append(f"{path}:{node.lineno}")
-          if offenders:
-              print("Hard telegram_bot import(s) found:")
-              print("\n".join(offenders))
-              sys.exit(1)
-          print("No hard telegram_bot imports.")
-          PY
+        run: python -m collector.scripts.check_standalone collector

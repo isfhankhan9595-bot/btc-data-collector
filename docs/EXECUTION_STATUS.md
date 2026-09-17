@@ -17,7 +17,7 @@ Documentation is never a substitute for implementation.
 | Merged PRs | #1 (Phase 2 storage contract), #2 (Phase 3 runtime integrity) |
 | Open PRs | #3 (`claude-test-pr`) — unrelated test PR, not project work |
 | Stale branches | `phase-3-fixes` (superseded by `phase-3-runtime-integrity`) |
-| Test baseline on `main` | **3 failing**, 170 passing |
+| Test baseline on `main` | **3 failing**, 170 passing (191 passing after Phase 0) |
 | CI | None. Only a destructive one-shot importer workflow. |
 
 ### Baseline defects found on `main`
@@ -36,7 +36,6 @@ Documentation is never a substitute for implementation.
 
 | # | Defect | Phase |
 |---|---|---|
-| D8 | `scripts/gap_report.py` computes coverage as `(total_ms - gap_ms)/total_ms`. A stream with three observations one second apart reports **100% coverage**. Pre-first-observation and post-last-observation periods are not counted. This is a false-clean report. | 21/22 |
 | D9 | `scripts/replay_test.py` is not a replay engine. It loads a derived Parquet file and asserts bounds on columns. There is no recorded-clock replay, no raw event source, no determinism check. | 8 |
 | D10 | No raw wire capture layer. `binance_orderbook_raw` stores normalised levels, not exact payloads; there is no connection id, no REST request/response lineage. Deterministic replay is not currently possible from stored data. | 6 |
 | D11 | OKX adapter declares `trades`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders` in `channel_event_types` but `normalize()` only implements `books`. Everything else silently returns `[]`. | 14 |
@@ -70,7 +69,106 @@ Documentation is never a substitute for implementation.
   `tests/test_phase0_standalone.py` (5).
 - **Suite:** 191 passed, 0 failed.
 
-### Phases 1+ — NOT STARTED
+### Phase 1 — Truthful coverage — **COMPLETE**
 
-Dependency order and remaining scope are tracked in the defect table above
-(D8–D14). No later phase may be marked complete on the strength of a plan.
+- **Branch:** `phase-01-truthful-coverage` (base: `main` @ `0bfbe74`)
+- **Objective:** make it structurally impossible for a coverage report to
+  claim completeness it cannot evidence. Closes **D8**.
+- **Changes:**
+  - New `collector/collector/coverage.py`: evidence-interval coverage model.
+    Each observation covers `[t, t + tolerance)`; covered time is the union
+    of those intervals intersected with the *requested* window. Leading,
+    interior and trailing gaps are classified; complete absence is a
+    first-class `ABSENT` state.
+  - `scripts/gap_report.py` rewritten onto the model. Adds `--json`,
+    `--whole-range`, `--streams`, `--data-dir`, and an exit code keyed off
+    `is_trustworthy`.
+  - Invalid / duplicate / out-of-order timestamps are counted and reported,
+    never silently dropped. Unreadable segments and legacy/`.seg` storage
+    collisions poison the verdict instead of being skipped.
+  - New `docs/COVERAGE_MODEL.md`.
+- **Tests:** `tests/test_coverage.py` (37), `tests/test_gap_report.py` (19,
+  rewritten from 2). Includes the 20 required adversarial scenarios, a
+  partition invariant (`covered + gaps == window`) and a property test over
+  500 random inputs proving 100% is unreachable without full evidence.
+- **Old tests:** the two prior `test_gap_report.py` tests asserted the false
+  contract (one required `100.00%` for three observations spanning five
+  seconds of a day). They were rewritten to the correct contract, not
+  weakened or deleted.
+- **Suite:** 262 passed, 0 failed.
+
+#### Phase 1 also closes a Phase 0 regression (D15)
+
+`main` was merged with **red CI**. The ledger recorded Phase 0 as complete on
+the strength of a local `pytest` run; the workflow itself was failing at the
+step *Assert collector does not import the trading bot* (run
+`35271857845`, job `test`, step 8). Steps 1-7 passed.
+
+Cause: Phase 0 added `notifications.py`, which probes for an optional Telegram
+backend behind a guarded, function-local import — the correct standalone
+design — and in the same change added an inline AST scan that flagged the
+name `telegram_bot` anywhere. The two contradicted each other, so CI could
+never be green.
+
+Fix: the scan is replaced by `collector/scripts/check_standalone.py`, which
+enforces *reachability* rather than naming. An import is a violation unless it
+sits inside a `try` with at least one handler. Module-level bare imports,
+unguarded function-local imports, and imports in `else:`/`finally:` are
+violations; guarded imports are not. The checker has 17 of its own tests,
+including a test that the real package passes.
+
+This is in scope for Phase 1 because a red CI makes the verification step of
+every subsequent phase meaningless.
+- **Live verification:** on a synthetic 3-observation day the pre-fix code
+  printed `100.00%` for all three streams and exited `0`; the new code prints
+  `0.0017%`–`0.0081%` and exits `1`.
+
+### Phases 2+ — NOT STARTED
+
+Remaining scope is tracked in the defect table above (D9–D14), plus D16 below.
+
+#### Adapter layer: verified state (audited 2026-09-18, read from source)
+
+The multi-exchange layer is **declared but not built**. Measured sizes:
+`binance.py` 32 lines, `bybit.py` 26, `okx.py` 16. These are stubs written as
+minified one-liners, not implementations.
+
+| Adapter | Channels declared | Channels implemented |
+|---|---|---|
+| Binance | 5 | 5 (unverified against official docs — D14) |
+| Bybit | 4 | 4 (ticker staleness unobservable — D12) |
+| OKX | 7 | **1** (`books` only — D11 confirmed) |
+
+`OKXAdapter.normalize()` early-returns `[]` for any channel that is not
+`books`, so `trades`, `mark-price`, `index-tickers`, `open-interest`,
+`funding-rate` and `liquidation-orders` are advertised as supported and
+silently produce nothing.
+
+| # | Defect | Severity | Phase |
+|---|---|---|---|
+| D16 | Every adapter's `normalize()` ends in a bare `return []`. An unroutable, malformed or unimplemented message is discarded with no quality event, no counter and no log. This is silent data loss and violates the project's core rule that unavailable information must be marked, not dropped. | **High** | 12–15 |
+
+#### Verified dependency order for remaining work
+
+```
+D16 silent-discard  ──┐  (independent, small, unblocks honest measurement)
+D13 recovery bounds ──┤  (independent)
+D14 Binance docs    ──┤  (independent; needs current official Binance USD-M docs)
+                      │
+D10 raw wire capture ─┴──> D9 replay engine ──> live/replay parity
+                                                     │
+D11 OKX, D12 Bybit ─────────────────────────────────┴──> cross-exchange alignment
+                                                              │
+                                                              └──> features ──> labels ──> splits
+```
+
+`D10` is the architectural keystone: deterministic replay is impossible from
+what is currently stored, because `binance_orderbook_raw` persists normalised
+levels rather than exact payloads, with no connection id and no REST
+request/response lineage. Nothing downstream of replay can be validated until
+that layer exists.
+
+**Exchange work requires current official documentation.** D11, D12 and D14
+must not be implemented from memory; the sequence, timestamp, trade-side and
+liquidation-side semantics have to be read from Binance USD-M, Bybit v5 and
+OKX v5 docs at implementation time.
