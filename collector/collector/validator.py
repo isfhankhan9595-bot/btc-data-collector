@@ -7,13 +7,17 @@ those regimes rather than having the collector censor them.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from .quality_events import QualityEvent, QualityEventType
 from .utils import logger
 
 
 class Validator:
+    CLOCK_DRIFT_THRESHOLD_MS = 5_000
+
     def __init__(self):
         self.last_timestamps: Dict[str, int] = {
             "orderbook": 0,
@@ -26,6 +30,14 @@ class Validator:
         self.failures_in_window = 0
         self.total_in_window = 0
         self.window_start = time.time()
+        self.quality_events: list[QualityEvent] = []
+
+    @staticmethod
+    def _finite(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def check_failure_rate(self) -> bool:
         now = time.time()
@@ -47,14 +59,33 @@ class Validator:
         if not isinstance(ts, int) or ts <= 0:
             return False, "Invalid timestamp"
 
-        # Exchange/local clock offset is a quality observation, not a reason to
-        # delete the market event.  NTP drift, replay data, and exchange clock
-        # behavior can all legitimately exceed an arbitrary wall-clock bound.
         exchange_ts = record.get("exchange_timestamp")
         if exchange_ts is not None and (
             not isinstance(exchange_ts, int) or exchange_ts <= 0
         ):
             return False, "Invalid exchange timestamp"
+
+        if exchange_ts is not None:
+            drift_ms = abs(exchange_ts - ts)
+            if drift_ms > self.CLOCK_DRIFT_THRESHOLD_MS:
+                self.quality_events.append(
+                    QualityEvent(
+                        exchange=str(record.get("exchange", "UNKNOWN")),
+                        stream=stream_name,
+                        event_type=QualityEventType.CLOCK_ANOMALY,
+                        reason="clock_drift",
+                        gap_size_ms=drift_ms,
+                        local_ts=ts,
+                        quality_state="VALID",
+                        connection_id=record.get("connection_id"),
+                    )
+                )
+                logger.warning(
+                    "Clock drift observed; preserving event",
+                    stream=stream_name,
+                    exchange=record.get("exchange", "UNKNOWN"),
+                    drift_ms=drift_ms,
+                )
 
         previous = self.last_timestamps[stream_name]
         if ts < previous or (ts == previous and not allow_equal):
@@ -77,7 +108,7 @@ class Validator:
 
         best_bid = record.get("best_bid", 0)
         best_ask = record.get("best_ask", 0)
-        if best_bid <= 0 or best_ask <= 0:
+        if not self._finite(best_bid) or not self._finite(best_ask) or best_bid <= 0 or best_ask <= 0:
             reason = "Invalid best bid/ask"
             self._handle_failure("orderbook", reason, record)
             return False, reason
@@ -87,13 +118,20 @@ class Validator:
             self._handle_failure("orderbook", reason, record)
             return False, reason
 
-        if record.get("total_bid_qty", 0) <= 0 or record.get("total_ask_qty", 0) <= 0:
+        total_bid_qty = record.get("total_bid_qty", 0)
+        total_ask_qty = record.get("total_ask_qty", 0)
+        if (
+            not self._finite(total_bid_qty)
+            or not self._finite(total_ask_qty)
+            or total_bid_qty <= 0
+            or total_ask_qty <= 0
+        ):
             reason = "Invalid total qty"
             self._handle_failure("orderbook", reason, record)
             return False, reason
 
         obi = record.get("obi", -2)
-        if obi < -1.0 or obi > 1.0:
+        if not self._finite(obi) or obi < -1.0 or obi > 1.0:
             reason = "OBI out of bounds"
             self._handle_failure("orderbook", reason, record)
             return False, reason
@@ -111,19 +149,17 @@ class Validator:
             return False, reason
 
         price = record.get("price", 0)
-        if price <= 0:
+        quantity = record.get("quantity", 0)
+        if not self._finite(price) or price <= 0:
             reason = "Invalid price"
             self._handle_failure("trades", reason, record)
             return False, reason
 
-        if record.get("quantity", 0) <= 0:
+        if not self._finite(quantity) or quantity <= 0:
             reason = "Invalid quantity"
             self._handle_failure("trades", reason, record)
             return False, reason
 
-        # Do not reject large price dislocations.  A liquidation cascade or
-        # other fast market can legitimately move several percent from the
-        # previous book mid; preserving it is essential for event studies.
         trade_id = record.get("trade_id", -1)
         if self.last_trade_id != -1 and trade_id <= self.last_trade_id:
             reason = "Duplicate/Regressive trade_id"
@@ -142,12 +178,14 @@ class Validator:
             self._handle_failure("liquidation", reason, record)
             return False, reason
 
-        if record.get("price", 0) <= 0:
+        price = record.get("price", 0)
+        quantity = record.get("quantity", 0)
+        if not self._finite(price) or price <= 0:
             reason = "Invalid price"
             self._handle_failure("liquidation", reason, record)
             return False, reason
 
-        if record.get("quantity", 0) <= 0:
+        if not self._finite(quantity) or quantity <= 0:
             reason = "Invalid quantity"
             self._handle_failure("liquidation", reason, record)
             return False, reason
@@ -163,14 +201,14 @@ class Validator:
             self._handle_failure("markprice", reason, record)
             return False, reason
 
-        if record.get("mark_price", 0) <= 0:
+        mark_price = record.get("mark_price", 0)
+        if not self._finite(mark_price) or mark_price <= 0:
             reason = "Invalid mark price"
             self._handle_failure("markprice", reason, record)
             return False, reason
 
-        # Funding extremes are valuable observations, not invalid records.
         funding_rate = record.get("funding_rate")
-        if funding_rate is not None and not isinstance(funding_rate, (int, float)):
+        if funding_rate is not None and not self._finite(funding_rate):
             reason = "Invalid funding rate"
             self._handle_failure("markprice", reason, record)
             return False, reason
@@ -190,6 +228,11 @@ class Validator:
 
         self.last_timestamps["markprice"] = record["timestamp"]
         return True, ""
+
+    def drain_quality_events(self) -> list[QualityEvent]:
+        events = self.quality_events
+        self.quality_events = []
+        return events
 
     def _handle_failure(self, stream_name: str, reason: str, record: Dict[str, Any]):
         self.failures_in_window += 1
@@ -221,3 +264,4 @@ class Validator:
         self.failures_in_window = 0
         self.total_in_window = 0
         self.window_start = time.time()
+        self.quality_events = []
