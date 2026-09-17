@@ -111,3 +111,8 @@ QUALITY_EVENTS_SCHEMA = pa.schema([
     ("update_id", pa.int64()), ("first_update_id", pa.int64()), ("previous_update_id", pa.int64()), ("local_receive_ts", pa.timestamp("ms", tz="UTC")),
     ("local_process_ts", pa.timestamp("ms", tz="UTC")),
 ], metadata={"schema_version": "1.1", "stream_name": "quality_events", "symbol": SYMBOL})
+
+# Raw wire capture (Phase 2). Defined in collector.collector.raw_capture so the
+# capture contract lives beside the records it describes; re-exported here so
+# every stream schema remains discoverable from one module.
+from .raw_capture import RAW_REST_SCHEMA, RAW_WIRE_SCHEMA  # noqa: E402,F401

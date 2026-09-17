@@ -18,9 +18,12 @@ from collector.collector.config import (
     QUALITY_EVENTS_SCHEMA,
     BINANCE_ORDERBOOK_RAW_SCHEMA,
     BINANCE_TRADES_RAW_SCHEMA,
+    RAW_REST_SCHEMA,
+    RAW_WIRE_SCHEMA,
     SYMBOL,
 )
 from collector.collector.adapters.binance import BinanceAdapter
+from collector.collector.raw_capture import RawCapture, RawRestRecord, RawWireRecord
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent
 from collector.collector.quality_events import BookQuality, QualityEvent, QualityEventType
@@ -56,6 +59,8 @@ class CollectorApp:
             "openinterest": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "liquidation": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "unrouted": {"received": 0},
+            "malformed_envelope": {"received": 0},
+            "adapter_unhandled": {"received": 0},
         }
         self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}, "openinterest": {}, "liquidation": {}}
 
@@ -85,19 +90,27 @@ class CollectorApp:
         self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
         self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA)
         self.liq_writer = ParquetWriter("liquidation", LIQUIDATION_SCHEMA)
+        self.raw_wire_writer = ParquetWriter("raw_wire", RAW_WIRE_SCHEMA, quality_event_sink=self._persist_quality_event)
+        self.raw_rest_writer = ParquetWriter("raw_rest", RAW_REST_SCHEMA, quality_event_sink=self._persist_quality_event)
+        self.raw_capture = RawCapture(self.raw_wire_writer, self.raw_rest_writer,
+                                      quality_event_sink=self._persist_quality_event)
+        # Adapter drops become durable quality events instead of vanishing.
+        self.binance_adapter.set_unhandled_sink(self._record_adapter_unhandled)
 
         self.ws_clients = [
             WebSocketClient(
                 url=BINANCE_PUBLIC_WS_URL,
                 on_message=self.handle_message,
                 on_reconnect=self._make_reconnect_handler(BINANCE_PUBLIC_WS_URL),
-                on_quality_event=self._websocket_quality_event, stream_group="public"
+                on_quality_event=self._websocket_quality_event, stream_group="public",
+                on_raw_frame=self._capture_raw_frame
             ),
             WebSocketClient(
                 url=BINANCE_MARKET_WS_URL,
                 on_message=self.handle_message,
                 on_reconnect=self._make_reconnect_handler(BINANCE_MARKET_WS_URL),
-                on_quality_event=self._websocket_quality_event, stream_group="market"
+                on_quality_event=self._websocket_quality_event, stream_group="market",
+                on_raw_frame=self._capture_raw_frame
             ),
         ]
 
@@ -135,6 +148,50 @@ class CollectorApp:
         logger.info(f"RAW_MESSAGE={msg}")
         self.raw_messages_logged += 1
 
+    def _capture_raw_frame(self, frame, *, local_receive_ts, connection_id=None,
+                           connection_generation=None, decode_ok=True,
+                           decode_error=None, parsed=None):
+        """Persist the exact frame before any lossy transformation.
+
+        Venue-native identifiers are copied verbatim when the frame decoded;
+        they are never derived, and absence stays null.
+        """
+        capture = getattr(self, "raw_capture", None)
+        if capture is None:
+            return
+        stream = channel = None
+        exchange_event_ts = update_id = first_update_id = previous_update_id = None
+        if isinstance(parsed, dict):
+            stream = parsed.get("stream")
+            channel = self._route_stream(stream) if isinstance(stream, str) else None
+            payload = parsed.get("data")
+            if isinstance(payload, dict):
+                exchange_event_ts = payload.get("E")
+                update_id = payload.get("u")
+                first_update_id = payload.get("U")
+                previous_update_id = payload.get("pu")
+        capture.capture_wire(RawWireRecord(
+            local_receive_ts=local_receive_ts,
+            payload=frame if isinstance(frame, str) else str(frame),
+            venue="BINANCE", connection_id=connection_id,
+            connection_generation=connection_generation,
+            channel=channel, stream=stream, symbol=SYMBOL,
+            decode_ok=decode_ok, decode_error=decode_error,
+            exchange_event_ts=exchange_event_ts, update_id=update_id,
+            first_update_id=first_update_id, previous_update_id=previous_update_id,
+            local_capture_ts=int(time.time() * 1000),
+        ))
+
+    def _record_adapter_unhandled(self, message):
+        """An adapter could not turn a message into events. Make it durable."""
+        self.stream_counters["adapter_unhandled"]["received"] += 1
+        self._persist_quality_event(message.to_quality_event())
+
+    def _capture_rest(self, record):
+        capture = getattr(self, "raw_capture", None)
+        if capture is not None:
+            capture.capture_rest(record)
+
     def _record_validation_rejection(self, stream_name: str, reason: str):
         reasons = self.validation_fail_reasons.setdefault(stream_name, {})
         reasons[reason] = reasons.get(reason, 0) + 1
@@ -157,10 +214,23 @@ class CollectorApp:
                 elif isinstance(event, dict):
                     self._persist_quality_event(event)
 
-    async def handle_message(self, msg: dict, local_receive_ts: int | None = None):
+    async def handle_message(self, msg: dict, local_receive_ts: int | None = None,
+                             connection_id: str | None = None):
         if local_receive_ts is None:
             local_receive_ts = int(time.time() * 1000)
-        if "stream" not in msg or "data" not in msg:
+        if not isinstance(msg, dict) or "stream" not in msg or "data" not in msg:
+            # Previously a bare `return`: subscription acks, error envelopes and
+            # any unexpected shape vanished with no counter and no record. A
+            # frame that does not match the combined-stream envelope is still
+            # information, and its absence must not look like silence.
+            self.stream_counters["malformed_envelope"]["received"] += 1
+            keys = sorted(str(k) for k in msg.keys()) if isinstance(msg, dict) else []
+            self._persist_quality_event({
+                "stream": "unrouted", "event_type": QualityEventType.DATA_DROP,
+                "reason": f"non_envelope_frame:keys={','.join(keys) or type(msg).__name__}",
+                "rows_lost": 1, "connection_id": connection_id,
+                "local_receive_ts": local_receive_ts, "local_ts": local_receive_ts,
+            })
             return
         stream = msg["stream"]
         data = msg["data"]
@@ -169,6 +239,14 @@ class CollectorApp:
         if route is None:
             self.stream_counters["unrouted"]["received"] += 1
             logger.warning("Unrouted stream message", stream=stream)
+            # Durable, not log-only: an unrouted stream is data the collector
+            # received and chose not to process.
+            self._persist_quality_event({
+                "stream": "unrouted", "event_type": QualityEventType.DATA_DROP,
+                "reason": f"unrouted_stream:{stream}", "rows_lost": 1,
+                "connection_id": connection_id,
+                "local_receive_ts": local_receive_ts, "local_ts": local_receive_ts,
+            })
         elif route == "orderbook":
             await self._handle_binance_orderbook(msg, local_receive_ts)
         elif route == "trades":
@@ -248,14 +326,28 @@ class CollectorApp:
         async with self._book_snapshot_lock:
             self.binance_book.state.resync()
             self._record_book_quality(QualityEventType.RESYNC, reason)
+        request_ts=int(time.time()*1000); status=None; body=None
         try:
             import aiohttp
             timeout=aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(BINANCE_DEPTH_SNAPSHOT_URL) as response:
-                    response.raise_for_status(); snapshot=await response.json()
+                    status=response.status
+                    # Read the body before raise_for_status so an error
+                    # response is captured rather than discarded.
+                    body=await response.text()
                     receive_ts=int(time.time()*1000)
+                    response.raise_for_status()
+                    snapshot=json.loads(body)
             process_ts=int(time.time()*1000)
+            # Record the exact snapshot so deterministic replay can bridge
+            # from recorded data instead of contacting the live exchange.
+            self._capture_rest(RawRestRecord(
+                request_ts=request_ts, response_receive_ts=receive_ts,
+                endpoint=BINANCE_DEPTH_SNAPSHOT_URL, purpose="orderbook_snapshot",
+                request_params={"symbol": SYMBOL, "limit": 1000},
+                http_status=status, ok=True, payload=body, symbol=SYMBOL,
+                local_process_ts=process_ts))
             if not isinstance(snapshot, dict) or "lastUpdateId" not in snapshot: raise ValueError("missing_last_update_id")
             if not snapshot.get("bids") or not snapshot.get("asks"): raise ValueError("empty_snapshot")
             snapshot_event=CanonicalOrderBookEvent("BINANCE","orderbook",None,None,receive_ts, local_process_ts=process_ts,
@@ -277,6 +369,13 @@ class CollectorApp:
         except Exception as exc:
             why="snapshot_http_error"
             logger.error("binance_book_snapshot_failed", error=str(exc))
+        # A failed snapshot is lineage too: replay must be able to see that
+        # recovery was attempted and why it did not produce a bridge.
+        self._capture_rest(RawRestRecord(
+            request_ts=request_ts, response_receive_ts=None,
+            endpoint=BINANCE_DEPTH_SNAPSHOT_URL, purpose="orderbook_snapshot",
+            request_params={"symbol": SYMBOL, "limit": 1000},
+            http_status=status, ok=False, error=why, payload=body, symbol=SYMBOL))
         async with self._book_snapshot_lock:
             self.binance_book.state.gap()
             self._record_book_quality(QualityEventType.ERROR,why)
@@ -538,10 +637,25 @@ class CollectorApp:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=5)
         while self.running:
+            request_ts = int(time.time() * 1000)
+            status = None
+            body = None
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(OI_URL) as resp:
-                        data = await resp.json()
+                        status = resp.status
+                        body = await resp.text()
+                        receive_ts = int(time.time() * 1000)
+                        resp.raise_for_status()
+                        data = json.loads(body)
+                # REST polling time is not exchange observation time; both are
+                # preserved separately so research can tell them apart.
+                self._capture_rest(RawRestRecord(
+                    request_ts=request_ts, response_receive_ts=receive_ts,
+                    endpoint=OI_URL, purpose="open_interest",
+                    request_params={"symbol": SYMBOL}, http_status=status,
+                    ok=True, payload=body, symbol=SYMBOL,
+                    local_process_ts=int(time.time() * 1000)))
                 self.stream_counters["openinterest"]["received"] += 1
                 features = compute_openinterest_features(data)
                 if features:
@@ -556,7 +670,19 @@ class CollectorApp:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                # Previously log-only, so a REST outage left no trace in the
+                # data and looked identical to a period of no change.
                 logger.error("OI poll failed", error=str(e))
+                self._capture_rest(RawRestRecord(
+                    request_ts=request_ts, response_receive_ts=None,
+                    endpoint=OI_URL, purpose="open_interest",
+                    request_params={"symbol": SYMBOL}, http_status=status,
+                    ok=False, error=f"{type(e).__name__}:{e}", payload=body,
+                    symbol=SYMBOL))
+                self._persist_quality_event({
+                    "stream": "openinterest", "event_type": QualityEventType.ERROR,
+                    "reason": f"oi_poll_failed:{type(e).__name__}",
+                    "local_ts": int(time.time() * 1000)})
             await asyncio.sleep(OI_POLL_INTERVAL_S)
 
     async def _verify_startup_streams(self):
@@ -603,6 +729,10 @@ class CollectorApp:
         self.mark_writer.close()
         self.oi_writer.close()
         self.liq_writer.close()
+        for raw_writer_name in ("raw_wire_writer", "raw_rest_writer"):
+            raw_writer = getattr(self, raw_writer_name, None)
+            if raw_writer is not None:
+                raw_writer.close()
         self.quality_writer.close()
         msg = "Collector Application Shutdown"
         logger.info(msg)

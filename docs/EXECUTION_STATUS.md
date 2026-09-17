@@ -123,7 +123,38 @@ every subsequent phase meaningless.
   printed `100.00%` for all three streams and exited `0`; the new code prints
   `0.0017%`–`0.0081%` and exits `1`.
 
-### Phases 2+ — NOT STARTED
+### Phase 2 — Raw wire capture and no silent discard — **COMPLETE**
+
+- **Branch:** `phase-02-raw-wire-capture` (base: `main` @ `c7b7646`)
+- **Objective:** make deterministic replay *possible* by persisting the wire,
+  and close every path that turned received data into nothing. Closes **D16**,
+  substantially addresses **D10**, and makes **D11** explicit in code.
+- **Changes:**
+  - New `collector/collector/raw_capture.py`: `raw_wire` and `raw_rest`
+    schemas, records and a fail-open `RawCapture` sink. Capture precedes
+    parsing; absent fields stay null; payloads are bounded and truncation is
+    itself a quality event.
+  - `websocket_client.py` captures the frame text before `json.loads`, so a
+    malformed frame is preserved rather than logged and dropped. Connection
+    id is now passed to handlers via a one-time arity probe (legacy
+    two-argument handlers keep working).
+  - `adapters/base.py`: `ExchangeAdapter.unhandled()` + `UnhandledReason`.
+    No adapter ends `normalize()` in a bare `return []` any more; a
+    structural test enforces this.
+  - `run_collector.py`: raw wire + REST writers wired; non-envelope frames,
+    unrouted streams, adapter drops, snapshot failures and OI poll failures
+    all produce durable quality events; REST snapshot and OI bodies are
+    recorded verbatim with request/response timestamps kept distinct.
+  - `OKXAdapter.unimplemented_channels` names the six unbuilt channels.
+- **Tests:** `tests/test_raw_capture.py` (33), `tests/test_no_silent_discard.py`
+  (16). One existing fake in `test_run_collector_routing.py` was modernised to
+  model the aiohttp surface actually used and now asserts REST lineage.
+- **Suite:** 311 passed, 0 failed.
+- **Live verification:** raw wire frames (including an undecodable one) and a
+  REST snapshot body were written to parquet and read back; the snapshot's
+  `lastUpdateId` round-trips off disk, which is the property replay needs.
+
+### Phases 3+ — NOT STARTED
 
 Remaining scope is tracked in the defect table above (D9–D14), plus D16 below.
 
@@ -146,7 +177,7 @@ silently produce nothing.
 
 | # | Defect | Severity | Phase |
 |---|---|---|---|
-| D16 | Every adapter's `normalize()` ends in a bare `return []`. An unroutable, malformed or unimplemented message is discarded with no quality event, no counter and no log. This is silent data loss and violates the project's core rule that unavailable information must be marked, not dropped. | **High** | 12–15 |
+| ~~D16~~ | *Closed in Phase 2.* Adapters classify every non-event outcome via `unhandled()`. | — | — |
 
 #### Verified dependency order for remaining work
 

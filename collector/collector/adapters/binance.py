@@ -2,11 +2,12 @@ from __future__ import annotations
 import time
 from decimal import Decimal
 from typing import Optional
-from .base import ExchangeAdapter
+from .base import ExchangeAdapter, UnhandledReason
 from ..canonical import CanonicalLiquidationEvent, CanonicalMarkPriceEvent, CanonicalOIEvent, CanonicalOrderBookEvent, CanonicalTradeEvent, OISource
 from ..sequence import BinanceSequenceComparator, binance_snapshot_bridge
 
 class BinanceAdapter(ExchangeAdapter):
+    venue = "BINANCE"
     channel_event_types = {"<symbol>@depth@100ms": ("CanonicalOrderBookEvent",), "<symbol>@depth10@100ms": ("CanonicalOrderBookEvent",), "<symbol>@aggTrade": ("CanonicalTradeEvent",), "<symbol>@markPrice@1s": ("CanonicalMarkPriceEvent",), "<symbol>@forceOrder": ("CanonicalLiquidationEvent",)}
     sequence_comparator = BinanceSequenceComparator()
     def connect(self): return None
@@ -25,7 +26,13 @@ class BinanceAdapter(ExchangeAdapter):
         if route == "markprice" or d.get("e") == "markPriceUpdate": return [CanonicalMarkPriceEvent("BINANCE","markprice",d.get("E"),None,now,mark_price=float(d["p"]),index_price=float(d["i"]) if d.get("i") is not None else None,funding_rate=float(d["r"]),next_funding_time=d.get("T"))]
         if route == "liquidation" or d.get("e") == "forceOrder":
             o=d.get("o",{}); return [CanonicalLiquidationEvent("BINANCE","liquidation",d.get("E"),o.get("T"),now,side=o.get("S"),price=float(o["p"]),quantity=float(o["q"]))]
-        return []
+        if not isinstance(d, dict) or not d:
+            return self.unhandled(UnhandledReason.MALFORMED_PAYLOAD, raw, local_receive_ts=now)
+        if any(key in raw for key in ("result", "id", "code", "msg")) and "data" not in raw:
+            return self.unhandled(UnhandledReason.CONTROL_FRAME, raw, local_receive_ts=now)
+        return self.unhandled(UnhandledReason.NO_ROUTE, raw, channel=raw.get("stream"),
+                              detail=str(d.get("e")) if isinstance(d, dict) and d.get("e") else None,
+                              local_receive_ts=now)
     @staticmethod
     def bridge_accepts(event, last_update_id): return binance_snapshot_bridge(event,last_update_id)
     @staticmethod
