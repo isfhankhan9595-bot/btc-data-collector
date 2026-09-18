@@ -241,3 +241,17 @@ that layer exists.
 must not be implemented from memory; the sequence, timestamp, trade-side and
 liquidation-side semantics have to be read from Binance USD-M, Bybit v5 and
 OKX v5 docs at implementation time.
+
+
+### Correction — PR #9 restored to main
+
+PR #9 (Phase 5, Bybit ticker staleness / D12) merged into
+`phase-04-bounded-recovery`, but that intermediate branch was never itself
+merged into `main` — only an earlier commit on it was, via PR #8. The fix
+was verified, tested and merged, yet absent from `main`. Diagnosed via
+`git merge-base --is-ancestor`, confirmed via the GitHub API
+(`merged: true`, `merge_commit_sha` present, but unreachable from
+`origin/main`). Reapplied directly from the orphaned merge commit
+(`41cd7f9`) onto current `main`: `bybit.py`, `canonical.py` provenance
+fields, `test_bybit_ticker_staleness.py`, and its doc. Clean apply, no
+conflicts. Suite: 401 passed, 0 failed.
