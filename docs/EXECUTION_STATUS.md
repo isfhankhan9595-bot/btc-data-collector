@@ -39,7 +39,7 @@ Documentation is never a substitute for implementation.
 | D10 | No raw wire capture layer. `binance_orderbook_raw` stores normalised levels, not exact payloads; there is no connection id, no REST request/response lineage. Deterministic replay is not currently possible from stored data. | 6 |
 | D11 | OKX adapter declares `trades`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders` in `channel_event_types` but `normalize()` only implements `books`. Everything else silently returns `[]`. | 14 |
 | D12 | Bybit adapter merges ticker deltas into shared `_ticker_state` and emits merged values without marking which fields were carried forward. Staleness is not observable. | 13 |
-| D14 | `binance_snapshot_bridge` and the USD-M sequence rules are implemented from assumption and have not been re-verified against current official Binance documentation. | 4 |
+| ~~D14~~ | *Closed in Phase 6.* Verified against official USD-M documentation 2026-09-19. The rules were correct; five defects were found around them (D18–D22). See `docs/BINANCE_USDM_SEMANTICS.md`. | — |
 
 ---
 
@@ -255,3 +255,47 @@ was verified, tested and merged, yet absent from `main`. Diagnosed via
 (`41cd7f9`) onto current `main`: `bybit.py`, `canonical.py` provenance
 fields, `test_bybit_ticker_staleness.py`, and its doc. Clean apply, no
 conflicts. Suite: 401 passed, 0 failed.
+
+
+### Phase 6 — Binance USD-M semantics verified (D14) — **COMPLETE**
+
+- **Branch:** `phase-06-binance-semantics-d14` (base: `main` @ `f5463de`)
+- **Objective:** close **D14** by verifying the USD-M diff-depth rules against
+  current official Binance documentation, and fix whatever the verification
+  exposes. This is P0: every downstream layer trusts book correctness.
+- **Verification:** "How to manage a local order book correctly" (USD-M
+  futures), read 2026-09-19. Steps 1–9 mapped to enforcement sites; see
+  `docs/BINANCE_USDM_SEMANTICS.md` for the table.
+- **Result:** the documented rules were **already correct**, including both
+  places USD-M diverges from Spot (step 4's strict `<`, step 5's absent `+1`).
+  Both are now pinned by tests that fail if changed to the Spot form.
+- **Five defects found around them, all fixed:**
+
+| # | Defect | Severity | Effect |
+|---|---|---|---|
+| D18 | A re-delivered diff failed the `pu` check and was classified as a sequence gap | **High** — false data quality | Wrote a `SEQUENCE_GAP` into the durable record for a hole the venue never created, and spent a bounded REST recovery slot. Step 7's absolute quantities make a non-advancing event redundant, not a break. |
+| D19 | `depth10` partial depth was reachable by the diff path (`"@depth" in stream` also matches `@depth10`) | Medium — latent | A top-N snapshot applied as a diff freezes stale depth below the top N while the book still reports `VALID`. Guarded at both runners but not in `LocalBook`, which owns book authority. |
+| D20 | A frame with no `pu` reported `pu_mismatch` | Low — misattribution | Unprovable continuity was indistinguishable from violated continuity. |
+| D21 | `binance_snapshot_bridge` raised `TypeError` on `None` ids | Medium | Reachable via public `BinanceAdapter.bridge_accepts`; a raising predicate turns a data problem into a crashed ingest task. |
+| D22 | A valid snapshot arriving *ahead* of the buffer was discarded, identically to one behind a hole | **High** — recovery | The first case resolves itself on the next 100ms diff; discarding it looped REST snapshots through the bounded budget and held the book un-bridged for up to a minute. Now retained and re-bridged from recorded data. |
+
+- **Self-review finding.** The first D22 implementation left `run_collector`
+  booking `snapshot_ahead_of_buffer` as `controller.fail()`. On a cold start
+  the buffer is empty until the first diff lands, so that outcome is common
+  and backoff would have escalated toward `attempts_exhausted` during normal
+  operation. Now treated as a deferred success.
+- **Live/replay parity preserved:** `replay.py` retries a retained snapshot at
+  the same point as the runner, so the same recorded bytes produce the same
+  book.
+- **Tests:** `tests/test_binance_usdm_semantics.py` (24), including
+  step-by-step conformance, one test per defect, a stale-storm adversarial
+  test, and a 400-case property test proving an unbridged book never reports
+  `VALID`.
+- **Rewritten, not weakened:**
+  `test_replay.py::test_replayed_repeat_of_an_applied_diff_is_not_silently_accepted`
+  asserted the pre-D18 contract explicitly in its docstring. Replaced with
+  `..._is_recorded_but_not_a_gap`, which still requires the duplicate to be
+  observable but asserts idempotence instead of a false gap.
+- **Suite:** 422 passed, 0 failed (was 401).
+- **Not claimed:** no live Binance session was run; conformance is against the
+  documented procedure and recorded fixtures.

@@ -413,8 +413,20 @@ class CollectorApp:
                 update_id=int(snapshot["lastUpdateId"]),is_snapshot=True,book_source="DIFF_DEPTH_RECONSTRUCTED")
             async with self._book_snapshot_lock:
                 if not self.binance_book.binance_snapshot(snapshot_event.update_id,snapshot_event):
-                    self._record_book_quality(QualityEventType.ERROR, self.binance_book.last_reason)
-                    if controller is not None: controller.fail(self.binance_book.last_reason)
+                    why=self.binance_book.last_reason
+                    if why == "snapshot_ahead_of_buffer":
+                        # The REST call succeeded and the snapshot is valid and
+                        # retained; it simply landed ahead of every buffered
+                        # diff, which is the common case on a cold start with
+                        # an empty buffer. The next diff bridges it with no
+                        # further REST call, so counting this as a failure
+                        # would escalate backoff toward exhaustion during
+                        # entirely normal operation.
+                        self._record_book_quality(QualityEventType.RECOVERY, why)
+                        if controller is not None: controller.succeed()
+                        return True
+                    self._record_book_quality(QualityEventType.ERROR, why)
+                    if controller is not None: controller.fail(why)
                     return False
                 self._persist_reconstructed_books(self.binance_book.committed_recovery_events)
                 self.binance_book.committed_recovery_events=[]
@@ -457,8 +469,19 @@ class CollectorApp:
                 if after == BookQuality.SEQUENCE_GAP and before != after:
                     self._record_book_quality(QualityEventType.SEQUENCE_GAP,self.binance_book.last_reason,event=event)
                 needs_recovery=applied is None and after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING)
+                bridged=[]
+                if needs_recovery and self.binance_book.retry_pending_snapshot():
+                    # A snapshot that had landed ahead of the buffer has now
+                    # been straddled by this diff. The bridge is proven from
+                    # already-recorded data, so no REST slot is consumed.
+                    bridged=self.binance_book.committed_recovery_events
+                    self.binance_book.committed_recovery_events=[]
+                    needs_recovery=False
+                    self._record_book_quality(QualityEventType.RECOVERY,"pending_snapshot_bridge_completed",event=event)
                 if self.binance_book.duplicate_count:
                     self._record_book_quality(QualityEventType.DUPLICATE,"binance_duplicate_update",event=event); self.binance_book.duplicate_count=0
+            if bridged:
+                self._persist_reconstructed_books(bridged)
             self._drain_integrity_quality_events()
             if needs_recovery:
                 self._schedule_recovery("sequence_gap_or_initial_snapshot")
