@@ -300,34 +300,117 @@ conflicts. Suite: 401 passed, 0 failed.
 - **Not claimed:** no live Binance session was run; conformance is against the
   documented procedure and recorded fixtures.
 
-### Phase 7 — OKX missing channels (D11) — **BLOCKED, NOT STARTED**
+### Phase 7 — OKX public raw capture — **COMPLETE**; D11 parsers still **BLOCKED**
 
-- **Objective:** implement the six OKX v5 channels that `channel_event_types`
-  declares but `normalize()` does not build: `trades`, `mark-price`,
-  `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders`.
-- **Blocker:** the field schemas for these channels could not be obtained from
-  official OKX documentation. `https://www.okx.com/docs-v5/en` is a
-  single-page application; fetching it returns the whole document flattened
-  and truncated in the REST/account sections, before reaching the WebSocket
-  public-channel push-data tables. Channel *names* were confirmed (they appear
-  in the navigation index); per-channel **field names were not**.
-- **Why this was not implemented anyway:** these are six parsers whose entire
-  job is field mapping. Guessing `fundingRate` vs `fundingRatePct`, or the
-  liquidation side encoding, produces a parser that runs, passes any test
-  written against the same guess, and emits **silently wrong numbers** into
-  the research record. That is worse than the current state, where D11 is at
-  least explicit: the channels are named in `unimplemented_channels` and
-  every message routed to them raises `CHANNEL_NOT_IMPLEMENTED` through
-  `unhandled()`, so nothing is silently discarded.
-- **What is needed to unblock:** the per-channel "Push Data Parameters" tables
-  from OKX v5 WebSocket public channels. Any of:
-  - a fetch that renders the SPA sections, or
-  - the six tables supplied directly, or
-  - one live connection to `wss://ws.okx.com:8443/ws/v5/public` subscribing to
-    the six channels and recording raw frames (the `raw_wire` layer from
-    Phase 2 already persists exactly what this needs), which would make the
-    schemas observable from captured data rather than from documentation.
-- **Note:** the same requirement applies to the Bybit v5 and OKX live clients.
-  Adapters exist; nothing ingests from either venue, so multi-exchange remains
-  declared rather than real, and every cross-exchange and spot/perp item in
-  the opportunity taxonomy is blocked on data that does not yet exist.
+- **Branch:** `phase-07-okx-raw-capture` (base: `main` @ `fa0d8d2`)
+- **Objective:** stop being blocked *by documentation* on D11. Capture the real
+  OKX frames so the schemas can be read off the wire instead of guessed.
+- **Verified first:** Phase 6 / PR #12 is merged and its content is genuinely
+  reachable from `main` (`git merge-base --is-ancestor` on both commits, plus a
+  content check that `stale_update`/`pu_missing` and `retry_pending_snapshot`
+  are present in `origin/main`'s blobs, not just that the commits exist).
+  Suite re-measured on `main`: **422 passed**.
+
+#### What was built
+
+| Component | Role |
+|---|---|
+| `websocket_client.py` | three optional venue hooks: `on_open`, `keepalive`, `control_frames` |
+| `collector/okx_capture.py` | `OKXPublicCapture`, `SubscriptionLedger`, envelope classification |
+| `run_okx_capture.py` | standalone bounded entrypoint; writes `raw_wire` + `quality_events` only |
+| `scripts/okx_schema_report.py` | reads captured frames back, reports observed field structure |
+
+Connection protocol implemented **only** from official OKX v5 documentation
+(read 2026-09-19): endpoint, subscribe/unsubscribe envelopes, 64 KB args
+limit, `event: subscribe|error|notice` responses, notice code 64008, the 30s
+idle disconnect and the literal `ping`/`pong` heartbeat, 3 connects/sec, 480
+subscribe requests per connection per hour. Full table in
+`docs/OKX_RAW_CAPTURE.md`.
+
+The only payload fields read anywhere are `arg.channel` and `arg.instId` —
+documented **envelope** fields. Nothing inside `data[]` is touched.
+
+#### Defects prevented by design
+
+- **False malformed-frame storm.** OKX's `pong` is the bare string `pong`, not
+  JSON. Without an explicit control-frame allowlist it reaches `json.loads`,
+  fails, and writes a durable `ERROR` quality event *once per heartbeat,
+  forever, on a healthy connection* — a false data-quality signal of the same
+  class as D18. Control frames are now captured, counted, and never reported
+  as malformed; a genuinely corrupt frame still is (both pinned by tests).
+- **Silent dead subscriptions.** A rejected channel produces nothing for the
+  life of the connection. Logged-only, that is indistinguishable from a quiet
+  market. `SubscriptionLedger` makes "not subscribed" observable, and
+  acknowledgements are cleared on reconnect because an ack belongs to a
+  connection, not to the process.
+- **Guessed parsers.** Capture subscribes to all six unimplemented channels
+  while `OKXAdapter.normalize` continues to refuse them. A test asserts the
+  adapter still raises `CHANNEL_NOT_IMPLEMENTED` for every one, so this phase
+  cannot have quietly enabled a guess.
+
+#### Self-review fixes applied before commit
+
+- Cancelled keepalive tasks are now awaited, so a pending task cannot outlive
+  its connection across reconnects.
+- `_keepalive_loop`'s `assert` replaced with a real guard (asserts are
+  stripped under `python -O`).
+- `okx_schema_report` catches `StorageCollisionError` and poisons the report
+  instead of raising: ambiguous storage means the observed frame set is not
+  provably the captured frame set.
+
+- **Tests:** `tests/test_okx_capture.py` (40) — documented subscribe format,
+  envelope classification for all seven event shapes, control-frame handling,
+  malformed-frame regression, subscription lifecycle, reconnect ack clearing,
+  capture-before-classification for all envelope kinds, keepalive ping/pong/
+  timeout with a controlled clock, Binance-unchanged regression, and schema
+  report behaviour including numeric-string typing and the semantics caveat.
+- **Suite:** **461 passed**, 0 failed (was 422).
+
+#### What this does and does not unblock
+
+| | Status |
+|---|---|
+| Field **names** in `data[]` | obtainable from capture — this is the unblock |
+| Field **types** (incl. numeric-strings) | obtainable from capture |
+| Field **meanings** — units, sign conventions, period vs annualised funding, liquidation `side` encoding | **still blocked**; observation cannot establish semantics |
+
+So D11 is **not** closed. Capture removes the *name* half of the blocker; the
+*semantic* half still requires official documentation or an authoritative SDK.
+
+#### Environment blocker (hard)
+
+This code has **never been run against the live venue**. The execution
+container denies egress to `ws.okx.com`
+(`x-deny-reason: host_not_allowed`; only package/registry hosts are
+reachable). Every test drives the real client loop through a fake socket,
+which verifies the logic and protocol shape but **cannot** verify that OKX
+accepts the subscribe request or that the heartbeat satisfies it.
+
+Treat "OKX capture works" as **UNVERIFIED against the venue** until
+`run_okx_capture` has been executed somewhere with network access.
+
+#### Smallest next action
+
+Run, on a host with outbound access:
+
+```bash
+python -m collector.run_okx_capture --duration 600 --data-dir data
+python -m collector.scripts.okx_schema_report --data-dir data
+```
+
+Then supply the report output plus the official push-data tables for the six
+channels. With names observed and semantics documented, the parsers become a
+mechanical, safe change.
+
+### Phase 8 — Bybit live client — **NOT STARTED**
+
+Adapter exists and parses its 4 declared channels; nothing ingests from it, so
+Bybit contributes no data. Same environment blocker applies to live
+verification. The `on_open` / `keepalive` / `control_frames` hooks added in
+Phase 7 are the generic foundation this needs.
+
+### Phases 9+ — market state, features, events — **NOT STARTED**
+
+See `docs/DATA_SUFFICIENCY.md` for which events are feasible on Binance-only
+data today (roughly two-thirds) and which are blocked on data that has never
+been collected (cross-exchange, spot/perp basis).
