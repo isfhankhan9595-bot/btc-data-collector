@@ -402,6 +402,36 @@ Then supply the report output plus the official push-data tables for the six
 channels. With names observed and semantics documented, the parsers become a
 mechanical, safe change.
 
+#### Regression found and fixed during merge review (pre-merge, this PR)
+
+Independent review before merging this PR found that `_consume`'s new
+`control_frame=` keyword is passed to **every** `on_raw_frame` callback,
+including `run_collector.CollectorApp._capture_raw_frame` (the live Binance
+raw-capture path), whose signature had no such parameter and no `**kwargs`.
+Every call therefore raised `TypeError` inside `_consume`'s fail-open
+`try/except`, which logs a warning and continues -- meaning **live Binance
+raw-wire capture would have gone completely dark**, silently, with no
+exception surfacing past a per-frame log line and no quality event.
+
+This is the exact "silent parser failure" class this project forbids, and it
+passed CI: the only existing integration-level test for this call path
+(`test_no_silent_discard.py`) used `def on_raw(frame, **kw): ...`, which is
+strictly more permissive than the real method and could not have caught a
+signature mismatch against it. This PR's own "Binance-unchanged" test
+(`test_binance_style_client_starts_no_keepalive_task`) checked `on_message`
+delivery and the absence of a keepalive task, and never exercised
+`on_raw_frame` at all.
+
+**Fixed**: `_capture_raw_frame` now accepts `control_frame: bool = False`
+(unused for Binance, which has none). **Verified bidirectionally**: the new
+regression test
+(`test_production_capture_raw_frame_survives_every_on_raw_frame_call_shape`,
+driving the real `WebSocketClient._consume` coroutine against the real
+production callback) was confirmed red against the original signature
+(reproducing the exact swallowed `TypeError`) and green after the fix, so
+the test is known to actually exercise the failure mode rather than merely
+share its blind spot. Suite: 462 passed (461 + 1).
+
 ### Phase 8 — Bybit live client — **NOT STARTED**
 
 Adapter exists and parses its 4 declared channels; nothing ingests from it, so
