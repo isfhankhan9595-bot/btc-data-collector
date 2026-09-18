@@ -2,15 +2,46 @@ import asyncio
 import inspect
 import json
 import time
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, FrozenSet, Optional
+
 import websockets
-from typing import Callable, Awaitable, Optional
+
 from .backoff import BackoffExhausted, ExponentialBackoff
 from .utils import logger
+
+
+@dataclass(frozen=True)
+class Keepalive:
+    """Application-level heartbeat for venues that require one.
+
+    Binance USD-M needs nothing here: the server drives protocol-level pings
+    and the ``websockets`` library answers them. OKX v5 is different -- it
+    closes a connection that has neither pushed data nor received a request
+    for more than 30 seconds, and the documented client obligation is to send
+    the literal string ``ping`` and expect the literal string ``pong`` back.
+
+    ``interval_s`` is measured from the last *inbound* frame, not from the
+    last ping, because any inbound frame proves the link is alive and a venue
+    that is pushing data needs no heartbeat at all.
+    """
+
+    payload: str
+    interval_s: float
+    expect: Optional[str] = None
+    timeout_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.interval_s <= 0 or self.timeout_s <= 0:
+            raise ValueError("keepalive interval_s and timeout_s must be positive")
 
 class WebSocketClient:
     def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None, stream_group: str = "websocket",
                  on_raw_frame: Optional[Callable[..., None]] = None,
-                 backoff: Optional[ExponentialBackoff] = None):
+                 backoff: Optional[ExponentialBackoff] = None,
+                 on_open: Optional[Callable[..., Awaitable[None]]] = None,
+                 keepalive: Optional[Keepalive] = None,
+                 control_frames: FrozenSet[str] = frozenset()):
         self.url = url
         self.stream_group = stream_group
         self.on_message = on_message
@@ -33,6 +64,23 @@ class WebSocketClient:
         self.connection_id = None
         self._connection_serial = 0
         self.malformed_frames = 0
+        # Venue protocol hooks. All optional; the defaults reproduce the
+        # previous Binance-only behaviour exactly.
+        #: Called after connect with a ``send`` coroutine so a venue can issue
+        #: its subscribe request. Binance carries streams in the URL and needs
+        #: none; OKX and Bybit must subscribe over the socket.
+        self.on_open = on_open
+        self.keepalive = keepalive
+        #: Literal non-JSON text frames that are valid protocol, e.g. OKX's
+        #: ``pong``. Without this they would be counted as malformed frames
+        #: and would each write a durable ERROR quality event -- a false
+        #: data-quality signal for a perfectly healthy connection.
+        self.control_frames = frozenset(control_frames)
+        self.control_frames_received = 0
+        self.keepalive_timeouts = 0
+        self._ws = None
+        self._last_inbound_monotonic = 0.0
+        self._awaiting_reply_since = None
 
     @staticmethod
     def _accepts_connection_id(callback) -> bool:
@@ -79,53 +127,40 @@ class WebSocketClient:
                     if self.on_reconnect:
                         self.on_reconnect()
 
-                    async for msg in ws:
-                        if not self.running:
-                            break
-                        # Capture arrival time before decoding so downstream
-                        # research can distinguish network arrival from work
-                        # performed after JSON parsing.
-                        local_receive_ts = int(time.time() * 1000)
-                        decode_error = None
-                        data = None
+                    self._ws = ws
+                    self._last_inbound_monotonic = self._monotonic()
+                    self._awaiting_reply_since = None
+
+                    if self.on_open is not None:
+                        # A failed subscribe must be visible: it is the
+                        # difference between "quiet market" and "we are not
+                        # subscribed to anything".
                         try:
-                            data = json.loads(msg)
-                        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                            decode_error = str(exc)
-
-                        # Raw capture precedes every lossy step, including a
-                        # failed decode: a frame that did not parse is still a
-                        # frame that arrived and must remain observable.
-                        if self.on_raw_frame is not None:
-                            try:
-                                self.on_raw_frame(
-                                    msg,
-                                    local_receive_ts=local_receive_ts,
-                                    connection_id=self.connection_id,
-                                    connection_generation=self._connection_serial,
-                                    decode_ok=decode_error is None,
-                                    decode_error=decode_error,
-                                    parsed=data,
-                                )
-                            except Exception as exc:  # noqa: BLE001 - capture fails open
-                                logger.warning("raw_frame_capture_failed", error=str(exc))
-
-                        if decode_error is not None:
-                            self.malformed_frames += 1
-                            logger.error("Failed to parse JSON from WebSocket", error=decode_error)
+                            await self.on_open(self._send)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error("websocket_on_open_failed", error=str(exc))
                             if self.on_quality_event:
-                                # Previously log-only, so malformed frames were
-                                # invisible in the data. Now durable.
                                 self.on_quality_event(
-                                    "ERROR", f"malformed_frame:{decode_error}",
-                                    self.connection_id, self.stream_group,
-                                )
-                            continue
+                                    "ERROR", f"subscribe_failed:{type(exc).__name__}",
+                                    self.connection_id, self.stream_group)
+                            raise
 
-                        if self._on_message_takes_connection:
-                            await self.on_message(data, local_receive_ts, connection_id=self.connection_id)
-                        else:
-                            await self.on_message(data, local_receive_ts)
+                    keepalive_task = None
+                    if self.keepalive is not None:
+                        keepalive_task = asyncio.ensure_future(self._keepalive_loop())
+
+                    try:
+                        await self._consume(ws)
+                    finally:
+                        if keepalive_task is not None:
+                            keepalive_task.cancel()
+                            # Awaiting the cancellation stops a pending task
+                            # from outliving its connection across reconnects.
+                            try:
+                                await keepalive_task
+                            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                                pass
+                        self._ws = None
 
             except websockets.ConnectionClosed as e:
                 self.connected = False
@@ -157,6 +192,123 @@ class WebSocketClient:
                 self.retry_delay = delay
                 logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=delay)
                 await asyncio.sleep(delay)
+
+    @staticmethod
+    def _monotonic() -> float:
+        return time.monotonic()
+
+    async def _send(self, message: Any) -> None:
+        """Send a frame. Dicts are JSON-encoded; strings go out verbatim.
+
+        Verbatim strings matter: OKX's heartbeat is the bare text ``ping``,
+        not a JSON object, so encoding it would break the protocol.
+        """
+        if self._ws is None:
+            raise RuntimeError("websocket is not connected")
+        payload = message if isinstance(message, str) else json.dumps(message)
+        await self._ws.send(payload)
+
+    async def _consume(self, ws) -> None:
+        async for msg in ws:
+            if not self.running:
+                break
+            # Capture arrival time before decoding so downstream research can
+            # distinguish network arrival from work performed after parsing.
+            local_receive_ts = int(time.time() * 1000)
+            self._last_inbound_monotonic = self._monotonic()
+
+            text = msg if isinstance(msg, str) else None
+            is_control = text is not None and text in self.control_frames
+            if is_control:
+                self._awaiting_reply_since = None
+
+            decode_error = None
+            data = None
+            if not is_control:
+                try:
+                    data = json.loads(msg)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    decode_error = str(exc)
+
+            # Raw capture precedes every lossy step, including a failed decode
+            # and including control frames: a frame that did not parse, or that
+            # carried no market data, is still a frame that arrived.
+            if self.on_raw_frame is not None:
+                try:
+                    self.on_raw_frame(
+                        msg,
+                        local_receive_ts=local_receive_ts,
+                        connection_id=self.connection_id,
+                        connection_generation=self._connection_serial,
+                        decode_ok=decode_error is None,
+                        decode_error=decode_error,
+                        parsed=data,
+                        control_frame=is_control,
+                    )
+                except Exception as exc:  # noqa: BLE001 - capture fails open
+                    logger.warning("raw_frame_capture_failed", error=str(exc))
+
+            if is_control:
+                # Healthy protocol traffic. Counted, never reported as
+                # malformed, and not forwarded to the market-data handler.
+                self.control_frames_received += 1
+                continue
+
+            if decode_error is not None:
+                self.malformed_frames += 1
+                logger.error("Failed to parse JSON from WebSocket", error=decode_error)
+                if self.on_quality_event:
+                    self.on_quality_event(
+                        "ERROR", f"malformed_frame:{decode_error}",
+                        self.connection_id, self.stream_group,
+                    )
+                continue
+
+            if self._on_message_takes_connection:
+                await self.on_message(data, local_receive_ts, connection_id=self.connection_id)
+            else:
+                await self.on_message(data, local_receive_ts)
+
+    async def _keepalive_loop(self) -> None:
+        """Heartbeat only when the link has gone quiet.
+
+        A venue that is pushing data needs no ping, so the timer is driven by
+        the last inbound frame. If a ping goes unanswered within
+        ``timeout_s`` the connection is closed so the normal reconnect path
+        runs -- a silently dead socket is worse than a visible reconnect.
+        """
+        config = self.keepalive
+        if config is None:   # not an assert: must still hold under python -O
+            return
+        while self.running and self._ws is not None:
+            await asyncio.sleep(min(config.interval_s, config.timeout_s) / 2.0)
+            if not self.running or self._ws is None:
+                return
+            now = self._monotonic()
+            pending = self._awaiting_reply_since
+            if pending is not None:
+                if now - pending >= config.timeout_s:
+                    self.keepalive_timeouts += 1
+                    logger.warning("keepalive_timeout", url=self.url)
+                    if self.on_quality_event:
+                        self.on_quality_event(
+                            "DISCONNECT", "keepalive_timeout",
+                            self.connection_id, self.stream_group)
+                    self._awaiting_reply_since = None
+                    try:
+                        await self._ws.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
+                continue
+            if now - self._last_inbound_monotonic >= config.interval_s:
+                try:
+                    await self._send(config.payload)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("keepalive_send_failed", error=str(exc))
+                    return
+                if config.expect is not None:
+                    self._awaiting_reply_since = now
 
     async def wait_connected(self, timeout_seconds: float = 30.0) -> bool:
         deadline = asyncio.get_event_loop().time() + timeout_seconds
