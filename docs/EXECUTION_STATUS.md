@@ -299,3 +299,35 @@ conflicts. Suite: 401 passed, 0 failed.
 - **Suite:** 422 passed, 0 failed (was 401).
 - **Not claimed:** no live Binance session was run; conformance is against the
   documented procedure and recorded fixtures.
+
+### Phase 7 — OKX missing channels (D11) — **BLOCKED, NOT STARTED**
+
+- **Objective:** implement the six OKX v5 channels that `channel_event_types`
+  declares but `normalize()` does not build: `trades`, `mark-price`,
+  `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders`.
+- **Blocker:** the field schemas for these channels could not be obtained from
+  official OKX documentation. `https://www.okx.com/docs-v5/en` is a
+  single-page application; fetching it returns the whole document flattened
+  and truncated in the REST/account sections, before reaching the WebSocket
+  public-channel push-data tables. Channel *names* were confirmed (they appear
+  in the navigation index); per-channel **field names were not**.
+- **Why this was not implemented anyway:** these are six parsers whose entire
+  job is field mapping. Guessing `fundingRate` vs `fundingRatePct`, or the
+  liquidation side encoding, produces a parser that runs, passes any test
+  written against the same guess, and emits **silently wrong numbers** into
+  the research record. That is worse than the current state, where D11 is at
+  least explicit: the channels are named in `unimplemented_channels` and
+  every message routed to them raises `CHANNEL_NOT_IMPLEMENTED` through
+  `unhandled()`, so nothing is silently discarded.
+- **What is needed to unblock:** the per-channel "Push Data Parameters" tables
+  from OKX v5 WebSocket public channels. Any of:
+  - a fetch that renders the SPA sections, or
+  - the six tables supplied directly, or
+  - one live connection to `wss://ws.okx.com:8443/ws/v5/public` subscribing to
+    the six channels and recording raw frames (the `raw_wire` layer from
+    Phase 2 already persists exactly what this needs), which would make the
+    schemas observable from captured data rather than from documentation.
+- **Note:** the same requirement applies to the Bybit v5 and OKX live clients.
+  Adapters exist; nothing ingests from either venue, so multi-exchange remains
+  declared rather than real, and every cross-exchange and spot/perp item in
+  the opportunity taxonomy is blocked on data that does not yet exist.
