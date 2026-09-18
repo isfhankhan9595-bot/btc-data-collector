@@ -361,6 +361,18 @@ class ReplayEngine:
             after = self.book.state.state
             if after is BookQuality.SEQUENCE_GAP and before is not after:
                 self._record_transition(self.book.last_reason, QualityEventType.SEQUENCE_GAP.value)
+            if applied is None and after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING):
+                # Parity with live: the runner retries a retained snapshot
+                # here, so replay must too or the same recorded bytes produce
+                # a different book.
+                if self.book.retry_pending_snapshot():
+                    self.result.snapshots_applied += 1
+                    for committed, event_kind, generation in self.book.committed_recovery_events:
+                        self._record_book(committed, event_kind, generation)
+                    self.book.committed_recovery_events = []
+                    self._record_transition("pending_snapshot_bridge_completed",
+                                            QualityEventType.RECOVERY.value)
+                    after = self.book.state.state
             if self.book.duplicate_count:
                 self.result.quality_events.append({
                     "event_type": QualityEventType.DUPLICATE.value,

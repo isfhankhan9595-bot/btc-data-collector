@@ -228,23 +228,42 @@ def test_numerically_increasing_ids_cannot_repair_a_broken_chain():
     )
 
 
-def test_replayed_repeat_of_an_applied_diff_is_not_silently_accepted():
-    """Binance continuity is the pu rule; a resent diff breaks it.
+def test_replayed_repeat_of_an_applied_diff_is_recorded_but_not_a_gap():
+    """A re-delivered diff is a duplicate, not a break in the chain.
 
-    BinanceSequenceComparator has no duplicate branch -- unlike Bybit, which
-    compares update_id equality. A repeated diff therefore fails
-    `pu == previous.u` and is treated as a gap rather than being waved
-    through. That is the conservative outcome: it cannot produce a falsely
-    VALID book.
+    This test previously asserted the opposite, on the reasoning that a
+    resent diff fails `pu == previous.u` and so should be treated as a gap
+    because that outcome "cannot produce a falsely VALID book". Safe, but
+    incorrect: Binance USD-M step 7 makes every event a statement of
+    *absolute* quantities for the levels it names, so re-applying one is
+    idempotent and dropping one whose `u` does not advance loses nothing.
+    Calling it a gap wrote a SEQUENCE_GAP into the durable quality record
+    that the venue never caused, and forced a REST resync out of the bounded
+    recovery budget. Downstream research then sees a data-quality hole where
+    the stream merely repeated itself.
+
+    The contract asserted now: the duplicate is *observable* -- never
+    silently accepted -- but it is reported as what it is, the book stays
+    trusted, and the book's contents are unchanged by the repeat.
     """
     applied = _depth_frame(BASE_TS + 30, U=106, u=110, pu=105, bid="100.1", index=2)
+    baseline = ReplayEngine().run(ReplaySource(_normal_session()[:3]))
     frames = _normal_session()[:3] + [
         ReplayFrame(timestamp_ms=BASE_TS + 35, kind=FrameKind.WIRE,
                     source_index=9, payload=applied.payload),
     ]
     result = ReplayEngine().run(ReplaySource(frames))
-    assert result.final_state != BookQuality.VALID.value
-    assert any(e.get("event_type") == "SEQUENCE_GAP" for e in result.quality_events)
+
+    assert any(e.get("event_type") == "DUPLICATE" for e in result.quality_events), (
+        "a repeated diff must remain observable in the quality record"
+    )
+    assert not any(e.get("event_type") == "SEQUENCE_GAP" for e in result.quality_events), (
+        "a duplicate must not be reported as a venue-side sequence gap"
+    )
+    assert result.final_state == BookQuality.VALID.value
+    # Idempotence: the repeat contributed no book update and left the book
+    # identical to the session without it.
+    assert result.book_updates == baseline.book_updates
 
 
 def test_malformed_snapshot_payload_is_rejected_not_applied():
