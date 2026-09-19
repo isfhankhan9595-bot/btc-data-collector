@@ -175,8 +175,11 @@ BYBIT_OPENINTEREST_SCHEMA = pa.schema([
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("open_interest", pa.float64()),
+    # Unit of open_interest (OIUnit value). UNKNOWN for Bybit: see the adapter.
+    ("oi_unit", pa.string()),
     ("carried_forward", pa.list_(pa.string())),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_openinterest", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "bybit_openinterest", "symbol": SYMBOL,
+             "note": "1.1 adds oi_unit; open_interest unit is UNKNOWN and must not be compared across venues"})
 
 BYBIT_LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -291,8 +294,10 @@ OKX_OPENINTEREST_SCHEMA = pa.schema([
     ("open_interest", pa.float64()),
     ("oi_ccy", pa.float64()),
     ("oi_usd", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_openinterest", "symbol": SYMBOL,
-             "note": "open_interest is contracts (oi field); oi_ccy/oi_usd preserved alongside, not merged"})
+    # Unit of open_interest (OIUnit value): CONTRACTS for OKX.
+    ("oi_unit", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_openinterest", "symbol": SYMBOL,
+             "note": "open_interest is contracts (oi field); oi_ccy (base currency)/oi_usd preserved alongside, not merged; 1.1 adds oi_unit"})
 
 OKX_LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),

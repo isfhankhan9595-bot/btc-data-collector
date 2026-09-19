@@ -66,18 +66,27 @@ that computes the event does not exist for any row.
 
 ## Cross-venue hazards that block specific rows
 
-**Open-interest units are not comparable, and nothing enforces it.**
-`CanonicalOIEvent.open_interest` is one untyped float. OKX stores its `oi`
-(contracts) there. `canonical.py`'s own comment describes Bybit's
-`openInterest` as base-currency, while also declaring the canonical unit to be
-"contracts": by the code's own account, one column holds different physical
-quantities. Binance's OI unit is not documented anywhere in this repository
-(`BINANCE_USDM_SEMANTICS.md` has no OI section). There is **no unit tag and no
-comparability guard** in the code; comparing `open_interest` across venues
-would silently compare different quantities. The OKX schema document lists the
-canonical OI unit as an open question. This must be resolved (a unit tag on the
-event, and an explicit refusal to compare across unknown units) before any
-cross-venue OI row is built.
+**Open-interest units (contract added; cross-venue comparison still blocked).**
+`CanonicalOIEvent.unit` (`OIUnit`: CONTRACTS, BASE_COIN, QUOTE_USD, UNKNOWN)
+states the unit of `open_interest`; the default is UNKNOWN, never "contracts".
+
+| Venue | `open_interest` unit | Basis |
+|---|---|---|
+| OKX | **CONTRACTS** | OKX documents `oi` as "Open interest, in contracts" (`OKX_D11_CHANNEL_SCHEMAS.md`); `oiCcy` (base currency) and `oiUsd` are carried alongside |
+| Bybit | **UNKNOWN** | The official ticker field table says only "Open interest size (both sides)". The example's `openInterestValue` equals `openInterest` x `markPrice`, which suggests base coin, but an example is not a unit statement. Whether "both sides" counts each contract twice relative to OKX/Binance (Bybit also publishes `singleOpenInterest`) is unresolved. |
+| Binance | **UNKNOWN** | No canonical OI event exists: the REST poll is written straight from the runner, the stored `openinterest` stream has no unit column, and `BINANCE_USDM_SEMANTICS.md` has no OI section. |
+
+`assert_comparable_oi(*events)` refuses differing units, and refuses UNKNOWN
+across exchanges; UNKNOWN is comparable with itself *within* one exchange, so a
+venue's own OI change over time stays usable. `base_coin_oi(event)` returns a
+base-coin figure only when it is provable (OKX `oiCcy`) and `None` otherwise.
+`okx_openinterest` and `bybit_openinterest` (schema 1.1) persist `oi_unit`;
+segments written before 1.1 lack the column, and their unit is fixed by stream
+(OKX CONTRACTS, Bybit UNKNOWN). **Nothing calls the guard yet** because no
+cross-venue OI consumer exists; the first one must. Contract size and
+linear-vs-inverse instrument differences are not modelled and remain the
+caller's responsibility. Promoting Bybit or Binance beyond UNKNOWN requires a
+documented unit and counting convention, not an inference.
 
 **OKX `liquidation-orders` is subscription-scoped by instrument type.** One
 stream carries many instruments. Replay preserves every row and does not
@@ -94,8 +103,8 @@ Most of the taxonomy is computable from Binance and Bybit data once the
 market-state and causal feature layers exist. Those layers are **not started**.
 Basis and spot/perp divergence are blocked on data that has never been
 collected and must not be synthesised from perp-only data. Cross-exchange rows
-are blocked on live verification, a causal alignment layer and the OI unit
-contract.
+are blocked on live verification, a causal alignment layer and a documented OI
+unit for Bybit and Binance.
 
 ## Timestamp quality caveats
 

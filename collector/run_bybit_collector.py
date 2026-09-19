@@ -231,6 +231,7 @@ class BybitCollectorApp:
         elif isinstance(event, CanonicalOIEvent):
             self.oi_writer.write({
                 **base, "open_interest": event.open_interest,
+                "oi_unit": event.unit.value,
                 "carried_forward": list(event.carried_forward),
             })
         elif isinstance(event, CanonicalLiquidationEvent):

@@ -7,6 +7,24 @@ from decimal import Decimal
 
 class OISource(str, Enum): REST_POLL = "REST_POLL"; WS_PUSH = "WS_PUSH"
 
+
+class OIUnit(str, Enum):
+    """The physical unit of a ``CanonicalOIEvent.open_interest`` value.
+
+    ``UNKNOWN`` is a first-class, *safe* value: it says the venue's documentation
+    does not state the unit, so nothing may compare this value with another
+    venue's. It is never a synonym for "probably contracts".
+    """
+
+    CONTRACTS = "CONTRACTS"
+    BASE_COIN = "BASE_COIN"
+    QUOTE_USD = "QUOTE_USD"
+    UNKNOWN = "UNKNOWN"
+
+
+class OIUnitError(ValueError):
+    """Open-interest values whose units cannot be proven comparable."""
+
 @dataclass(frozen=True)
 class CanonicalEvent:
     exchange: str; stream: str; exchange_event_ts: Optional[int]; exchange_transaction_ts: Optional[int]
@@ -30,9 +48,13 @@ class CanonicalTradeEvent(CanonicalEvent):
 
 @dataclass(frozen=True)
 class CanonicalOIEvent(CanonicalEvent):
-    #: Canonical unit: contracts (matches this codebase's existing convention
-    #: of using the venue's primary/native size field -- see Bybit's
-    #: `openInterest`, itself base-currency; OKX's is `oi`, contracts).
+    #: The venue's primary/native open-interest size, **in the unit named by
+    #: ``unit``**. There is no venue-neutral canonical unit: OKX's ``oi`` is
+    #: contracts, Bybit's ``openInterest`` is documented only as "size" (unit
+    #: not stated in text), so the same field holds different physical
+    #: quantities per venue. Never compare across events without
+    #: :func:`assert_comparable_oi`; use :func:`base_coin_oi` for a value that
+    #: is safe to compare across venues.
     open_interest: Optional[float] = None; source: OISource = OISource.WS_PUSH
     #: OKX pushes three simultaneous OI representations (contracts/coin/USD).
     #: Only one can be the canonical `open_interest`; the other two are kept
@@ -44,12 +66,57 @@ class CanonicalOIEvent(CanonicalEvent):
     #: Age in ms of each field at this event, as ``(field, age_ms)``. A field
     #: absent here was never observed; it is not assumed to be zero-age.
     field_age_ms: tuple[tuple[str, int], ...] = ()
+    #: Unit of ``open_interest``. Defaults to UNKNOWN so an adapter that does
+    #: not state its unit can never be silently treated as comparable.
+    unit: OIUnit = OIUnit.UNKNOWN
 
     def is_carried_forward(self, field: str) -> bool:
         return field in self.carried_forward
 
     def age_of(self, field: str) -> Optional[int]:
         return dict(self.field_age_ms).get(field)
+def assert_comparable_oi(*events: "CanonicalOIEvent") -> OIUnit:
+    """Raise :class:`OIUnitError` unless every event's ``open_interest`` is
+    provably the same physical quantity; return the shared unit.
+
+    * Different units are never comparable.
+    * An UNKNOWN unit is comparable only with itself **within one exchange**
+      (one venue's stream is one quantity by construction, so an OI *change*
+      over time is safe). Across exchanges UNKNOWN is refused: nobody has
+      established that the two quantities match.
+    * Two exchanges sharing one KNOWN unit pass. Instrument (linear vs
+      inverse, contract size) is not modelled here and remains the caller's
+      responsibility.
+    """
+    if len(events) < 2:
+        raise ValueError("assert_comparable_oi needs at least two events")
+    units = {event.unit for event in events}
+    exchanges = sorted({event.exchange for event in events})
+    if len(units) > 1:
+        raise OIUnitError(
+            f"open interest is in different units {sorted(u.value for u in units)} "
+            f"across {exchanges}; refusing to compare")
+    (unit,) = units
+    if unit is OIUnit.UNKNOWN and len(exchanges) > 1:
+        raise OIUnitError(
+            f"open-interest unit is UNKNOWN for {exchanges}; refusing to compare "
+            f"across exchanges until each venue's unit is documented")
+    return unit
+
+
+def base_coin_oi(event: "CanonicalOIEvent") -> Optional[float]:
+    """Open interest in the base coin, or ``None`` if it cannot be proven.
+
+    The only cross-venue-safe accessor today: a venue that pushes a
+    base-currency figure alongside its native one (OKX ``oiCcy``) provides it;
+    a venue whose native unit is BASE_COIN provides ``open_interest``; anything
+    else returns ``None`` rather than a guess.
+    """
+    if event.unit is OIUnit.BASE_COIN:
+        return event.open_interest
+    return event.oi_ccy
+
+
 @dataclass(frozen=True)
 class CanonicalMarkPriceEvent(CanonicalEvent):
     mark_price: Optional[float] = None; index_price: Optional[float] = None; funding_rate: Optional[float] = None; next_funding_time: Optional[int] = None

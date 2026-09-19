@@ -231,6 +231,7 @@ class OKXCollectorApp:
             self.oi_writer.write({
                 **base, "open_interest": event.open_interest,
                 "oi_ccy": event.oi_ccy, "oi_usd": event.oi_usd,
+                "oi_unit": event.unit.value,
             })
         elif isinstance(event, CanonicalLiquidationEvent):
             self.liq_writer.write({
