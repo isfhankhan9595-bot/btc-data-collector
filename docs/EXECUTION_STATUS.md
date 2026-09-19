@@ -439,7 +439,67 @@ Bybit contributes no data. Same environment blocker applies to live
 verification. The `on_open` / `keepalive` / `control_frames` hooks added in
 Phase 7 are the generic foundation this needs.
 
-### Phases 9+ — market state, features, events — **NOT STARTED**
+### Phase 9 — Leakage-safe label horizons and chronological splits — **PARTIAL, VERIFIED**
+
+**Provenance.** Found as uncommitted work in the shared container (branch
+`phase-09-leakage-safe-splits`, never pushed) while resolving the PR #13
+hotfix. Origin — another concurrent session or the repository owner directly
+— could not be established, so it is not claimed as originating from this
+session. It was reviewed in full before being adopted: both diffs read
+line-by-line, tests read and matched against the defects they claim to
+cover, then run as a batch, then the full suite, then an independent
+adversarial pass (boundary cases: single-date and near-empty inputs,
+adjacent-day gap arithmetic, zero-horizon derivation when no `return_*`
+column exists, monotonicity of the 70/85% split fractions) before commit.
+Nothing here is taken on the strength of its own docstrings or the fact that
+its own tests passed.
+
+**`pipeline/label_generator.py` — defect fixed:** horizons were applied as a
+row shift (`shift_rows = int(h*1000/grid_ms)`), which equals `h` seconds only
+on a perfectly regular grid. The aligned grid has real outages, so
+`return_1s` could silently measure an arbitrarily longer span across a gap,
+and `int()` truncation could silently shorten it (`grid_ms=300, h=1` measured
+900ms). Every downstream conditional statistic would then answer a different
+question than its column name claims. Fixed: grid regularity is verified
+from a timestamp column when available (absence is recorded as
+`grid_verified=False`, never assumed regular); a horizon not evenly divisible
+by `grid_ms` is rejected in `strict` mode and its realised span recorded
+otherwise; the realised horizon in milliseconds is written to metadata
+per-column, not just the requested one.
+
+**`pipeline/split_generator.py` — defect fixed:** the previous embargo logic
+(`dates[:train_end - embargo_days] if train_end > embargo_days else
+dates[:train_end]`) silently dropped the embargo entirely whenever a split
+was shorter than the requested gap, while the manifest still recorded the
+requested `embargo_days` as if applied — the exact "verify programmatically
+that an embargo actually exists" failure this project's rules name
+explicitly. It also removed the gap from both sides of each boundary,
+silently doubling it. Fixed: `purge_days` is derived from the *measured*
+longest label horizon across every labeled file's schema (not the newest
+file alone, and not a hardcoded constant that could drift out of step with
+the label set); the gap is removed from the end of the earlier split only,
+since forward-looking labels leak forward; `verify_manifest()` independently
+re-derives ordering, disjointness and achieved gaps from the recorded dates
+rather than trusting the arithmetic that produced them; an empty split or an
+under-achieved gap raises `LeakageError` in `strict` mode rather than writing
+a manifest that reports itself safe.
+
+**Tests:** `test_leakage_safe_splits.py` (new, 31 tests) plus updates to the
+two existing test files — 39 in the batch group, all passing. Full suite:
+**496 passed** (462 + 34 net new/changed).
+
+**Not claimed:**
+- `pipeline/dataset_assembler.py`, `pipeline/cross_exchange_alignment.py`,
+  `pipeline/stats_computer.py` are untouched by this work and have not been
+  reviewed against the leakage rules in this pass.
+- No real labeled dataset has been run through this end-to-end; correctness
+  is verified against synthetic fixtures and property-style boundary cases,
+  not a production run.
+- Walk-forward / purged / embargoed *evaluation* (item N in the priority
+  list) is distinct from the chronological single-pass split here and is not
+  built.
+
+### Phases 10+ — market state, features, events — **NOT STARTED**
 
 See `docs/DATA_SUFFICIENCY.md` for which events are feasible on Binance-only
 data today (roughly two-thirds) and which are blocked on data that has never
