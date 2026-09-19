@@ -232,21 +232,32 @@ def test_unroutable_frames_are_recorded_not_dropped(adapter_cls, frame):
     assert adapter.unhandled_count == 1
 
 
-def test_okx_unimplemented_channels_are_explicitly_classified():
-    """D11: six declared channels are not implemented. Say so, loudly."""
+def test_okx_malformed_payload_for_implemented_channels_is_explicitly_classified():
+    """D11 follow-up: all eight declared channel names are now implemented
+    (docs/OKX_D11_CHANNEL_SCHEMAS.md). An empty/malformed payload for any of
+    them must still be observable -- as MALFORMED_PAYLOAD now, not silently
+    parsed into a fabricated 0.0-priced event and not (any more)
+    CHANNEL_NOT_IMPLEMENTED, since implementation gaps are what that reason
+    exists to flag, and there are none left to flag. liquidation-orders is
+    the one exception: an empty outer object has a valid shape with zero
+    entries in `details[]`, which is EMPTY_DATA (a distinct, equally
+    non-silent classification), not a parse failure."""
     adapter = OKXAdapter()
-    assert adapter.unimplemented_channels
-    for channel in sorted(adapter.unimplemented_channels):
+    channels = sorted(adapter.declared_channels())
+    assert channels, "expected OKX to declare at least one channel"
+    for channel in channels:
         adapter.normalize({"arg": {"channel": channel}, "data": [{}]}, local_receive_ts=1)
     drained = adapter.drain_unhandled()
-    assert len(drained) == len(adapter.unimplemented_channels)
-    assert all(m.reason is UnhandledReason.CHANNEL_NOT_IMPLEMENTED for m in drained)
+    assert len(drained) == len(channels)
+    by_channel = {m.channel: m.reason for m in drained}
+    assert by_channel.pop("liquidation-orders") is UnhandledReason.EMPTY_DATA
+    assert all(reason is UnhandledReason.MALFORMED_PAYLOAD for reason in by_channel.values())
 
 
 def test_declared_channels_minus_unimplemented_is_what_actually_works():
     adapter = OKXAdapter()
-    assert adapter.implemented_channels() == frozenset({"books"})
-    assert adapter.declared_channels() > adapter.implemented_channels()
+    assert adapter.implemented_channels() == adapter.declared_channels()
+    assert not adapter.unimplemented_channels
 
 
 def test_control_frames_are_classified_separately_from_data_loss():
@@ -299,7 +310,7 @@ def test_unhandled_message_converts_to_a_durable_quality_event():
     event = adapter.drain_unhandled()[0].to_quality_event()
     assert event["exchange"] == "OKX"
     assert event["event_type"] == "DATA_DROP"
-    assert "channel_not_implemented" in event["reason"]
+    assert "malformed_payload" in event["reason"]
     assert event["rows_lost"] == 1
     assert event["local_receive_ts"] == 77
 

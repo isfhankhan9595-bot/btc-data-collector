@@ -355,23 +355,37 @@ async def test_every_envelope_kind_is_captured_before_classification():
 # The actual unblock mechanism
 # ---------------------------------------------------------------------------
 
-def test_capture_subscribes_to_channels_the_parser_refuses():
-    """This is the point of the whole module.
-
-    ``OKXAdapter`` declares seven channels and implements one; the other six
-    raise CHANNEL_NOT_IMPLEMENTED. Capture must nonetheless subscribe to them,
-    because those are exactly the schemas that need observing before a parser
-    can be written without guessing.
+def test_capture_subscribes_to_every_declared_channel_regardless_of_parser_status():
+    """Capture is unconditional: it subscribes to every channel the adapter
+    declares whether or not normalize() implements it, because capture's job
+    is recording the wire, not deciding what is parseable. (Originally this
+    covered six then-unimplemented D11 channels specifically; all seven are
+    now implemented -- see docs/OKX_D11_CHANNEL_SCHEMAS.md -- but the
+    capture/parse independence this asserts is unchanged.)
     """
     adapter = OKXAdapter()
     declared = adapter.declared_channels()
-    unimplemented = adapter.unimplemented_channels
-    assert unimplemented, "expected D11 channels to still be declared unimplemented"
+    assert declared == adapter.implemented_channels(), (
+        "D11 implementation is complete; a channel appearing here as "
+        "declared-but-unimplemented would be a regression"
+    )
 
     capture = OKXPublicCapture(sorted(declared))
     args = {a["channel"] for a in capture._subscribe_message["args"]}
-    assert unimplemented <= args
     assert args == set(declared)
+
+
+def test_capture_subscribe_args_are_channel_aware():
+    """liquidation-orders subscribes by instType, not instId; index-tickers
+    by its own index instId, not the SWAP instId every other channel uses.
+    A uniform ``instId``-for-everything builder was the pre-implementation
+    bug; this pins the fix (docs/OKX_D11_CHANNEL_SCHEMAS.md §F)."""
+    capture = OKXPublicCapture(["books", "index-tickers", "liquidation-orders"])
+    by_channel = {a["channel"]: a for a in capture._subscribe_message["args"]}
+    assert by_channel["books"] == {"channel": "books", "instId": "BTC-USDT-SWAP"}
+    assert by_channel["index-tickers"] == {"channel": "index-tickers", "instId": "BTC-USDT"}
+    assert by_channel["liquidation-orders"] == {"channel": "liquidation-orders", "instType": "SWAP"}
+    assert "instId" not in by_channel["liquidation-orders"]
 
 
 def test_oversized_subscribe_request_is_refused_locally():
@@ -610,17 +624,30 @@ def test_schema_report_refuses_to_claim_semantics(tmp_path):
     assert okx_schema_report.main(["--data-dir", str(tmp_path)]) == 0
 
 
-def test_okx_adapter_still_refuses_unimplemented_channels():
-    """Capture must not have quietly enabled a guessed parser."""
+def test_okx_adapter_implements_all_declared_channels():
+    """Was: adapter refuses six D11 channels with CHANNEL_NOT_IMPLEMENTED.
+    Now: all seven wire channels (eight declared names) are implemented --
+    see docs/OKX_D11_CHANNEL_SCHEMAS.md. This pins the opposite of the old
+    assertion: no declared channel should still raise
+    CHANNEL_NOT_IMPLEMENTED, and a well-formed frame for each produces a
+    real canonical event, not an empty list."""
     adapter = OKXAdapter()
-    for channel in sorted(adapter.unimplemented_channels):
+    fixtures = {
+        "books": {"bids": [["50000", "1"]], "asks": [["50001", "1"]], "ts": "1700000000000", "seqId": 1, "prevSeqId": -1},
+        "trades": {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "50000", "sz": "1", "side": "buy", "ts": "1700000000000"},
+        "trades-all": {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "50000", "sz": "1", "side": "buy", "ts": "1700000000000", "source": "0"},
+        "mark-price": {"instType": "SWAP", "instId": "BTC-USDT-SWAP", "markPx": "50000", "ts": "1700000000000"},
+        "index-tickers": {"instId": "BTC-USDT", "idxPx": "50000", "ts": "1700000000000"},
+        "funding-rate": {"instId": "BTC-USDT-SWAP", "fundingRate": "0.0001", "fundingTime": "1700000000000", "ts": "1700000000000"},
+        "open-interest": {"instType": "SWAP", "instId": "BTC-USDT-SWAP", "oi": "100", "oiCcy": "1", "oiUsd": "50000", "ts": "1700000000000"},
+        "liquidation-orders": {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "instFamily": "BTC-USDT", "uly": "BTC-USDT", "details": [{"bkPx": "50000", "sz": "1", "side": "sell", "posSide": "long", "ts": "1700000000000", "bkLoss": "0", "ccy": ""}]},
+    }
+    assert set(fixtures) == adapter.declared_channels()
+    for channel, payload in fixtures.items():
         events = adapter.normalize(
-            {"arg": {"channel": channel, "instId": "BTC-USDT-SWAP"},
-             "data": [{"anything": 1}]}, local_receive_ts=5)
-        assert events == []
-    drained = adapter.drain_unhandled()
-    assert {m.reason.value for m in drained} == {"channel_not_implemented"}
-    assert {m.channel for m in drained} == set(adapter.unimplemented_channels)
+            {"arg": {"channel": channel}, "data": [payload]}, local_receive_ts=5)
+        assert events, f"{channel} produced no events from a well-formed fixture"
+    assert adapter.unhandled_count == 0
 
 
 def test_schema_report_refuses_ambiguous_storage(tmp_path, monkeypatch):

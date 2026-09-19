@@ -103,19 +103,51 @@ class FrameKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+#: Default underlying-index instId, used by ``index-tickers``. This is OKX's
+#: spot-style pair for BTC's index -- distinct from the SWAP instId every
+#: other channel here subscribes with. Unverified against a live connection
+#: (docs/OKX_D11_CHANNEL_SCHEMAS.md, open question #3); a caller who has
+#: confirmed the correct identifier can override it via
+#: ``okx_subscribe_message``'s ``index_inst_id`` parameter rather than this
+#: module silently assuming it is right.
+OKX_BTC_INDEX_INST_ID = "BTC-USDT"
+
+#: OKX channel that subscribes by instType, not instId (confirmed in
+#: docs/OKX_D11_CHANNEL_SCHEMAS.md, §F -- two independent sources). A single
+#: subscribe args builder that applied ``instId`` to every channel uniformly
+#: would send this channel the wrong argument shape entirely; that was the
+#: bug before this set existed.
+OKX_INST_TYPE_SCOPED_CHANNELS = frozenset({"liquidation-orders"})
+OKX_LIQUIDATION_INST_TYPE = "SWAP"
+
+
 def okx_subscribe_message(
     channels: Iterable[str],
     inst_id: str = OKX_BTC_SWAP_INST_ID,
     *,
     request_id: Optional[str] = None,
+    index_inst_id: str = OKX_BTC_INDEX_INST_ID,
 ) -> dict[str, Any]:
     """Build the documented subscribe request.
 
     ``id`` is optional in the protocol but is set when supplied, because it is
     echoed back in the acknowledgement and is the only way to tie an ack to
     the request that caused it.
+
+    Argument shape is channel-aware, not uniform: ``liquidation-orders``
+    subscribes by ``instType`` (never ``instId``), and ``index-tickers``
+    subscribes by its own index instId, not the SWAP instId every other
+    channel here uses. See docs/OKX_D11_CHANNEL_SCHEMAS.md for the sourcing
+    on both.
     """
-    args = [{"channel": channel, "instId": inst_id} for channel in channels]
+    args = []
+    for channel in channels:
+        if channel in OKX_INST_TYPE_SCOPED_CHANNELS:
+            args.append({"channel": channel, "instType": OKX_LIQUIDATION_INST_TYPE})
+        elif channel == "index-tickers":
+            args.append({"channel": channel, "instId": index_inst_id})
+        else:
+            args.append({"channel": channel, "instId": inst_id})
     if not args:
         raise ValueError("subscribe requires at least one channel")
     message: dict[str, Any] = {"op": "subscribe", "args": args}
