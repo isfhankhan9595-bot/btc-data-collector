@@ -975,3 +975,29 @@ reconnect behaves as it does against fake sockets.
 | G3 | OKX `books` is parsed by the adapter but not collected by `run_okx_collector`; OKX book replay has no committed test; adapter emits `float` levels into a `Decimal`-typed event. | OKX book replay is unverified; no live OKX book data. |
 | G4 | `tests/test_okx_collector_storage.py` uses a bare `from run_okx_collector import ...`, so `pytest collector` from the repo root fails at collection; CI is unaffected. | Test-invocation fragility only. |
 | G5 | `pipeline/cross_exchange_alignment.py` has no test file. | Cannot be relied on for causal alignment until audited and tested. |
+
+### OI unit contract — **IMPLEMENTED, TESTED; not COMPLETE until merged (main ancestry recorded on the PR)**
+
+Closes G1 above. A handoff had described `OIUnit` / `assert_comparable_oi()` as
+existing; they did not, so they were built.
+
+- `canonical.py`: `OIUnit` (CONTRACTS / BASE_COIN / QUOTE_USD / UNKNOWN),
+  `OIUnitError`, `CanonicalOIEvent.unit` (default **UNKNOWN**),
+  `assert_comparable_oi()`, `base_coin_oi()`. The self-contradictory comment
+  ("canonical unit is contracts" beside "Bybit's is base-currency") is replaced.
+- Units: OKX **CONTRACTS** (documented). Bybit **UNKNOWN**: verified against the
+  official ticker field table, which states no unit; the base-coin reading rests
+  on an example's arithmetic, and the "both sides" counting convention is
+  unresolved. Binance **UNKNOWN** and has no canonical OI event.
+- `okx_openinterest` / `bybit_openinterest` schemas 1.0 -> 1.1: add `oi_unit`.
+- Guard semantics: differing units refused; UNKNOWN refused across exchanges but
+  allowed within one exchange (so single-venue OI change stays usable).
+
+**Tests:** `test_oi_unit_contract.py` (new, 17), mutation-checked: promoting
+Bybit to BASE_COIN fails 5, a permissive guard fails 1, dropping the persisted
+unit fails 1.
+
+**Not claimed:** no consumer calls the guard (none exists); Bybit/Binance units
+are unresolved; instrument/contract-size differences are not modelled; Binance
+OI (G2) is untouched; segments written before schema 1.1 have no `oi_unit`
+column (fixed by stream).

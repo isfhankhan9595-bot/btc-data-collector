@@ -41,6 +41,7 @@ from ..canonical import (
     CanonicalOrderBookEvent,
     CanonicalTradeEvent,
     OISource,
+    OIUnit,
 )
 from ..sequence import BybitSequenceComparator
 
@@ -170,6 +171,14 @@ class BybitAdapter(ExchangeAdapter):
                     "BYBIT", "openinterest", ts, None, now,
                     open_interest=self._as_float(state.get("openInterest")),
                     source=OISource.WS_PUSH,
+                    # Deliberately UNKNOWN. Bybit's ticker field table says only
+                    # "Open interest size (both sides)" -- no unit. The example
+                    # (openInterestValue == openInterest * markPrice) suggests
+                    # base coin, but an example is not documentation, and the
+                    # "both sides" counting convention versus `singleOpenInterest`
+                    # is unresolved. Do not promote this without a documented
+                    # unit and convention.
+                    unit=OIUnit.UNKNOWN,
                     carried_forward=carried, field_age_ms=ages))
             return events
 

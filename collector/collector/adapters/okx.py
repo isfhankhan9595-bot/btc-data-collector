@@ -42,6 +42,7 @@ from ..canonical import (
     CanonicalOrderBookEvent,
     CanonicalTradeEvent,
     OISource,
+    OIUnit,
 )
 from ..sequence import OKXSequenceComparator
 
@@ -256,6 +257,9 @@ class OKXAdapter(ExchangeAdapter):
             "OKX", "open-interest", _int(d["ts"]), None, now,
             open_interest=float(d["oi"]), oi_ccy=_num(d.get("oiCcy")),
             oi_usd=_num(d.get("oiUsd")), source=OISource.WS_PUSH,
+            # OKX documents `oi` as "Open interest, in contracts"
+            # (docs/OKX_D11_CHANNEL_SCHEMAS.md) and `oiCcy` as base currency.
+            unit=OIUnit.CONTRACTS,
         ) for d in data]
 
     def _parse_liquidation_orders(self, data, now):
