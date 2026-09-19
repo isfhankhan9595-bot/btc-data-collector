@@ -539,8 +539,8 @@ def _record_all_three_venues(base: Path) -> None:
         (BASE_TS + 30, _bybit_payload(BASE_TS + 30, 102, bid="100.2")),
     ])
     _write_wire(base, "OKX", [
-        (BASE_TS + 15, json.dumps({"arg": {"channel": "funding-rate"}, "data": [{"fundingRate": "0.0001"}]})),
-        (BASE_TS + 25, json.dumps({"arg": {"channel": "funding-rate"}, "data": [{"fundingRate": "0.0002"}]})),
+        (BASE_TS + 15, json.dumps({"arg": {"channel": "funding-rate"}, "data": [{"ts": str(BASE_TS + 15), "fundingRate": "0.0001"}]})),
+        (BASE_TS + 25, json.dumps({"arg": {"channel": "funding-rate"}, "data": [{"ts": str(BASE_TS + 25), "fundingRate": "0.0002"}]})),
     ])
     wire = ParquetWriter("raw_wire", RAW_WIRE_SCHEMA, base_dir=str(base))
     rest = ParquetWriter("raw_rest", RAW_REST_SCHEMA, base_dir=str(base))
@@ -581,8 +581,16 @@ def test_replay_reads_only_the_requested_venue_and_matches_each_venues_own_book(
     okx_source = ReplaySource.from_directory(str(tmp_path), venue="OKX")
     assert len(okx_source) == 2
     assert all("funding-rate" in frame.payload for frame in okx_source)
-    with pytest.raises(ValueError):           # OKX has no replay adapter yet; say so, don't misroute
-        ReplayEngine(venue="OKX")
+    okx = replay_directory(str(tmp_path), venue="OKX")
+    # OKX has no order book in this fixture -- funding-rate is a non-book
+    # canonical event (CanonicalMarkPriceEvent), never routed through
+    # LocalBook, so book_updates stays empty and the events land in
+    # non_book_events instead.
+    assert okx.book_updates == []
+    assert len(okx.non_book_events) == 2
+    assert [event.funding_rate for event in okx.non_book_events] == [0.0001, 0.0002]
+    assert all(event.exchange == "OKX" and event.stream == "funding-rate"
+               for event in okx.non_book_events)
     with pytest.raises(ValueError):
         ReplaySource.from_directory(str(tmp_path), venue="COINBASE")
 

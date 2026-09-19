@@ -55,12 +55,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .adapters.binance import BinanceAdapter
 from .adapters.bybit import BybitAdapter
+from .adapters.okx import OKXAdapter
 from .book_engine import LocalBook
 from .canonical import CanonicalOrderBookEvent
 from .quality_events import BookQuality, QualityEventType
@@ -134,6 +135,12 @@ class ReplayResult:
     """Everything a replay produced, plus a digest for parity comparison."""
 
     book_updates: list[BookUpdate] = field(default_factory=list)
+    #: Canonical events from every non-order-book stream a venue adapter
+    #: produces (trades, mark/index/funding, OI, liquidations, ...), stored
+    #: as the actual frozen dataclass instances `adapter.normalize()`
+    #: yielded -- not re-shaped into a book-like record, and not routed
+    #: through LocalBook, which only ever meant order-book reconstruction.
+    non_book_events: list[Any] = field(default_factory=list)
     quality_events: list[dict[str, Any]] = field(default_factory=list)
     frames_total: int = 0
     frames_wire: int = 0
@@ -148,13 +155,23 @@ class ReplayResult:
     def digest(self) -> str:
         """Stable hash of the full output sequence.
 
-        Covers book states *and* quality transitions, so a replay that
-        produced the same prices via a different quality path does not
-        compare equal.
+        Covers book states, non-book canonical events, *and* quality
+        transitions, so a replay that produced the same prices via a
+        different quality path -- or the same book but a changed trade,
+        funding rate, OI reading, or liquidation -- does not compare equal.
         """
         hasher = hashlib.sha256()
         for update in self.book_updates:
             hasher.update(repr(update.digest_tuple()).encode())
+        for event in self.non_book_events:
+            # asdict() on a frozen dataclass of only str/int/float/bool/
+            # tuple/Enum/None fields (see canonical.py) is deterministic;
+            # default=str turns the one non-JSON-native field (OISource,
+            # an Enum) into its repr rather than raising. The type name is
+            # included so a trade and a liquidation with coincidentally
+            # identical field values never hash the same.
+            payload = {"__type__": type(event).__name__, **asdict(event)}
+            hasher.update(json.dumps(payload, sort_keys=True, default=str).encode())
         for event in self.quality_events:
             hasher.update(
                 repr((event.get("event_type"), event.get("reason"),
@@ -170,6 +187,7 @@ class ReplayResult:
             "frames_undecodable": self.frames_undecodable,
             "frames_unhandled": self.frames_unhandled,
             "book_updates": len(self.book_updates),
+            "non_book_events": len(self.non_book_events),
             "quality_events": len(self.quality_events),
             "snapshots_applied": self.snapshots_applied,
             "snapshots_rejected": self.snapshots_rejected,
@@ -320,6 +338,7 @@ def _as_ms(value: Any) -> int:
 _ADAPTER_CLASSES: dict[str, type] = {
     "BINANCE": BinanceAdapter,
     "BYBIT": BybitAdapter,
+    "OKX": OKXAdapter,
 }
 
 
@@ -416,6 +435,14 @@ class ReplayEngine:
             message, local_receive_ts=frame.timestamp_ms
         ):
             if not isinstance(event, CanonicalOrderBookEvent):
+                # Trades, mark/index/funding, OI, liquidations, ... -- every
+                # non-order-book canonical event this adapter's normalize()
+                # produces. These never touch LocalBook (that machinery is
+                # order-book reconstruction only); they are preserved
+                # directly, exactly as live would hand them to its own
+                # downstream writers, so a changed trade or funding value
+                # changes the replay digest instead of vanishing here.
+                self.result.non_book_events.append(event)
                 continue
             if event.book_source != "DIFF_DEPTH_RECONSTRUCTED":
                 # depth10 partials are not authoritative; live refuses them
