@@ -64,7 +64,8 @@ from .adapters.bybit import BybitAdapter
 from .book_engine import LocalBook
 from .canonical import CanonicalOrderBookEvent
 from .quality_events import BookQuality, QualityEventType
-from .storage_layout import StorageCollisionError, iter_segments
+from .storage_layout import StorageCollisionError, iter_segments, read_streams
+from .utils import logger
 
 __all__ = [
     "ReplayFrame",
@@ -187,6 +188,9 @@ class ReplaySource:
 
     def __init__(self, frames: Iterable[ReplayFrame]) -> None:
         self._frames = sorted(frames, key=lambda frame: frame.order_key)
+        #: Rows a directory read refused because their ``venue`` column named
+        #: a different venue (or none). Empty for a clean read; never silent.
+        self.skipped_rows: dict[str, int] = {}
 
     def __iter__(self) -> Iterator[ReplayFrame]:
         return iter(self._frames)
@@ -235,25 +239,60 @@ class ReplaySource:
 
     @classmethod
     def from_directory(
-        cls, data_dir: str, date: str | None = None
+        cls, data_dir: str, date: str | None = None, venue: str = "BINANCE"
     ) -> "ReplaySource":
-        """Read recorded ``raw_wire`` and ``raw_rest`` segments."""
+        """Read ``venue``'s recorded ``raw_wire`` and ``raw_rest`` segments.
+
+        Each venue records into its own stream directory (``venue_stream``),
+        so replaying Bybit or OKX never reads Binance's frames. OKX also
+        reads the legacy unprefixed ``raw_wire``, where its pre-namespace
+        captures live alongside Binance's; that directory is shared history,
+        so every row is kept only if its own ``venue`` column matches. Rows
+        naming another venue are excluded and counted in ``skipped_rows``
+        rather than replayed through the wrong adapter or silently dropped.
+        """
         import pandas as pd
+
+        venue_key = venue.upper()
+        skipped: dict[str, int] = {}
 
         def read(stream: str) -> list[dict]:
             rows: list[dict] = []
-            try:
-                paths = list(iter_segments(data_dir, stream, date=date))
-            except StorageCollisionError as exc:
-                raise StorageCollisionError(
-                    f"cannot replay {stream}: ambiguous storage ({exc})"
-                ) from exc
-            for path in sorted(paths):
-                frame = pd.read_parquet(path)
-                rows.extend(frame.to_dict("records"))
+            for name in read_streams(venue_key, stream):
+                try:
+                    paths = list(iter_segments(data_dir, name, date=date))
+                except StorageCollisionError as exc:
+                    raise StorageCollisionError(
+                        f"cannot replay {name}: ambiguous storage ({exc})"
+                    ) from exc
+                for path in sorted(paths):
+                    frame = pd.read_parquet(path)
+                    for row in frame.to_dict("records"):
+                        row_venue = _row_venue(row)
+                        if row_venue != venue_key:
+                            key = row_venue or "<unattributed>"
+                            skipped[key] = skipped.get(key, 0) + 1
+                            continue
+                        rows.append(row)
             return rows
 
-        return cls.from_records(read("raw_wire"), read("raw_rest"))
+        source = cls.from_records(read("raw_wire"), read("raw_rest"))
+        source.skipped_rows = skipped
+        if skipped:
+            logger.warning("replay_skipped_foreign_venue_rows", venue=venue_key, skipped=skipped)
+        return source
+
+
+def _row_venue(row: dict) -> str:
+    """A stored row's venue, upper-cased; ``""`` when it names none.
+
+    pandas hands back ``NaN`` (a truthy float) for a null string cell, so a
+    plain ``str(value or "")`` would file an unattributed row under ``"NAN"``.
+    """
+    value = row.get("venue")
+    if value is None or (isinstance(value, float) and value != value):
+        return ""
+    return str(value).strip().upper()
 
 
 def _as_ms(value: Any) -> int:
@@ -522,6 +561,13 @@ class ReplayEngine:
         return self.result
 
 
-def replay_directory(data_dir: str, date: str | None = None) -> ReplayResult:
-    """Convenience: replay recorded segments from disk."""
-    return ReplayEngine().run(ReplaySource.from_directory(data_dir, date=date))
+def replay_directory(
+    data_dir: str, date: str | None = None, venue: str = "BINANCE"
+) -> ReplayResult:
+    """Convenience: replay ``venue``'s recorded segments from disk.
+
+    The venue selects both the stream directories read and the adapter that
+    replays them, so a venue's frames are never replayed by another's adapter.
+    """
+    return ReplayEngine(venue=venue).run(
+        ReplaySource.from_directory(data_dir, date=date, venue=venue))

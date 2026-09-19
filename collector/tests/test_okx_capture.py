@@ -25,6 +25,7 @@ from collector.collector.okx_capture import (
     okx_subscribe_message,
 )
 from collector.collector.parquet_writer import ParquetWriter
+from collector.collector.storage_layout import venue_stream
 from collector.collector.raw_capture import RawCapture, RawWireRecord
 from collector.collector.websocket_client import Keepalive, WebSocketClient
 from collector.scripts import okx_schema_report
@@ -514,8 +515,8 @@ async def test_failed_subscribe_on_open_is_recorded_and_reconnects():
 # ---------------------------------------------------------------------------
 
 def _write_raw_wire(tmp_path, frames):
-    writer = ParquetWriter("raw_wire", RAW_WIRE_SCHEMA, base_dir=str(tmp_path),
-                           segment_rows=1000, segment_seconds=3600)
+    writer = ParquetWriter(venue_stream("OKX", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=str(tmp_path),
+                           exchange="OKX", segment_rows=1000, segment_seconds=3600)
     capture = RawCapture(writer, None)
     for index, (channel, payload, decode_ok) in enumerate(frames):
         capture.capture_wire(RawWireRecord(

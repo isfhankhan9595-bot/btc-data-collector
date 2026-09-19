@@ -6,13 +6,77 @@ import os
 import time
 from datetime import date as _date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import IO, Any, Callable, Dict, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .utils import logger
-from .storage_layout import SegmentKind, iter_segments, parse_segment_name, segment_path
+from .storage_layout import (
+    SegmentKind, check_stream_namespace, iter_segments, parse_segment_name, segment_path,
+)
+
+try:  # POSIX advisory locks. Absent on Windows; see _acquire_writer_lock.
+    import fcntl
+except ImportError:  # pragma: no cover - the collector deploys on Linux
+    fcntl = None  # type: ignore[assignment]
+
+#: Held (exclusively, for the writer's lifetime) inside every stream directory.
+#: Not a segment name, so ``parse_segment_name`` and every reader ignore it.
+WRITER_LOCK_FILENAME = ".writer.lock"
+
+
+class StorageWriterLockedError(RuntimeError):
+    """Another live writer already owns this stream directory."""
+
+
+def _acquire_writer_lock(stream_dir: Path) -> Optional[IO[bytes]]:
+    """Take the stream directory's exclusive writer lock, or raise.
+
+    Sequence allocation is scan-then-create: it reads the directory, picks
+    ``max + 1``, and only later opens ``<seg>.tmp``. Nothing reserves that
+    number, so two live writers on one directory pick the same one and open
+    the *same* ``.tmp`` path -- interleaving two parquet streams into one
+    file. Worse, ``_recover_orphans`` deletes every ``*.seg.tmp`` it finds,
+    which from a second process is the first process's live segment, and then
+    reports a DATA_DROP for it. Separate stream names remove the *expected*
+    collision; this lock makes the unexpected one (a duplicate service start,
+    a mis-named stream) fail loudly before it can damage anything.
+
+    ``flock`` is released by the kernel when the holder dies, so a SIGKILLed
+    collector never leaves the next one locked out (restart-safe). It is held
+    on an open-file object so an abandoned writer releases it on collection.
+    """
+    if fcntl is None:  # pragma: no cover
+        logger.warning("storage_writer_lock_unavailable", stream_dir=str(stream_dir),
+                       reason="fcntl not available on this platform; single-writer is unenforced")
+        return None
+    handle = open(stream_dir / WRITER_LOCK_FILENAME, "a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            handle.seek(0)
+            holder = handle.read().decode("utf-8", "replace").strip() or "unknown"
+        except OSError:
+            holder = "unknown"
+        handle.close()
+        raise StorageWriterLockedError(
+            f"stream directory {stream_dir} is already being written by another live "
+            f"writer ({holder}); two writers on one stream would share segment "
+            f"sequence numbers and .tmp files"
+        ) from None
+    except BaseException:
+        handle.close()
+        raise
+    try:  # diagnostic only: tells a refused writer who holds the stream
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n".encode("ascii"))
+        handle.flush()
+    except OSError:
+        pass
+    return handle
 
 
 def _epoch_ms(value: Any) -> Optional[int]:
@@ -67,6 +131,7 @@ class ParquetWriter:
     ) -> None:
         if segment_rows <= 0 or segment_seconds <= 0:
             raise ValueError("segment_rows and segment_seconds must be positive")
+        check_stream_namespace(exchange, stream_name)
         self.stream_name, self.schema, self.base_dir = stream_name, schema, base_dir
         #: Attributed on every quality event this writer emits about itself
         #: (crashed segments, data drops). Defaults to BINANCE because every
@@ -76,21 +141,39 @@ class ParquetWriter:
         self.exchange = exchange
         self.stream_dir = Path(base_dir) / "raw" / stream_name
         self.stream_dir.mkdir(parents=True, exist_ok=True)
-        self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
-        self.quality_event_sink = quality_event_sink
-        self.buffer: List[Dict[str, Any]] = []
-        self.current_hour = self._get_current_hour_str()
-        self.writer: Optional[pq.ParquetWriter] = None
-        self._tmp_filepath: Optional[Path] = None
-        self._counter_filepath: Optional[Path] = None
-        self._segment_opened_monotonic = time.monotonic()
-        self.record_count = 0
-        self._first_record_ts: Optional[int] = None
-        self._last_record_ts: Optional[int] = None
-        self._sequence_cache: dict[str, int] = {}
-        self._seq = self._next_sequence(self.current_hour)
-        self._recover_orphans()
-        self._open_segment()
+        self._closed = False
+        self._lock_handle: Optional[IO[bytes]] = _acquire_writer_lock(self.stream_dir)
+        try:
+            self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
+            self.quality_event_sink = quality_event_sink
+            self.buffer: List[Dict[str, Any]] = []
+            self.current_hour = self._get_current_hour_str()
+            self.writer: Optional[pq.ParquetWriter] = None
+            self._tmp_filepath: Optional[Path] = None
+            self._counter_filepath: Optional[Path] = None
+            self._segment_opened_monotonic = time.monotonic()
+            self.record_count = 0
+            self._first_record_ts: Optional[int] = None
+            self._last_record_ts: Optional[int] = None
+            self._sequence_cache: dict[str, int] = {}
+            self._seq = self._next_sequence(self.current_hour)
+            self._recover_orphans()
+            self._open_segment()
+        except BaseException:
+            # A writer that never finished constructing must not keep the
+            # directory locked (e.g. a refused legacy/segment collision).
+            self._release_lock()
+            raise
+
+    def _release_lock(self) -> None:
+        handle, self._lock_handle = self._lock_handle, None
+        if handle is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     def _get_current_hour_str(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
@@ -245,7 +328,15 @@ class ParquetWriter:
     def write(self, record: Dict[str, Any]) -> None:
         hour = self._get_current_hour_str()
         if hour != self.current_hour:
-            self.close()
+            if self._closed:
+                # close() released the stream lock. Rolling over would open a
+                # new segment in a directory this writer no longer owns.
+                raise RuntimeError(
+                    f"ParquetWriter for {self.stream_name!r} is closed and no longer owns "
+                    f"its stream directory; refusing to open a new segment")
+            # Not close(): the writer keeps its stream directory across an
+            # hour rollover, so the lock must stay held.
+            self._finalize_segment()
             self.current_hour, self._seq = hour, self._next_sequence(hour)
             self._open_segment()
         self.buffer.append(record)
@@ -318,6 +409,14 @@ class ParquetWriter:
             self._open_segment()
 
     def close(self) -> None:
+        """Publish the open segment and release the stream directory lock."""
+        try:
+            self._finalize_segment()
+        finally:
+            self._closed = True
+            self._release_lock()
+
+    def _finalize_segment(self) -> None:
         if self.writer is None:
             return
         if self.record_count == 0 and not self.buffer:

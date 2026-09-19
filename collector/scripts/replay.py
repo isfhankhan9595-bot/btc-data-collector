@@ -24,14 +24,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("date", nargs="?", default=None, help="UTC date, YYYY-MM-DD")
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--venue", default="BINANCE", type=str.upper,
+                        help="Venue whose recorded stream to replay (BINANCE, BYBIT, OKX).")
     parser.add_argument("--verify-determinism", action="store_true",
                         help="Replay twice and require identical digests.")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
 
     try:
-        source = ReplaySource.from_directory(args.data_dir, date=args.date)
-    except StorageCollisionError as exc:
+        source = ReplaySource.from_directory(args.data_dir, date=args.date, venue=args.venue)
+    except (StorageCollisionError, ValueError) as exc:  # ambiguous storage / unknown venue
         print(f"[FAIL] {exc}")
         return 1
 
@@ -41,11 +43,15 @@ def main(argv: Sequence[str] | None = None) -> int:
               + (f" for {args.date}" if args.date else ""))
         return 1
 
-    result = ReplayEngine().run(source)
+    try:
+        result = ReplayEngine(venue=args.venue).run(source)
+    except ValueError as exc:  # unsupported venue: say so, do not traceback
+        print(f"[FAIL] {exc}")
+        return 1
     summary = result.summary()
 
     if args.verify_determinism:
-        second = ReplayEngine().run(source)
+        second = ReplayEngine(venue=args.venue).run(source)
         summary["deterministic"] = second.digest == result.digest
         if not summary["deterministic"]:
             summary["second_digest"] = second.digest
@@ -61,6 +67,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.verify_determinism and not summary.get("deterministic", True):
         print("\n[FAIL] replay is not deterministic: digests differ")
         ok = False
+    if source.skipped_rows:
+        print(f"[WARN] excluded rows from other venues: {source.skipped_rows}")
     if result.frames_undecodable:
         print(f"\n[WARN] {result.frames_undecodable} frame(s) were undecodable when recorded")
     if result.snapshots_rejected:

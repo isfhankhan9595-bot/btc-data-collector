@@ -479,6 +479,11 @@ That existing risk fails loud, not silently (`FileExistsError` guards
 publish), so it is recorded here as a known defect rather than fixed as a
 side effect of unrelated Bybit work.
 
+> **Superseded by the storage-namespace phase (below).** The claim above that
+> this risk "fails loud, not silently" was wrong: two writers on one stream
+> open the same `.tmp` path before `FileExistsError` can fire, and the second
+> writer's orphan recovery deletes the first's live segment.
+
 **No derived microstructure features are computed for Bybit.**
 `feature_computer.compute_orderbook_features` reads raw Binance-message keys
 directly (`msg.get("E", ...)` with a silent fallback to local time when
@@ -643,6 +648,7 @@ Bybit; and the Binance-comparator invariant test. Full suite: **520 passed**
 - Multi-exchange storage namespace collision (`raw_wire`/`quality_events`
   stream-name collision between OKX and Binance, noted in Phase 7) is
   unrelated to this fix and remains open.
+  *(Addressed afterwards in the storage-namespace phase below.)*
 
 ### Phase 9 — Leakage-safe label horizons and chronological splits — **PARTIAL, VERIFIED**
 
@@ -713,6 +719,54 @@ two existing test files — 39 in the batch group, all passing. Full suite:
 - Walk-forward / purged / embargoed *evaluation* (item N in the priority
   list) is distinct from the chronological single-pass split here and is not
   built.
+
+### Storage-namespace phase — multi-venue stream namespaces and single-writer locks — **IMPLEMENTED, TESTED; not COMPLETE until merged (main ancestry is recorded on the PR)**
+
+**Provenance.** The previous session's OKX renames were never pushed and were
+not present in the repository when this session began (`main` @ `d2e2ea1`,
+clean tree, no stash, no branch carrying storage work). The work was redone
+from the source, not adopted from a transcript.
+
+**Defects found by inspection and reproduced on the real writer:**
+
+| # | Defect | Severity |
+|---|---|---|
+| S1 | OKX capture shared Binance's `raw_wire` / `quality_events` stream directories. | High |
+| S2 | Two live writers on one stream directory choose the same sequence and open the **same `.tmp` path**; the publish-time `FileExistsError` guard fires only afterwards. The earlier note that this "fails loud" was incorrect. | High — data corruption |
+| S3 | A writer's orphan recovery deletes every `*.seg.tmp` in its directory: from a second process, that is the first process's live segment, reported as a `DATA_DROP`. | High — data loss + false alarm |
+| S4 | The OKX runner built its writers without `exchange="OKX"`, so a crashed OKX segment was durably recorded as a **BINANCE** storage fault. | Medium — misattribution |
+| S5 | `ReplaySource.from_directory` / `replay_directory` hard-coded Binance's streams and adapter: replaying Bybit or OKX from disk read Binance's frames, and Binance replay would read legacy OKX frames from the shared `raw_wire`. | High — cross-venue mixing in replay |
+
+**Fixed:**
+- `storage_layout`: `venue_stream`, `read_streams`, `check_stream_namespace` —
+  one authority for venue → stream directory. Binance keeps its historical
+  names; OKX is `okx_*`; Bybit was already `bybit_*`. Unregistered venues
+  raise.
+- `ParquetWriter`: refuses a stream that contradicts its declared venue, and
+  holds an exclusive `flock` on `<stream_dir>/.writer.lock` for its lifetime
+  (across hour rollover; released by public `close()`; kernel-released on
+  crash). A second writer raises `StorageWriterLockedError` before touching
+  anything.
+- `run_okx_capture`: `okx_raw_wire` / `okx_quality_events`, `exchange="OKX"`.
+- Readers: replay and `okx_schema_report` resolve streams by venue and keep a
+  row only if its own `venue` column matches; excluded rows are counted, not
+  hidden. `scripts/replay.py --venue` added.
+- One existing assertion updated (`test_empty_parquet_sidecar_…`): it asserted
+  the stream directory was entirely empty; it now asserts no segment,
+  temporary segment or sidecar exists, since the lock file is a permanent
+  non-segment file by design.
+
+**Tests:** `test_storage_namespace_collision.py` (new, 18). Full suite: **538 passed** (520 on `main` + 18). Real OS processes
+(six writers across three venues × two streams, all allocating sequence before
+any writes, then released together), real runner classes, real replay. Each
+new test group was mutation-checked: removing the lock fails the five lock
+tests; restoring the original OKX runner fails the wiring and attribution
+tests.
+
+**Not claimed:** see "Known limits" in `docs/STORAGE_NAMESPACES.md` —
+notably that compaction still covers only the five Binance canonical streams,
+that the lock is single-host/local-filesystem, and that legacy OKX rows are
+left in place (filtered by venue on read, not migrated).
 
 ### Phases 10+ — market state, features, events — **NOT STARTED**
 
