@@ -2,6 +2,20 @@ import pyarrow as pa
 
 # Constants
 SYMBOL = "BTCUSDT"
+
+#: Bybit v5 public linear endpoint. Verified 2026-09-19 against
+#: https://bybit-exchange.github.io/docs/v5/ws/connect (USDT/USDC perpetual
+#: & USDT Futures -> wss://stream.bybit.com/v5/public/linear).
+BYBIT_PUBLIC_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+
+#: Orderbook depth level to subscribe at. Valid linear depths, per
+#: https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook,
+#: are 1, 50, 200, 1000 (push frequency 10/20/100/200ms respectively).
+#: 50 is chosen as an operational default -- deep enough for multi-level
+#: imbalance features, far short of the 1000-level, 200ms-cadence table.
+#: This is a configuration choice, not a protocol fact: any of the four
+#: values is valid.
+BYBIT_ORDERBOOK_DEPTH = 50
 BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth@100ms"
 BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@forceOrder"
 # Intervals and Thresholds
@@ -86,6 +100,88 @@ LIQUIDATION_SCHEMA = pa.schema([
     ("order_status", pa.string()),
     ("time_in_force", pa.string()),
 ], metadata={"schema_version": "1.0", "stream_name": "liquidation", "symbol": SYMBOL})
+
+# Bybit canonical schemas (Phase 8).
+#
+# Deliberately not the Binance-shaped ORDERBOOK_SCHEMA/TRADES_SCHEMA/etc.
+# above, for two reasons:
+#
+# 1. Those schemas have no exchange column. Bybit rows would be silently
+#    indistinguishable from Binance rows in the same table -- exactly what
+#    "do not force incompatible exchange systems into one" forbids.
+# 2. No derived microstructure features (obi, spread, micro_price, ...) are
+#    computed here. `feature_computer.compute_orderbook_features` reads raw
+#    Binance-message keys directly (`msg.get("E", ...)` for exchange
+#    timestamp, no persistent-book state, only the levels present in one
+#    message) -- reusing it on Bybit's differently-shaped raw payload would
+#    silently produce wrong or locally-substituted values rather than fail.
+#    Feature computation belongs in its own verified, causal, cross-venue
+#    phase, not bolted onto ingestion wiring for one exchange.
+#
+# Own stream names, not shared ones: `ParquetWriter._seq` is a per-instance
+# in-memory counter with no cross-process coordination. Two independently
+# constructed writers appending to the same stream name from two OS
+# processes (a real deployment shape here: Binance, Bybit and OKX are
+# separate runner processes) can race for the same segment sequence number.
+# The existing `FileExistsError` guard on publish means this fails loud
+# rather than corrupting data, but it is still an avoidable operational
+# fault -- PR #13's OKX capture reused "raw_wire"/"quality_events" with
+# Binance's own stream names, which carries exactly this risk if both are
+# ever run at once. Not fixed here (out of scope for Bybit's own wiring),
+# but not repeated: every Bybit stream below is named uniquely.
+BYBIT_ORDERBOOK_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("bids_price", pa.list_(pa.float64())),
+    ("bids_qty", pa.list_(pa.float64())),
+    ("asks_price", pa.list_(pa.float64())),
+    ("asks_qty", pa.list_(pa.float64())),
+    ("update_id", pa.int64()),
+    ("sequence", pa.int64()),
+    ("is_snapshot", pa.bool_()),
+], metadata={"schema_version": "1.0", "stream_name": "bybit_orderbook", "symbol": SYMBOL})
+
+BYBIT_TRADES_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("trade_id", pa.string()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+    ("side", pa.string()),
+    ("venue_sequence", pa.int64()),
+    ("block_trade", pa.bool_()),
+    ("rpi", pa.bool_()),
+], metadata={"schema_version": "1.0", "stream_name": "bybit_trades", "symbol": SYMBOL})
+
+BYBIT_MARKPRICE_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("mark_price", pa.float64()),
+    ("index_price", pa.float64()),
+    ("funding_rate", pa.float64()),
+    ("next_funding_time", pa.int64()),
+    ("carried_forward", pa.list_(pa.string())),
+], metadata={"schema_version": "1.0", "stream_name": "bybit_markprice", "symbol": SYMBOL})
+
+BYBIT_OPENINTEREST_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("open_interest", pa.float64()),
+    ("carried_forward", pa.list_(pa.string())),
+], metadata={"schema_version": "1.0", "stream_name": "bybit_openinterest", "symbol": SYMBOL})
+
+BYBIT_LIQUIDATION_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("side", pa.string()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+], metadata={"schema_version": "1.0", "stream_name": "bybit_liquidation", "symbol": SYMBOL})
 
 BINANCE_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),  # Canonical local processing timestamp.
