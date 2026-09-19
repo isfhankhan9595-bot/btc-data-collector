@@ -939,6 +939,39 @@ implements.
 
 
 
-See `docs/DATA_SUFFICIENCY.md` for which events are feasible on Binance-only
-data today (roughly two-thirds) and which are blocked on data that has never
-been collected (cross-exchange, spot/perp basis).
+See `docs/DATA_SUFFICIENCY.md` for which events have their data collection
+implemented, which are blocked on data that has never been collected (spot/perp
+basis), and which cross-exchange rows are blocked on live verification, a
+causal alignment layer and the OI unit contract.
+
+### Documentation truth pass and live-verification status — **COMPLETE (docs only; no code changed)**
+
+Verified against `main` @ `e2c3c8a`: PRs #19-#23 merged and reachable; PR #24
+(`docs/CARRY_FORWARD_AUDIT.md`) was still open and is untouched by this pass.
+**591 tests pass** when run as CI runs them (`working-directory: collector`,
+`PYTHONPATH` = repo root + `collector/`).
+
+**Fixed:** `docs/REPLAY.md` (said Binance-only and no non-book replay; both
+false since PRs #18/#23; also carried a D14 "unverified assumption" note that
+was closed in Phase 6) and `docs/DATA_SUFFICIENCY.md` (said Bybit had no live
+client and OKX was 1/7 channels; it also asserted Binance "data flowing: yes"
+with no in-repo evidence). Both now separate IMPLEMENTED / TESTED /
+REPLAY-VERIFIED / LIVE-VERIFIED and do not convert one into another.
+
+**Live verification: LIVE-UNVERIFIED — ENVIRONMENT BLOCKED, all three venues.**
+Measured from the execution container: `api.bybit.com`, `stream.bybit.com`,
+`www.okx.com`, `fapi.binance.com`, `fstream.binance.com` return
+`403 x-deny-reason: host_not_allowed`; `ws.okx.com:8443` gives no response. No
+capture was attempted or faked. Nothing here can show that any venue accepts
+the subscriptions, populates timestamp/sequence fields as documented, or that
+reconnect behaves as it does against fake sockets.
+
+**Findings recorded (not fixed here):**
+
+| # | Finding | Impact |
+|---|---|---|
+| G1 | **`OIUnit` and `assert_comparable_oi()` do not exist** anywhere in code or docs, contrary to an earlier handoff that described them as existing safeguards. `CanonicalOIEvent.open_interest` is one untyped float; `canonical.py` calls the canonical unit "contracts" while describing Bybit's value as base-currency. Binance's OI unit is undocumented in the repo. | Cross-venue OI comparison would silently compare different quantities. **Blocks any cross-exchange OI work.** |
+| G2 | Binance OI is recorded as a `raw_rest` row (`purpose="open_interest"`) and is not routed through `BinanceAdapter.normalize()`; replay consumes only `orderbook_snapshot` REST rows. | Binance OI has no shared live/replay path and is absent from `non_book_events`. |
+| G3 | OKX `books` is parsed by the adapter but not collected by `run_okx_collector`; OKX book replay has no committed test; adapter emits `float` levels into a `Decimal`-typed event. | OKX book replay is unverified; no live OKX book data. |
+| G4 | `tests/test_okx_collector_storage.py` uses a bare `from run_okx_collector import ...`, so `pytest collector` from the repo root fails at collection; CI is unaffected. | Test-invocation fragility only. |
+| G5 | `pipeline/cross_exchange_alignment.py` has no test file. | Cannot be relied on for causal alignment until audited and tested. |
