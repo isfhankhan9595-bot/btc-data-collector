@@ -169,6 +169,70 @@ def test_capture_raw_frame_is_a_noop_without_capture_configured():
     app._capture_raw_frame("{}", local_receive_ts=1)  # must not raise
 
 
+def test_production_capture_raw_frame_survives_every_on_raw_frame_call_shape():
+    """Regression: a keyword ``WebSocketClient._consume`` can add must not
+    break the real, restricted-signature production callback.
+
+    ``_capture_raw_frame``'s signature is deliberately narrow (no
+    ``**kwargs``): it is production code, not a test double, and a narrow
+    signature is what lets a reviewer see exactly which fields it consumes.
+    That narrowness is also the hazard -- when the OKX capture work
+    (`control_frames`/keepalive) needed ``_consume`` to tell every
+    ``on_raw_frame`` callback whether a frame was a protocol control frame,
+    it added ``control_frame=`` to *every* call, including Binance's. The
+    only existing integration-level test for this path used
+    ``def on_raw(frame, **kw): ...`` -- strictly more permissive than the
+    real method -- so it kept passing while the real callback silently
+    raised ``TypeError`` on every single frame, inside the client's
+    fail-open ``try/except``. Net effect: raw-wire capture for the live
+    Binance path would have gone completely dark, with no exception, no log
+    reaching an operator's attention beyond a per-frame warning, and no
+    quality event -- exactly the "silent parser failure" this project's
+    rules forbid.
+
+    This drives the *actual* ``WebSocketClient._consume`` coroutine, not a
+    hand-rolled substitute, so it fails again if any future change to the
+    calling contract is not mirrored in ``_capture_raw_frame``.
+    """
+    app = _app()
+    captured = []
+    app.raw_capture = MagicMock()
+    app.raw_capture.capture_wire.side_effect = lambda record: captured.append(record)
+
+    class _FakeSocket:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def __aiter__(self):
+            async def gen():
+                for frame in self.frames:
+                    yield frame
+            return gen()
+
+    async def on_message(data, ts, connection_id=None):
+        pass
+
+    client = WebSocketClient(
+        url="wss://fstream.binance.com/public/stream",
+        on_message=on_message,
+        on_raw_frame=app._capture_raw_frame,
+    )
+    client.running = True  # _consume gates its loop on this; start() sets it,
+                           # but this test drives _consume directly.
+
+    asyncio.run(client._consume(_FakeSocket([
+        '{"stream":"btcusdt@depth","data":{"u":1}}',
+        "{not valid json",
+    ])))
+
+    assert len(captured) == 2, (
+        "every inbound frame must reach durable raw capture; "
+        f"only {len(captured)} did"
+    )
+    assert captured[0].decode_ok is True
+    assert captured[1].decode_ok is False
+
+
 def test_adapter_unhandled_becomes_a_durable_quality_event():
     app = _app()
     from collector.collector.adapters.okx import OKXAdapter

@@ -158,11 +158,22 @@ class CollectorApp:
 
     def _capture_raw_frame(self, frame, *, local_receive_ts, connection_id=None,
                            connection_generation=None, decode_ok=True,
-                           decode_error=None, parsed=None):
+                           decode_error=None, parsed=None, control_frame=False):
         """Persist the exact frame before any lossy transformation.
 
         Venue-native identifiers are copied verbatim when the frame decoded;
         they are never derived, and absence stays null.
+
+        ``control_frame`` exists because ``WebSocketClient`` now calls every
+        ``on_raw_frame`` callback with it (added for OKX's non-JSON ``pong``
+        heartbeat). Binance has no control frames, so this always arrives
+        ``False`` here and nothing below reads it -- but the parameter must
+        exist. Regression: without it, every call raised ``TypeError``
+        inside the client's fail-open ``try/except``, so it never propagated
+        as an error -- it just meant zero frames were captured, silently,
+        for the life of the process. No test caught this because the only
+        integration-level raw-frame test used a ``**kwargs`` double, which is
+        strictly more permissive than this method's real signature.
         """
         capture = getattr(self, "raw_capture", None)
         if capture is None:
