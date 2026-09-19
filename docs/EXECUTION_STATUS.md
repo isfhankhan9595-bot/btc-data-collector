@@ -1027,3 +1027,36 @@ pytest collector          # from repo root, explicit
 cd collector && PYTHONPATH=<repo>:<repo>/collector pytest tests   # CI's own invocation
 ```
 All three: **608 passed, 0 failed.**
+
+### G2 — Binance OI replayability — CLOSED
+
+`compute_openinterest_features()` used wall-clock time for both of its
+timestamp fields, discarding the real request/response lineage raw capture
+already had. `ReplaySource.from_records` excluded every `purpose ==
+"open_interest"` REST row before it became a `ReplayFrame` -- live OI and
+replayed OI were not the same pipeline, and replay could not reproduce OI
+at all.
+
+Fixed with a single shared normalizer, `binance_oi.normalize_binance_oi()`,
+called by both `run_collector._poll_openinterest` (live) and the new
+`ReplayEngine._handle_rest_oi` (replay) via a new `FrameKind.REST_OI`. Event
+availability is the REST **response's** receive timestamp, never the
+exchange's own `time` field and never wall-clock-at-write. The legacy
+parser is confirmed removed from the live path by a structural test, not
+merely superseded.
+
+Unit remains `OIUnit.UNKNOWN` per the project's OI contract -- not verified
+against current official documentation, not guessed.
+
+Tests: `tests/test_binance_oi_replayability.py` (29). One existing test
+(`test_non_snapshot_rest_purposes_do_not_drive_the_book`) asserted the old
+"OI produces zero frames" contract; corrected to assert the real one --
+OI produces a frame but never touches the book.
+
+Mutation check performed: reverting the `from_records` purpose dispatch to
+its old form (never recognising `"open_interest"`) fails 9 of the 29 new
+tests, confirming they actually exercise the fix rather than passing
+vacuously.
+
+Suite: 637 passed, 0 failed, both `pytest` and `pytest collector` (G4
+contract) invocations agree.

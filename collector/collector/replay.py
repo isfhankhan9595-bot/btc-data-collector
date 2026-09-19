@@ -1,5 +1,12 @@
 """Deterministic replay over recorded raw wire data.
 
+Drives Binance, Bybit, and OKX through their own adapters (venue selected
+at construction). Order-book events go through LocalBook; every other
+canonical event an adapter produces -- trades, funding, liquidations, and
+(for Binance) REST-polled open interest via binance_oi.py -- is preserved
+in `ReplayResult.non_book_events` rather than being silently dropped or
+re-shaped into a book-like record.
+
 What was here before
 --------------------
 
@@ -60,6 +67,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .adapters.binance import BinanceAdapter
+from .binance_oi import BinanceOIParseError, normalize_binance_oi
 from .adapters.bybit import BybitAdapter
 from .adapters.okx import OKXAdapter
 from .book_engine import LocalBook
@@ -82,12 +90,17 @@ __all__ = [
 class FrameKind:
     WIRE = "wire"
     REST_SNAPSHOT = "rest_snapshot"
+    #: A REST open-interest observation (currently Binance only -- see
+    #: binance_oi.py). Kept distinct from REST_SNAPSHOT because it drives
+    #: no order-book state and never bridges anything; it is a plain
+    #: point-in-time reading routed straight into non_book_events.
+    REST_OI = "rest_oi"
 
 
 #: Tie-break rank. A snapshot that landed in the same millisecond as a diff is
 #: ordered after it, matching live, where the diff was already in the socket
 #: buffer when the HTTP response completed.
-_KIND_RANK = {FrameKind.WIRE: 0, FrameKind.REST_SNAPSHOT: 1}
+_KIND_RANK = {FrameKind.WIRE: 0, FrameKind.REST_SNAPSHOT: 1, FrameKind.REST_OI: 1}
 
 
 @dataclass(frozen=True)
@@ -149,6 +162,8 @@ class ReplayResult:
     frames_unhandled: int = 0
     snapshots_applied: int = 0
     snapshots_rejected: int = 0
+    oi_observations: int = 0
+    oi_rejected: int = 0
     final_state: str = BookQuality.VALID.value
 
     @property
@@ -191,6 +206,8 @@ class ReplayResult:
             "quality_events": len(self.quality_events),
             "snapshots_applied": self.snapshots_applied,
             "snapshots_rejected": self.snapshots_rejected,
+            "oi_observations": self.oi_observations,
+            "oi_rejected": self.oi_rejected,
             "final_state": self.final_state,
             "digest": self.digest,
         }
@@ -238,17 +255,27 @@ class ReplaySource:
             ))
             index += 1
         for row in rest_rows:
-            # Only snapshot responses drive the book. Other REST purposes are
-            # recorded lineage but are not inputs to reconstruction.
-            if row.get("purpose") != "orderbook_snapshot":
-                continue
+            purpose = row.get("purpose")
             landed = row.get("response_receive_ts")
             if landed is None:
-                # A request that never returned never bridged anything live,
-                # so it must not bridge anything in replay either.
+                # A request that never returned was never available live,
+                # so it cannot become available in replay either.
+                continue
+            if purpose == "orderbook_snapshot":
+                kind = FrameKind.REST_SNAPSHOT
+            elif purpose == "open_interest":
+                # G2: previously excluded entirely -- every recorded OI
+                # observation vanished before becoming a ReplayFrame, so
+                # replay could not reproduce OI at all.
+                kind = FrameKind.REST_OI
+            else:
+                # Recorded lineage for a purpose replay does not yet drive
+                # (e.g. a future REST stream). Kept out of the frame stream
+                # deliberately, not silently: nothing currently claims to
+                # replay it, so nothing should quietly start doing so.
                 continue
             frames.append(ReplayFrame(
-                timestamp_ms=_as_ms(landed), kind=FrameKind.REST_SNAPSHOT,
+                timestamp_ms=_as_ms(landed), kind=kind,
                 source_index=index, payload=row.get("payload") or "",
                 http_ok=bool(row.get("ok", False)), endpoint=row.get("endpoint"),
             ))
@@ -495,6 +522,44 @@ class ReplayEngine:
             if applied is not None:
                 self._record_book(applied, "NORMAL_INCREMENTAL", self.book.recovery_generation)
 
+    def _handle_rest_oi(self, frame: ReplayFrame) -> None:
+        """Route a recorded Binance OI response through the shared normalizer.
+
+        This is the replay half of G2: the exact same function
+        (`normalize_binance_oi`) that live's poll loop calls. A failed
+        request (``http_ok=False``) produced no observation live, so it
+        produces none here either.
+        """
+        if self.venue != "BINANCE":
+            self.result.oi_rejected += 1
+            self.result.quality_events.append({
+                "event_type": QualityEventType.DATA_DROP.value,
+                "reason": f"replay_oi_frame_for_unsupported_venue:{self.venue}",
+                "quality_state": self.book.state.state.value,
+            })
+            return
+        if not frame.http_ok:
+            self.result.oi_rejected += 1
+            self.result.quality_events.append({
+                "event_type": QualityEventType.ERROR.value,
+                "reason": "replay_oi_request_failed",
+                "quality_state": self.book.state.state.value,
+            })
+            return
+        try:
+            event = normalize_binance_oi(
+                frame.payload, response_receive_ts=frame.timestamp_ms)
+        except BinanceOIParseError as exc:
+            self.result.oi_rejected += 1
+            self.result.quality_events.append({
+                "event_type": QualityEventType.ERROR.value,
+                "reason": f"replay_oi_malformed:{exc}",
+                "quality_state": self.book.state.state.value,
+            })
+            return
+        self.result.oi_observations += 1
+        self.result.non_book_events.append(event)
+
     def _handle_snapshot(self, frame: ReplayFrame) -> None:
         self.result.frames_snapshot += 1
         if self.venue != "BINANCE":
@@ -577,6 +642,8 @@ class ReplayEngine:
                 self._handle_wire(frame)
             elif frame.kind == FrameKind.REST_SNAPSHOT:
                 self._handle_snapshot(frame)
+            elif frame.kind == FrameKind.REST_OI:
+                self._handle_rest_oi(frame)
             else:
                 self.result.quality_events.append({
                     "event_type": QualityEventType.DATA_DROP.value,

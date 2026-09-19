@@ -26,6 +26,7 @@ from collector.collector.adapters.binance import BinanceAdapter
 from collector.collector.raw_capture import RawCapture, RawRestRecord, RawWireRecord
 from collector.collector.backoff import ExponentialBackoff, rate_limit_penalty
 from collector.collector.recovery_control import RecoveryController
+from collector.collector.binance_oi import normalize_binance_oi, BinanceOIParseError
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent
 from collector.collector.quality_events import BookQuality, QualityEvent, QualityEventType
@@ -746,23 +747,42 @@ class CollectorApp:
                         data = json.loads(body)
                 # REST polling time is not exchange observation time; both are
                 # preserved separately so research can tell them apart.
+                process_ts = int(time.time() * 1000)
                 self._capture_rest(RawRestRecord(
                     request_ts=request_ts, response_receive_ts=receive_ts,
                     endpoint=OI_URL, purpose="open_interest",
                     request_params={"symbol": SYMBOL}, http_status=status,
                     ok=True, payload=body, symbol=SYMBOL,
-                    local_process_ts=int(time.time() * 1000)))
+                    local_process_ts=process_ts))
                 self.stream_counters["openinterest"]["received"] += 1
-                features = compute_openinterest_features(data)
-                if features:
+                # G2: the same normalizer replay uses. local_receive_ts is the
+                # RESPONSE's receive time, not wall-clock-at-write and not the
+                # exchange's own `time` field -- a slow response must not
+                # claim availability earlier than it actually arrived.
+                try:
+                    event = normalize_binance_oi(
+                        body, response_receive_ts=receive_ts,
+                        local_process_ts=process_ts, symbol=SYMBOL)
+                except BinanceOIParseError as exc:
+                    self.stream_counters["openinterest"]["empty_features"] += 1
+                    self._persist_quality_event({
+                        "stream": "openinterest", "event_type": QualityEventType.ERROR,
+                        "reason": f"oi_malformed_response:{exc}",
+                        "local_ts": process_ts})
+                else:
+                    features = {
+                        "timestamp": event.local_receive_ts,
+                        "exchange_timestamp": event.exchange_event_ts,
+                        "local_timestamp": event.local_receive_ts,
+                        "open_interest": event.open_interest,
+                    }
                     self.stream_counters["openinterest"]["computed"] += 1
                     self.stream_counters["openinterest"]["validated"] += 1
                     self.oi_writer.write(features)
                     self.stream_counters["openinterest"]["written"] += 1
-                    self.gap_detector.check_gap("openinterest", features["exchange_timestamp"])
-                    self.health_monitor.record_message("openinterest", features["timestamp"])
-                else:
-                    self.stream_counters["openinterest"]["empty_features"] += 1
+                    if event.exchange_event_ts is not None:
+                        self.gap_detector.check_gap("openinterest", event.exchange_event_ts)
+                    self.health_monitor.record_message("openinterest", event.local_receive_ts)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
