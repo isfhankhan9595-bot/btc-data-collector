@@ -60,6 +60,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .adapters.binance import BinanceAdapter
+from .adapters.bybit import BybitAdapter
 from .book_engine import LocalBook
 from .canonical import CanonicalOrderBookEvent
 from .quality_events import BookQuality, QualityEventType
@@ -234,9 +235,20 @@ class ReplaySource:
 
     @classmethod
     def from_directory(
-        cls, data_dir: str, date: str | None = None
+        cls, data_dir: str, date: str | None = None, *,
+        wire_stream: str = "raw_wire", rest_stream: str | None = "raw_rest",
     ) -> "ReplaySource":
-        """Read recorded ``raw_wire`` and ``raw_rest`` segments."""
+        """Read recorded raw-wire (and optionally raw-rest) segments.
+
+        Defaults match Binance's own unprefixed stream names, so every
+        existing call site is unaffected. Bybit's live collector writes to
+        ``bybit_raw_wire`` and has no REST-recovery stream at all (Bybit's
+        snapshot arrives over the WS stream itself, not a REST bridge) --
+        call as ``from_directory(data_dir, wire_stream="bybit_raw_wire",
+        rest_stream=None)`` for it. ``rest_stream=None`` skips reading a
+        REST stream entirely rather than reading a Binance-named one that
+        does not exist for the venue being replayed.
+        """
         import pandas as pd
 
         def read(stream: str) -> list[dict]:
@@ -252,7 +264,7 @@ class ReplaySource:
                 rows.extend(frame.to_dict("records"))
             return rows
 
-        return cls.from_records(read("raw_wire"), read("raw_rest"))
+        return cls.from_records(read(wire_stream), read(rest_stream) if rest_stream else [])
 
 
 def _as_ms(value: Any) -> int:
@@ -276,9 +288,21 @@ def _as_ms(value: Any) -> int:
 class ReplayEngine:
     """Drive recorded frames through the production reconstruction path."""
 
+    #: Every venue this engine can replay, mapped to the adapter that
+    #: understands its wire format. Adding a venue means adding it here --
+    #: there is no silent fallback to Binance for an unrecognised one.
+    _ADAPTERS = {"BINANCE": BinanceAdapter, "BYBIT": BybitAdapter}
+
     def __init__(self, venue: str = "BINANCE", max_buffer_events: int = 10_000) -> None:
+        if venue not in self._ADAPTERS:
+            raise ValueError(
+                f"ReplayEngine has no adapter for venue {venue!r}; "
+                f"supported venues are {sorted(self._ADAPTERS)}. Silently "
+                f"defaulting to Binance's adapter here previously meant a "
+                f"Bybit-shaped raw frame was parsed as if it were Binance's, "
+                f"producing nothing usable with no error.")
         self.venue = venue
-        self.adapter = BinanceAdapter()
+        self.adapter = self._ADAPTERS[venue]()
         self.book = LocalBook(venue, max_buffer_events=max_buffer_events)
         self.result = ReplayResult()
         self.adapter.set_unhandled_sink(self._on_unhandled)
@@ -359,8 +383,20 @@ class ReplayEngine:
             before = self.book.state.state
             applied = self.book.apply(event)
             after = self.book.state.state
-            if after is BookQuality.SEQUENCE_GAP and before is not after:
-                self._record_transition(self.book.last_reason, QualityEventType.SEQUENCE_GAP.value)
+            if before is not after and after is not BookQuality.VALID:
+                # Any real transition away from VALID must be recorded, not
+                # only ones landing on SEQUENCE_GAP specifically.
+                # BybitSequenceComparator's is_resync_signal (a decrease or
+                # reset -- see sequence.py) drives the book straight to
+                # RECOVERING via LocalBook.apply()'s is_resync_signal branch,
+                # never through SEQUENCE_GAP at all. Binance's comparator
+                # never sets is_resync_signal, so this path was previously
+                # untested and the narrower check silently dropped every
+                # such transition from the replay quality record.
+                event_type = (QualityEventType.SEQUENCE_GAP.value
+                             if after is BookQuality.SEQUENCE_GAP
+                             else QualityEventType.RECOVERY.value)
+                self._record_transition(self.book.last_reason, event_type)
             if applied is None and after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING):
                 # Parity with live: the runner retries a retained snapshot
                 # here, so replay must too or the same recorded bytes produce
@@ -376,7 +412,7 @@ class ReplayEngine:
             if self.book.duplicate_count:
                 self.result.quality_events.append({
                     "event_type": QualityEventType.DUPLICATE.value,
-                    "reason": "binance_duplicate_update",
+                    "reason": f"{self.venue.lower()}_duplicate_update",
                     "quality_state": after.value,
                 })
                 self.book.duplicate_count = 0
@@ -386,6 +422,23 @@ class ReplayEngine:
 
     def _handle_snapshot(self, frame: ReplayFrame) -> None:
         self.result.frames_snapshot += 1
+        if self.venue != "BINANCE":
+            # Only USD-M's model has a separate REST snapshot bridged against
+            # a buffered diff chain (LocalBook.binance_snapshot). Bybit's
+            # snapshot arrives as a type:"snapshot" message over the same WS
+            # stream and is handled entirely inside _handle_wire via
+            # LocalBook.apply()'s generic is_snapshot branch. A REST_SNAPSHOT
+            # frame appearing in a non-Binance replay source means something
+            # upstream mislabelled a frame's kind -- calling a Binance-named
+            # bridging method on another venue's book would silently run the
+            # wrong protocol rather than fail, so this fails loud instead.
+            self.result.snapshots_rejected += 1
+            self.result.quality_events.append({
+                "event_type": QualityEventType.ERROR.value,
+                "reason": f"rest_snapshot_frame_not_supported_for_venue:{self.venue}",
+                "quality_state": self.book.state.state.value,
+            })
+            return
         if not frame.http_ok:
             # A failed snapshot bridged nothing live. Record the attempt.
             self.result.snapshots_rejected += 1
