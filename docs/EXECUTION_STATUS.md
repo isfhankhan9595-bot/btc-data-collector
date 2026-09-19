@@ -418,7 +418,7 @@ COMPLETE":
 | Parser + canonical mapping implementation | **COMPLETE** — `collector/collector/adapters/okx.py`, all 8 declared channel names (`books` unchanged + 7 D11 names); `OKXAdapter.declared_channels() == OKXAdapter.implemented_channels()` is itself asserted by test |
 | Storage wiring | **COMPLETE** for the 7 D11 streams (`okx_trades`, `okx_trades_all`, `okx_markprice`, `okx_indextickers`, `okx_fundingrate`, `okx_openinterest`, `okx_liquidation`) via new `run_okx_collector.py`. **NOT included:** `okx_orderbook` — a live OKX order-book collector needs the same `LocalBook`/quality-state-machine wiring Binance/Bybit have and was out of D11's scope; `books` already has its own raw-only capture path (`run_okx_capture.py`) unchanged by this PR. |
 | Fixture tests | **COMPLETE** — `tests/test_okx_d11_channels.py` (happy path per channel from documented/captured examples, malformed/missing-field handling, empty-string vs missing-field distinction, repeated-seqId non-gap, channel purity, determinism) and `tests/test_okx_collector_storage.py` (namespace isolation, per-channel stream routing). Existing tests asserting the old `CHANNEL_NOT_IMPLEMENTED` behaviour updated to assert the new implemented behaviour (`tests/test_okx_capture.py`, `tests/test_raw_capture.py`, `tests/test_no_silent_discard.py`) rather than left contradicting the code. |
-| Replay | **NOT COMPLETE.** `ReplayEngine`/`replay_directory` (`collector/collector/replay.py`) only replay `CanonicalOrderBookEvent` — `_handle_wire` explicitly `continue`s past every other canonical event type, for every venue, not just OKX. This predates this PR and is not a D11-specific gap. Extending `ReplayEngine` to non-orderbook streams is a cross-venue architectural change (would also apply to Binance's/Bybit's existing trades/markprice/OI/liquidation events, which are equally not replayed today) and was deliberately not bundled into this PR, so a schema/parser defect and a replay-engine defect are never in the same diff. What **is** proven: `test_parse_is_deterministic_same_frame_same_result` shows `OKXAdapter.normalize()` is a pure function of its input (no adapter-instance state affects re-parsing the same frame) — the property that makes "raw frame → same parser → same canonical result" true once a replay driver for these streams exists. |
+| Replay | **COMPLETE** as of this session — see "Non-orderbook replay (this session)" below. Was NOT COMPLETE when PR #22 merged: `_handle_wire` `continue`d past every canonical event type except `CanonicalOrderBookEvent`, for every venue, not just OKX; that cross-venue gap is now closed. |
 | Live verification | **PENDING** (environment blocker, below) — unchanged from Phase 7. |
 
 Five open questions from `docs/OKX_D11_CHANNEL_SCHEMAS.md` remain open;
@@ -846,7 +846,98 @@ notably that compaction still covers only the five Binance canonical streams,
 that the lock is single-host/local-filesystem, and that legacy OKX rows are
 left in place (filtered by venue on read, not migrated).
 
-### Phases 10+ — market state, features, events — **NOT STARTED**
+### Non-orderbook replay, OKX registered in `ReplayEngine` — **COMPLETE, VERIFIED**
+
+Closes the gap PR #22 explicitly declined to bundle in ("Replay | NOT
+COMPLETE" above) — deliberately, since that PR was right not to mix a
+parser defect and a replay-engine defect in one diff. Two defects fixed:
+
+**`ReplayEngine` had no `"OKX"` entry in its venue→adapter map.**
+`_ADAPTER_CLASSES` (added in the Phase 8 addendum fix above) only had
+`BINANCE`/`BYBIT`; `ReplayEngine(venue="OKX")` raised `ValueError`. Now
+`OKXAdapter` is registered the same way.
+
+**`_handle_wire` silently dropped every non-order-book canonical event, for
+every venue.** The loop was `if not isinstance(event, CanonicalOrderBookEvent):
+continue` — trades, mark/index/funding, open interest, and liquidations
+were parsed by the adapter and then discarded before the caller ever saw
+them, for Binance and Bybit too, not only OKX. Fixed by routing every such
+event into a new `ReplayResult.non_book_events: list[Any]`, storing the
+actual frozen canonical-event dataclass instances `adapter.normalize()`
+yielded — no replay-only reshaping, no dict conversion, and (per the task's
+explicit instruction) no routing through `LocalBook`, which is order-book
+reconstruction only and was never meant to hold a trade or a funding rate.
+`ReplayResult.digest` now folds these in (`dataclasses.asdict` +
+`json.dumps(sort_keys=True, default=str)`, tagged with the event's class
+name so two different event types can never hash identically by
+coincidence), so a changed trade price, a disappeared trade, a changed OI
+reading, funding rate, or liquidation quantity all change the digest —
+proven by direct test, not asserted from reading the code.
+
+**What this does not touch, and did not need to:** order-book replay logic,
+`LocalBook`, the quality-transition parity fix above, `ReplaySource`'s
+venue-row filtering (PR #19) or its frame ordering (`(timestamp, kind_rank,
+source_index)`, unchanged) — non-book events are appended in the same
+single pass over the same already-ordered frame sequence, so they inherit
+that same causal ordering and the same "no lookahead" guarantee without any
+new code needing to reason about it. Bybit's ticker carried-forward
+provenance (`CanonicalMarkPriceEvent.carried_forward`/`field_age_ms`) is
+also unaffected in the sense that matters: replay drives the *same*
+`BybitAdapter` instance, method by method, in the same order live would —
+one `self.adapter = adapter_cls()` per `ReplayEngine`, never reconstructed
+per frame — so carried-forward state accumulates identically to live by
+construction, not by any special-casing in replay itself. Verified by a
+dedicated test (`test_bybit_ticker_carried_forward_provenance_survives_replay_unaltered`)
+rather than left as an inference from the architecture.
+
+**Not claimed:**
+- OKX's D11 semantic open questions (trades vs trades-all aggregation,
+  `seqId` presence, index-tickers instId convention, OI's canonical unit,
+  liquidation `ccy` semantics) are unchanged by this work and remain exactly
+  as open as PR #22 left them. Nothing here resolves them, tests them as
+  resolved, or reads them as more certain than PR #22 documented.
+- Live OKX verification is not claimed. `ws.okx.com` was not reached in
+  this environment; this is a parser/replay-correctness pass over
+  documented/fixture frames, per the existing Phase 7 environment blocker.
+- OKX order-book replay through `LocalBook`/quality-state-machine remains
+  out of scope, as PR #22 also noted — `okx_orderbook` has no live
+  collector yet (`books` is raw-capture-only per Phase 7), so there is
+  nothing to replay through the book path for OKX specifically. Registering
+  `OKXAdapter` in `_ADAPTER_CLASSES` makes `ReplayEngine("OKX")` work
+  correctly for every OKX canonical event type that exists today (all
+  non-book); it does not manufacture book replay support that has no
+  upstream live collector to replay.
+
+**Tests (new, 18):** `tests/test_replay_non_book_events.py` — OKX
+registration; Binance trade/mark-price/liquidation survive replay
+individually and alongside a real order-book session (the exact scenario
+the old isinstance filter broke); Bybit trade/liquidation survive replay,
+a single ticker frame correctly producing *both* a `CanonicalMarkPriceEvent`
+and a `CanonicalOIEvent` where live would, and the carried-forward
+provenance test above; OKX `trades`/`trades-all` kept distinct despite
+sharing a canonical class, `mark-price`/`index-tickers` kept on separate
+fields, `funding-rate`'s three-way current/next/settled distinction,
+open-interest's three preserved units, `liquidation-orders`' explicit
+no-instrument-filtering and empty-string-vs-missing `ccy` distinction; four
+digest-sensitivity tests (trade price change, trade disappearance, OKX
+funding/OI/liquidation edits); replay determinism across two runs; digest
+order-independence for input-list order (not timestamp order, which still
+governs); and a malformed-funding-rate test confirming a missing required
+field still produces `frames_unhandled`, never a fabricated event. Plus one
+existing test in `tests/test_storage_namespace_collision.py` updated: it
+previously asserted `ReplayEngine(venue="OKX")` raised `ValueError` (correct
+at the time it was written, under PR #19); now asserts OKX replay actually
+produces the expected `CanonicalMarkPriceEvent`s from its fixture's
+funding-rate frames (the fixture's data dicts were missing the required
+`"ts"` field, which the old test never exercised because it expected
+construction to fail before parsing ran).
+
+Full suite: **591 passed** (573 on `main` at the time this started + 18
+new). No existing test's assertions were weakened, only the one described
+above, which was asserting the absence of a feature this session
+implements.
+
+
 
 See `docs/DATA_SUFFICIENCY.md` for which events are feasible on Binance-only
 data today (roughly two-thirds) and which are blocked on data that has never
