@@ -101,7 +101,7 @@ def test_binance_mark_price_and_liquidation_survive_replay():
 def test_binance_book_and_trade_in_the_same_replay_both_survive():
     """A regression against the isinstance-filter bug specifically: a
     session with both event kinds must not lose one to the other."""
-    from tests.test_replay import _depth_frame  # existing Binance book fixture builder
+    from collector.tests.test_replay import _depth_frame  # existing Binance book fixture builder
     frames = [
         _depth_frame(BASE_TS, U=100, u=105, pu=None, index=0),
         _binance_trade(BASE_TS + 5, "65000.0", index=1),
