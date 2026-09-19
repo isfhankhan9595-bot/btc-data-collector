@@ -63,10 +63,17 @@ class ParquetWriter:
         self, stream_name: str, schema: pa.Schema, base_dir: str = "data", *,
         segment_rows: int = 5_000, segment_seconds: float = 30.0,
         quality_event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        exchange: str = "BINANCE",
     ) -> None:
         if segment_rows <= 0 or segment_seconds <= 0:
             raise ValueError("segment_rows and segment_seconds must be positive")
         self.stream_name, self.schema, self.base_dir = stream_name, schema, base_dir
+        #: Attributed on every quality event this writer emits about itself
+        #: (crashed segments, data drops). Defaults to BINANCE because every
+        #: writer in this codebase was one until Bybit's; a writer created
+        #: for another venue must say so, or its own storage failures are
+        #: durably misattributed to a venue that did not cause them.
+        self.exchange = exchange
         self.stream_dir = Path(base_dir) / "raw" / stream_name
         self.stream_dir.mkdir(parents=True, exist_ok=True)
         self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
@@ -90,7 +97,7 @@ class ParquetWriter:
 
     def _emit_quality(self, event_type: str, reason: str) -> None:
         event = {
-            "exchange": "BINANCE",
+            "exchange": self.exchange,
             "stream": self.stream_name,
             "event_type": event_type,
             "reason": reason,
@@ -186,7 +193,7 @@ class ParquetWriter:
         return str(segment_path(self.base_dir, self.stream_name, hour_str, self._seq))
 
     def _emit_drop(self, rows_lost: Optional[int], reason: str = "crashed_segment_discarded") -> None:
-        event = {"exchange": "BINANCE", "stream": self.stream_name, "event_type": "DATA_DROP",
+        event = {"exchange": self.exchange, "stream": self.stream_name, "event_type": "DATA_DROP",
                  "reason": reason, "gap_size_ms": None, "rows_lost": rows_lost,
                  "local_ts": int(time.time() * 1000)}
         logger.warning("segment_data_drop", **event)

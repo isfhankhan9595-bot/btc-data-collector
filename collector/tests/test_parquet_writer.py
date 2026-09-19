@@ -297,3 +297,39 @@ def test_parquet_sidecar_created_next_to_parquet_file(temp_dir, monkeypatch):
     assert os.path.exists(file_path)
     assert os.path.exists(sidecar_path)
     assert os.path.dirname(sidecar_path) == os.path.dirname(file_path)
+
+
+def test_writer_reports_its_own_exchange_in_quality_events(temp_dir):
+    """A non-Binance writer's own storage failures must not be attributed
+    to Binance.
+
+    Every writer in this codebase was a Binance writer until Bybit's; the
+    quality-event emitters (`_emit_quality`, `_emit_drop`) hardcoded
+    ``"exchange": "BINANCE"` rather than reading it from the instance. A
+    Bybit writer using either method unmodified would durably misattribute
+    its own data drops and crashed-segment events to a venue that did not
+    cause them -- exactly the kind of quality-record falsification this
+    project's rules forbid, and easy to miss because nothing before Bybit
+    ever constructed a ``ParquetWriter`` for a second venue.
+    """
+    schema = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
+    events = []
+    writer = ParquetWriter("bybit_test_stream", schema, base_dir=temp_dir,
+                           exchange="BYBIT", quality_event_sink=events.append)
+
+    writer._emit_quality("SEQUENCE_GAP", "test_reason")
+    writer._emit_drop(rows_lost=3)
+
+    assert len(events) == 2
+    assert all(e["exchange"] == "BYBIT" for e in events), (
+        f"expected every event attributed to BYBIT, got {[e['exchange'] for e in events]}"
+    )
+
+
+def test_writer_exchange_defaults_to_binance_for_backward_compatibility(temp_dir):
+    schema = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
+    events = []
+    writer = ParquetWriter("test_stream_default_exchange", schema, base_dir=temp_dir,
+                           quality_event_sink=events.append)
+    writer._emit_quality("SEQUENCE_GAP", "test_reason")
+    assert events[0]["exchange"] == "BINANCE"

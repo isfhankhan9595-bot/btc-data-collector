@@ -432,12 +432,113 @@ production callback) was confirmed red against the original signature
 the test is known to actually exercise the failure mode rather than merely
 share its blind spot. Suite: 462 passed (461 + 1).
 
-### Phase 8 — Bybit live client — **NOT STARTED**
+### Phase 8 — Bybit live client — **PARTIAL, VERIFIED**
 
-Adapter exists and parses its 4 declared channels; nothing ingests from it, so
-Bybit contributes no data. Same environment blocker applies to live
-verification. The `on_open` / `keepalive` / `control_frames` hooks added in
-Phase 7 are the generic foundation this needs.
+`collector/run_bybit_collector.py`: a standalone runner wiring the
+already-correct `BybitAdapter` and venue-generic `LocalBook("BYBIT")` (both
+pre-existing, unmodified) to a live `WebSocketClient` connection, raw wire
+capture, and durable storage.
+
+**Protocol facts verified 2026-09-19 against official documentation** (not
+third-party SDKs, not memory):
+- Endpoint `wss://stream.bybit.com/v5/public/linear` and subscribe envelope
+  `{"op":"subscribe","args":[...]}` —
+  https://bybit-exchange.github.io/docs/v5/ws/connect
+- Orderbook depth levels (1/50/200/1000 for linear) —
+  https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook.
+  50 is used, an operational choice, not a protocol fact.
+- Heartbeat is **JSON** (`{"op":"ping"}` sent every ~20s; public reply
+  `{"success":true,"ret_msg":"pong","conn_id":"...","op":"ping"}`), unlike
+  OKX's raw-text control frames.
+
+**Design decision, stated not hidden:** the keepalive is fire-and-forget
+(`expect=None`). `WebSocketClient`'s reply-tracking only recognises an exact
+raw-text match against `control_frames`, built for OKX's literal
+`"ping"`/`"pong"`. Bybit's JSON pong has a dynamic `conn_id` and can never
+satisfy that match; wiring `expect=` would mark every ping as permanently
+awaiting a reply this mechanism cannot see arrive, eventually forcing a
+spurious reconnect on a healthy connection. Chosen deliberately conservative
+given this session's P0 hotfix was exactly an insufficiently-tested change to
+this same shared file — extending the reply-matching logic to recognise a
+JSON pong generically is real future work, not a defect in what ships here.
+BTCUSDT public channels push data continuously, so `_last_inbound_monotonic`
+(reset by any frame) is the dominant liveness signal regardless; a genuinely
+dead socket still surfaces via a failed `_send()`.
+
+**Storage:** distinct `bybit_*` stream names throughout (`bybit_orderbook`,
+`bybit_trades`, `bybit_markprice`, `bybit_openinterest`, `bybit_liquidation`,
+`bybit_raw_wire`, `bybit_quality_events`) with new schemas mirroring the
+Binance canonical shape minus derived microstructure features — never the
+shared Binance-named streams or Binance canonical schemas, both for a
+concrete reason (see `config.py`'s docstring above `BYBIT_ORDERBOOK_SCHEMA`):
+the Binance canonical schemas have no exchange column, and PR #13's OKX
+capture already reuses Binance's own `"raw_wire"`/`"quality_events"` stream
+names, which risks a segment-sequence race between independent OS processes
+(`ParquetWriter._seq` is a per-instance, uncoordinated in-memory counter).
+That existing risk fails loud, not silently (`FileExistsError` guards
+publish), so it is recorded here as a known defect rather than fixed as a
+side effect of unrelated Bybit work.
+
+**No derived microstructure features are computed for Bybit.**
+`feature_computer.compute_orderbook_features` reads raw Binance-message keys
+directly (`msg.get("E", ...)` with a silent fallback to local time when
+absent, and per-message levels rather than persistent book state) — reusing
+it on Bybit's payload shape would silently produce wrong values rather than
+fail loudly. Feature computation belongs in one verified, causal, cross-venue
+phase (item H), not bolted onto one exchange's ingestion wiring.
+
+**Three real defects found and fixed** while wiring this, none of them
+protocol guesses — all found by driving the actual
+`WebSocketClient._consume()` coroutine with synthetic frames rather than
+calling the handler methods directly (the same lesson as this session's P0
+hotfix, applied proactively this time):
+1. `on_open` is invoked as `await self.on_open(self._send)` — the client's
+   bound `_send` method, not the client instance. A first draft assumed the
+   latter and would have raised `AttributeError` on every connection.
+2. `on_message` is `await`ed by `_consume()`; a first draft's handler was a
+   plain synchronous method, which would have raised `TypeError` on the
+   first frame, inside the same fail-open `try/except` responsible for the
+   P0 hotfix — this bug is the exact shape of that one, caught before
+   shipping instead of after.
+3. `on_quality_event` is called with **4** positional arguments
+   (`event_type, reason, connection_id, stream_group`); a first draft's
+   handler took 2 and would have raised `TypeError` on the first malformed
+   frame or disconnect.
+
+A fourth issue was a test bug, not a production one, and is recorded to
+distinguish it from the three above: a first draft of the sequence-gap test
+asserted that an *increasing* jump in Bybit's `u` is a gap. It is not —
+`BybitSequenceComparator` (pre-existing, unmodified) only flags a decrease or
+exact repeat, matching official docs (`u` only guarantees non-decrease;
+continuity is self-healed by a fresh snapshot, not a client-side bridge chain
+the way Binance's `pu` rule works). The test encoded the wrong assumption,
+not the implementation; corrected to assert what the protocol actually
+guarantees.
+
+**Also fixed, adjacent:** `ParquetWriter._emit_quality`/`_emit_drop`
+hardcoded `"exchange": "BINANCE"` regardless of which venue's writer emitted
+them — latent because nothing before this constructed a `ParquetWriter` for
+a second venue. A Bybit writer's own storage failures would have been
+durably misattributed to Binance. Fixed with an `exchange` constructor
+parameter (default `"BINANCE"`, so every existing call site is unaffected),
+with a regression test for both the new venue and the default.
+
+**Tests:** `test_bybit_collector.py` (11, driving the real `_consume()`
+coroutine) + 2 new `ParquetWriter` exchange-attribution tests. Full suite:
+**509 passed** (496 + 13).
+
+**Not claimed:**
+- No live connection to Bybit was made or tested in this environment (no
+  outbound network access to exchange domains from this sandbox — the same
+  constraint noted for OKX). Everything above is verified against official
+  protocol documentation and exercised with synthetic frames through the
+  real client/adapter/book-engine code path, not a live session.
+- No derived microstructure features, as stated above.
+- The `ParquetWriter` multi-process same-stream-name collision risk
+  (pre-existing, from PR #13's OKX capture reusing Binance's stream names)
+  is recorded, not fixed.
+- OKX's six unimplemented channels (D11) remain blocked exactly as recorded
+  in Phase 7 — unrelated to this phase, not attempted here.
 
 ### Phase 9 — Leakage-safe label horizons and chronological splits — **PARTIAL, VERIFIED**
 
