@@ -216,3 +216,96 @@ QUALITY_EVENTS_SCHEMA = pa.schema([
 # capture contract lives beside the records it describes; re-exported here so
 # every stream schema remains discoverable from one module.
 from .raw_capture import RAW_REST_SCHEMA, RAW_WIRE_SCHEMA  # noqa: E402,F401
+
+# OKX D11 canonical schemas (this phase). Same reasoning as the Bybit block
+# above: no exchange column (own okx_-prefixed streams via storage_layout's
+# venue namespace, so cross-venue confusion is a storage-layer refusal, not a
+# schema concern), and separate from Binance/Bybit shapes wherever the
+# semantics actually differ (funding's current/next/settled split, OI's
+# three units, liquidation's bkLoss/ccy/posSide) rather than force-fit.
+# Fields with no slot here are not lost -- ``okx_raw_wire`` is the lossless
+# copy; see collector/collector/adapters/okx.py's module docstring.
+OKX_TRADES_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("trade_id", pa.string()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+    ("side", pa.string()),
+    ("venue_sequence", pa.int64()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_trades", "symbol": SYMBOL})
+
+OKX_TRADES_ALL_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("trade_id", pa.string()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+    ("side", pa.string()),
+    ("venue_sequence", pa.int64()),
+    ("source", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_trades_all", "symbol": SYMBOL,
+             "note": "Distinct channel from okx_trades -- see docs/OKX_D11_CHANNEL_SCHEMAS.md"})
+
+OKX_MARKPRICE_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("mark_price", pa.float64()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_markprice", "symbol": SYMBOL,
+             "note": "mark-price channel only; never populated from index-tickers or funding-rate"})
+
+OKX_INDEXTICKERS_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("index_price", pa.float64()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_indextickers", "symbol": SYMBOL})
+
+OKX_FUNDINGRATE_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("funding_rate", pa.float64()),
+    ("funding_time", pa.int64()),
+    ("next_funding_rate", pa.float64()),
+    ("next_funding_time", pa.int64()),
+    ("sett_funding_rate", pa.float64()),
+    ("sett_state", pa.string()),
+    ("premium", pa.float64()),
+    ("interest_rate", pa.float64()),
+    ("max_funding_rate", pa.float64()),
+    ("min_funding_rate", pa.float64()),
+    ("formula_type", pa.string()),
+    ("method", pa.string()),
+    ("impact_value", pa.float64()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_fundingrate", "symbol": SYMBOL,
+             "note": "current(funding_rate/funding_time), next, and settled are three distinct observations, never merged"})
+
+OKX_OPENINTEREST_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("open_interest", pa.float64()),
+    ("oi_ccy", pa.float64()),
+    ("oi_usd", pa.float64()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_openinterest", "symbol": SYMBOL,
+             "note": "open_interest is contracts (oi field); oi_ccy/oi_usd preserved alongside, not merged"})
+
+OKX_LIQUIDATION_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("inst_id", pa.string()),
+    ("side", pa.string()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+    ("bk_loss", pa.float64()),
+    ("ccy", pa.string()),
+    ("pos_side", pa.string()),
+    ("inst_family", pa.string()),
+    ("uly", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "okx_liquidation", "symbol": SYMBOL,
+             "note": "subscription is instType-scoped; inst_id column lets downstream filter to BTC-USDT-SWAP"})

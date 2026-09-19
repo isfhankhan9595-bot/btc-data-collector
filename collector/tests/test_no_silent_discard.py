@@ -242,7 +242,9 @@ def test_adapter_unhandled_becomes_a_durable_quality_event():
     adapter.normalize({"arg": {"channel": "open-interest"}, "data": [{}]}, local_receive_ts=3)
 
     assert app.stream_counters["adapter_unhandled"]["received"] == 1
-    assert "channel_not_implemented" in app.quality_events[0]["reason"]
+    # open-interest is implemented (D11); an empty payload is malformed, not
+    # an unimplemented channel -- see docs/OKX_D11_CHANNEL_SCHEMAS.md.
+    assert "malformed_payload" in app.quality_events[0]["reason"]
 
 
 # ---------------------------------------------------------------------------

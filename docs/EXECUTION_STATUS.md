@@ -37,7 +37,7 @@ Documentation is never a substitute for implementation.
 | # | Defect | Phase |
 |---|---|---|
 | D10 | No raw wire capture layer. `binance_orderbook_raw` stores normalised levels, not exact payloads; there is no connection id, no REST request/response lineage. Deterministic replay is not currently possible from stored data. | 6 |
-| D11 | OKX adapter declares `trades`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders` in `channel_event_types` but `normalize()` only implements `books`. Everything else silently returns `[]`. | 14 |
+| ~~D11~~ | *Closed in this session (PR #22).* OKX adapter now implements all seven D11 channel names (`trades`, `trades-all`, `mark-price`, `index-tickers`, `open-interest`, `funding-rate`, `liquidation-orders`) plus `books`; none silently return `[]` for a well-formed frame. See "Implementation pass (PR #22)" below. Non-orderbook replay and live verification remain separately tracked, not reopened as D11. | 14 |
 | D12 | Bybit adapter merges ticker deltas into shared `_ticker_state` and emits merged values without marking which fields were carried forward. Staleness is not observable. | 13 |
 | ~~D14~~ | *Closed in Phase 6.* Verified against official USD-M documentation 2026-09-19. The rules were correct; five defects were found around them (D18–D22). See `docs/BINANCE_USDM_SEMANTICS.md`. | — |
 
@@ -212,6 +212,11 @@ minified one-liners, not implementations.
 `books`, so `trades`, `mark-price`, `index-tickers`, `open-interest`,
 `funding-rate` and `liquidation-orders` are advertised as supported and
 silently produce nothing.
+
+> **Update, this session (PR #22):** D11 is closed — see "Implementation
+> pass (PR #22)" above. This table and the dependency graph below are left
+> as the historical record of Phase 2's finding, not edited to match current
+> state, the same convention used for `~~D14~~` below.
 
 | # | Defect | Severity | Phase |
 |---|---|---|---|
@@ -399,7 +404,47 @@ Parsers/canonical mapping/storage/replay/tests for these six channels are
 citation error in the schema doc and an implementation defect are never in
 the same diff.
 
-#### Environment blocker (hard)
+#### Implementation pass (PR #22, this session)
+
+Six channel groups (seven channel names: `trades`, `trades-all`,
+`mark-price`, `index-tickers`, `funding-rate`, `open-interest`,
+`liquidation-orders`) now go raw frame → parser → canonical event → durable
+storage. Status by the states the task asked to distinguish, not "D11
+COMPLETE":
+
+| Aspect | State |
+|---|---|
+| Schema verified (official docs / captured frame) | **COMPLETE** — `docs/OKX_D11_CHANNEL_SCHEMAS.md`, PR #21 |
+| Parser + canonical mapping implementation | **COMPLETE** — `collector/collector/adapters/okx.py`, all 8 declared channel names (`books` unchanged + 7 D11 names); `OKXAdapter.declared_channels() == OKXAdapter.implemented_channels()` is itself asserted by test |
+| Storage wiring | **COMPLETE** for the 7 D11 streams (`okx_trades`, `okx_trades_all`, `okx_markprice`, `okx_indextickers`, `okx_fundingrate`, `okx_openinterest`, `okx_liquidation`) via new `run_okx_collector.py`. **NOT included:** `okx_orderbook` — a live OKX order-book collector needs the same `LocalBook`/quality-state-machine wiring Binance/Bybit have and was out of D11's scope; `books` already has its own raw-only capture path (`run_okx_capture.py`) unchanged by this PR. |
+| Fixture tests | **COMPLETE** — `tests/test_okx_d11_channels.py` (happy path per channel from documented/captured examples, malformed/missing-field handling, empty-string vs missing-field distinction, repeated-seqId non-gap, channel purity, determinism) and `tests/test_okx_collector_storage.py` (namespace isolation, per-channel stream routing). Existing tests asserting the old `CHANNEL_NOT_IMPLEMENTED` behaviour updated to assert the new implemented behaviour (`tests/test_okx_capture.py`, `tests/test_raw_capture.py`, `tests/test_no_silent_discard.py`) rather than left contradicting the code. |
+| Replay | **NOT COMPLETE.** `ReplayEngine`/`replay_directory` (`collector/collector/replay.py`) only replay `CanonicalOrderBookEvent` — `_handle_wire` explicitly `continue`s past every other canonical event type, for every venue, not just OKX. This predates this PR and is not a D11-specific gap. Extending `ReplayEngine` to non-orderbook streams is a cross-venue architectural change (would also apply to Binance's/Bybit's existing trades/markprice/OI/liquidation events, which are equally not replayed today) and was deliberately not bundled into this PR, so a schema/parser defect and a replay-engine defect are never in the same diff. What **is** proven: `test_parse_is_deterministic_same_frame_same_result` shows `OKXAdapter.normalize()` is a pure function of its input (no adapter-instance state affects re-parsing the same frame) — the property that makes "raw frame → same parser → same canonical result" true once a replay driver for these streams exists. |
+| Live verification | **PENDING** (environment blocker, below) — unchanged from Phase 7. |
+
+Five open questions from `docs/OKX_D11_CHANNEL_SCHEMAS.md` remain open;
+implementation code handles all five defensively (reads the relevant field
+with `.get()`/no assumption of presence or absence) rather than resolving
+them by assumption — see per-question comments in
+`collector/collector/adapters/okx.py` and the corresponding tests in
+`tests/test_okx_d11_channels.py`.
+
+Two related bugs fixed as part of this pass, found by writing the
+implementation rather than pre-existing test coverage: (1) both
+`OKXAdapter.subscribe_message` and `okx_capture.okx_subscribe_message`
+previously applied one `instId` to every channel uniformly, which is the
+wrong argument shape for `liquidation-orders` (`instType`-scoped, confirmed
+in two independent doc mirrors) — fixed, channel-aware now, pinned by
+`test_capture_subscribe_args_are_channel_aware`. (2) `index-tickers`'
+subscription instId (the underlying index, not the SWAP instId) was
+previously not distinguished anywhere in code; it is now an explicit,
+overridable parameter (`OKXAdapter.index_inst_id` /
+`okx_subscribe_message`'s `index_inst_id`) rather than silently reusing the
+SWAP instId, since the correct value is open question #3 and this way a
+verified correction is a one-argument change, not a code change.
+
+**Suite:** **573 passed**, 0 failed (was 538 after PR #21).
+
+
 
 This code has **never been run against the live venue**. The execution
 container denies egress to `ws.okx.com`
