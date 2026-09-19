@@ -60,6 +60,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .adapters.binance import BinanceAdapter
+from .adapters.bybit import BybitAdapter
 from .book_engine import LocalBook
 from .canonical import CanonicalOrderBookEvent
 from .quality_events import BookQuality, QualityEventType
@@ -273,13 +274,30 @@ def _as_ms(value: Any) -> int:
     raise ValueError(f"unsupported replay timestamp: {value!r}")
 
 
+#: Which adapter replays which venue's wire frames. ``LocalBook`` already
+#: has its own venue-keyed comparator dict (see ``book_engine.LocalBook``);
+#: this is that same idea one layer up, so the constructor argument actually
+#: determines what runs instead of being accepted and ignored.
+_ADAPTER_CLASSES: dict[str, type] = {
+    "BINANCE": BinanceAdapter,
+    "BYBIT": BybitAdapter,
+}
+
+
 class ReplayEngine:
     """Drive recorded frames through the production reconstruction path."""
 
     def __init__(self, venue: str = "BINANCE", max_buffer_events: int = 10_000) -> None:
-        self.venue = venue
-        self.adapter = BinanceAdapter()
-        self.book = LocalBook(venue, max_buffer_events=max_buffer_events)
+        self.venue = venue.upper()
+        try:
+            adapter_cls = _ADAPTER_CLASSES[self.venue]
+        except KeyError:
+            raise ValueError(
+                f"replay does not support venue {venue!r}; supported venues: "
+                f"{sorted(_ADAPTER_CLASSES)}"
+            ) from None
+        self.adapter = adapter_cls()
+        self.book = LocalBook(self.venue, max_buffer_events=max_buffer_events)
         self.result = ReplayResult()
         self.adapter.set_unhandled_sink(self._on_unhandled)
 
@@ -294,14 +312,27 @@ class ReplayEngine:
             record = event.record() if hasattr(event, "record") else dict(event)
             self.result.quality_events.append(record)
 
-    def _record_transition(self, reason: str, kind: str) -> None:
-        transition = self.book.last_transition
+    def _record_transition(self, reason: str, kind: str, before: BookQuality, after: BookQuality) -> None:
+        """Record a quality-state transition using the states actually
+        observed by the caller, not ``LocalBook.last_transition``.
+
+        ``last_transition`` is not updated by every state-changing path --
+        notably ``LocalBook.snapshot()`` (the plain websocket-snapshot bridge
+        Bybit's wire uses) changes ``state`` via ``recovered()`` without
+        touching it, while Binance's ``_attempt_bridge`` does set it. Reading
+        it here would make correctness depend on every current and future
+        state-changing path in ``LocalBook`` remembering to set it too. Live
+        never has this problem because it compares its own ``before``/
+        ``after`` locals directly (see
+        ``run_bybit_collector.BybitCollectorApp._apply_orderbook``); passing
+        them in here is the same fix, not a workaround.
+        """
         self.result.quality_events.append({
             "event_type": kind,
             "reason": reason,
-            "quality_state": self.book.state.state.value,
-            "previous_state": getattr(getattr(transition, "previous_state", None), "value", None),
-            "new_state": getattr(getattr(transition, "new_state", None), "value", None),
+            "quality_state": after.value,
+            "previous_state": before.value,
+            "new_state": after.value,
         })
 
     def _record_book(self, applied, event_kind: str, generation: int) -> None:
@@ -359,20 +390,34 @@ class ReplayEngine:
             before = self.book.state.state
             applied = self.book.apply(event)
             after = self.book.state.state
-            if after is BookQuality.SEQUENCE_GAP and before is not after:
-                self._record_transition(self.book.last_reason, QualityEventType.SEQUENCE_GAP.value)
+            if before is not after:
+                # Match live exactly (see run_bybit_collector._apply_orderbook):
+                # any state change is recorded, not only a transition that
+                # happens to land on SEQUENCE_GAP. A resync signal can drive
+                # the book straight to RECOVERING without ever passing
+                # through SEQUENCE_GAP (see book_engine.LocalBook.apply,
+                # ``result.is_resync_signal`` -> ``state.resync()``), and a
+                # narrower check here would silently omit exactly the
+                # transition live records for that path.
+                kind = (
+                    QualityEventType.SEQUENCE_GAP.value
+                    if after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING)
+                    else QualityEventType.RECOVERY.value
+                )
+                self._record_transition(self.book.last_reason, kind, before, after)
             if applied is None and after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING):
                 # Parity with live: the runner retries a retained snapshot
                 # here, so replay must too or the same recorded bytes produce
                 # a different book.
+                retry_before = after
                 if self.book.retry_pending_snapshot():
                     self.result.snapshots_applied += 1
                     for committed, event_kind, generation in self.book.committed_recovery_events:
                         self._record_book(committed, event_kind, generation)
                     self.book.committed_recovery_events = []
-                    self._record_transition("pending_snapshot_bridge_completed",
-                                            QualityEventType.RECOVERY.value)
                     after = self.book.state.state
+                    self._record_transition("pending_snapshot_bridge_completed",
+                                            QualityEventType.RECOVERY.value, retry_before, after)
             if self.book.duplicate_count:
                 self.result.quality_events.append({
                     "event_type": QualityEventType.DUPLICATE.value,
@@ -386,6 +431,22 @@ class ReplayEngine:
 
     def _handle_snapshot(self, frame: ReplayFrame) -> None:
         self.result.frames_snapshot += 1
+        if self.venue != "BINANCE":
+            # Only Binance bridges a gap with a REST snapshot; Bybit's
+            # snapshot arrives on the wire itself (``type": "snapshot"``,
+            # see BybitAdapter.normalize) and is handled by _handle_wire via
+            # LocalBook.snapshot(), never here. A REST_SNAPSHOT frame for
+            # any other venue means the recorded data does not match this
+            # venue's protocol -- treating it as Binance's ``lastUpdateId``
+            # format would either crash on the wrong shape or, worse, parse
+            # by coincidence and silently corrupt the book.
+            self.result.frames_unhandled += 1
+            self.result.quality_events.append({
+                "event_type": QualityEventType.ERROR.value,
+                "reason": f"replay_rest_snapshot_not_supported_for_venue:{self.venue}",
+                "quality_state": self.book.state.state.value,
+            })
+            return
         if not frame.http_ok:
             # A failed snapshot bridged nothing live. Record the attempt.
             self.result.snapshots_rejected += 1
@@ -423,18 +484,21 @@ class ReplayEngine:
             update_id=last_update_id, is_snapshot=True,
             book_source="DIFF_DEPTH_RECONSTRUCTED",
         )
+        before = self.book.state.state
         if not self.book.binance_snapshot(last_update_id, snapshot_event):
+            after = self.book.state.state
             self.result.snapshots_rejected += 1
             self._record_transition(self.book.last_reason or "snapshot_rejected",
-                                    QualityEventType.ERROR.value)
+                                    QualityEventType.ERROR.value, before, after)
             self._drain_book_quality()
             return
 
+        after = self.book.state.state
         self.result.snapshots_applied += 1
         for applied, event_kind, generation in self.book.committed_recovery_events:
             self._record_book(applied, event_kind, generation)
         self.book.committed_recovery_events = []
-        self._record_transition("snapshot_bridge_completed", QualityEventType.RECOVERY.value)
+        self._record_transition("snapshot_bridge_completed", QualityEventType.RECOVERY.value, before, after)
         self._drain_book_quality()
 
     # -- driver -----------------------------------------------------------
