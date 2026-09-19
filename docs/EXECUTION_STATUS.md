@@ -1001,3 +1001,29 @@ unit fails 1.
 are unresolved; instrument/contract-size differences are not modelled; Binance
 OI (G2) is untouched; segments written before schema 1.1 have no `oi_unit`
 column (fixed by stream).
+
+### G4 — test collection discrepancy — CLOSED
+
+Two test files used bare/rootdir-relative imports that only resolved when
+pytest's cwd was `collector/`:
+
+- `test_okx_collector_storage.py`: `from run_okx_collector import ...`
+- `test_replay_non_book_events.py`: `from tests.test_replay import ...`
+
+Every other test in the suite already uses the package-qualified form
+(`from collector.run_collector import ...`, established since early phases).
+These two were the only inconsistent instances — found by grep across the
+whole suite, not assumed.
+
+Fixed to the existing convention (`collector.run_okx_collector`,
+`collector.tests.test_replay`). No `sys.path` hacks, no new conftest logic,
+no architectural change — `collector/conftest.py` already puts the repo root
+on `sys.path`, which is sufficient once imports are package-qualified.
+
+**Canonical test command, now equivalent from any cwd:**
+```
+pytest                    # from repo root
+pytest collector          # from repo root, explicit
+cd collector && PYTHONPATH=<repo>:<repo>/collector pytest tests   # CI's own invocation
+```
+All three: **608 passed, 0 failed.**

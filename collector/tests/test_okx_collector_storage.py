@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from run_okx_collector import OKXCollectorApp
+from collector.run_okx_collector import OKXCollectorApp
 
 
 def _flush(app: OKXCollectorApp) -> None:
