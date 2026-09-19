@@ -377,6 +377,28 @@ documented **envelope** fields. Nothing inside `data[]` is touched.
 So D11 is **not** closed. Capture removes the *name* half of the blocker; the
 *semantic* half still requires official documentation or an authoritative SDK.
 
+#### Official-documentation semantic pass (this session)
+
+`docs/OKX_D11_CHANNEL_SCHEMAS.md` records verified field-level schemas for
+all six channels (`trades`, `trades-all`, `mark-price`, `index-tickers`,
+`funding-rate`, `open-interest`, `liquidation-orders`), sourced from OKX's
+official `docs-v5` documentation (cross-checked across regional mirrors of
+the same content) and, for `liquidation-orders`, a real captured production
+frame found in a public bug report. This substantially closes the semantic
+half for envelope shape, field names/types, and funding
+current/next/settled-period semantics. It explicitly does **not** resolve:
+whether `trades` aggregates multiple fills per push relative to
+`trades-all`, whether `seqId` (added to `trades` per the 2025-07-08
+changelog) is present on `trades-all`, and one open question on
+`liquidation-orders`' `ccy` field — those need comparison against real
+captured frames for BTC-USDT-SWAP specifically, which this environment
+cannot do (see "Environment blocker" below): capture-only verification is
+still needed before the canonical mapping, not just documentation.
+Parsers/canonical mapping/storage/replay/tests for these six channels are
+**not implemented**; that is the next phase, tracked separately so a
+citation error in the schema doc and an implementation defect are never in
+the same diff.
+
 #### Environment blocker (hard)
 
 This code has **never been run against the live venue**. The execution
