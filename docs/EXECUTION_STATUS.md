@@ -490,8 +490,18 @@ two existing test files — 39 in the batch group, all passing. Full suite:
 
 **Not claimed:**
 - `pipeline/dataset_assembler.py`, `pipeline/cross_exchange_alignment.py`,
-  `pipeline/stats_computer.py` are untouched by this work and have not been
-  reviewed against the leakage rules in this pass.
+  `pipeline/stats_computer.py` are untouched and **not reviewed** against
+  these same leakage rules in this pass. A brief read shows sound causal
+  design in each (`dataset_assembler.py` uses `merge_asof(direction=
+  "backward")` with explicit freshness tolerances and staleness flags rather
+  than silent forward-fill, and bins trades forward to the next grid point
+  so a grid row never uses a trade that has not yet happened;
+  `cross_exchange_alignment.py`'s `causally_align()` explicitly discards any
+  event later than the observation timestamp; `stats_computer.py` computes
+  descriptive statistics only, no causal claims). This is a read, not an
+  audit: no adversarial tests were written against any of the three, and
+  `cross_exchange_alignment.py` and `stats_computer.py` have no dedicated
+  test file at all (`dataset_assembler.py` has one, unmodified here).
 - No real labeled dataset has been run through this end-to-end; correctness
   is verified against synthetic fixtures and property-style boundary cases,
   not a production run.
