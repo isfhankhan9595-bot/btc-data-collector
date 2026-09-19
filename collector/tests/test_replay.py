@@ -170,14 +170,25 @@ def test_snapshot_request_with_no_response_is_excluded_entirely():
 
 
 def test_non_snapshot_rest_purposes_do_not_drive_the_book():
+    """open_interest is a real, replayed purpose (see G2 /
+    test_binance_oi_replayability.py) -- it produces a frame, but that
+    frame must never touch order-book reconstruction. A genuinely unknown
+    purpose still produces nothing, which this also covers."""
     source = ReplaySource.from_records(
         wire_rows=[],
-        rest_rows=[{
-            "purpose": "open_interest", "response_receive_ts": BASE_TS,
-            "payload": json.dumps({"openInterest": "1"}), "ok": True,
-        }],
+        rest_rows=[
+            {"purpose": "open_interest", "response_receive_ts": BASE_TS,
+             "payload": json.dumps({"openInterest": "1"}), "ok": True},
+            {"purpose": "some_future_purpose", "response_receive_ts": BASE_TS,
+             "payload": "{}", "ok": True},
+        ],
     )
-    assert len(source) == 0
+    assert len(source) == 1
+    assert source.frames[0].kind == FrameKind.REST_OI
+
+    result = ReplayEngine().run(source)
+    assert result.book_updates == []  # never touches the book
+    assert result.oi_observations == 1
 
 
 def test_undecodable_frame_stays_undecodable_in_replay():
