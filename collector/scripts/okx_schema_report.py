@@ -29,7 +29,7 @@ import sys
 from collections import Counter, defaultdict
 from typing import Any
 
-from collector.collector.storage_layout import StorageCollisionError, iter_segments
+from collector.collector.storage_layout import StorageCollisionError, iter_segments, read_streams
 
 #: Envelope keys, documented and already known. Excluded from the payload
 #: report so the output is only the part that is actually unverified.
@@ -85,7 +85,11 @@ def collect(data_dir: str, date: str | None = None) -> dict[str, Any]:
     }
 
     try:
-        paths = sorted(iter_segments(data_dir, "raw_wire", date=date))
+        # OKX's own stream first, then the legacy unprefixed ``raw_wire`` where
+        # its pre-namespace captures share a directory with Binance's frames.
+        # The venue filter below is what separates them; nothing is assumed.
+        paths = [path for name in read_streams("OKX", "raw_wire")
+                 for path in sorted(iter_segments(data_dir, name, date=date))]
     except StorageCollisionError as exc:
         # Ambiguous storage means the observed frame set cannot be trusted to
         # be the frame set that was captured. Report it instead of guessing.

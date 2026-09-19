@@ -13,6 +13,13 @@ Raw output is atomically published under `data/raw/<stream>/` as immutable
 readers use `collector.storage_layout.iter_segments`; temporary files are never
 read.
 
+Each venue writes to its own stream directories (`storage_layout.venue_stream`:
+Binance keeps `raw_wire`/`quality_events`, Bybit is `bybit_*`, OKX is `okx_*`),
+and `ParquetWriter` holds a single-writer lock per stream directory, so two
+collectors can never share segment sequence numbers or `.tmp` files. Starting a
+second copy of a collector against the same `data/` fails immediately with
+`StorageWriterLockedError`. See `docs/STORAGE_NAMESPACES.md`.
+
 ## Commands
 
 From the repository root after installing `collector/requirements.txt`:

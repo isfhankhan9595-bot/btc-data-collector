@@ -3,6 +3,15 @@
 Raw collector output has used both legacy hourly ``.parquet`` files and the
 crash-bounded ``.seg`` format. Readers must use this module rather than
 constructing filenames themselves so that old data remains readable.
+
+Venue namespaces
+----------------
+Every venue's raw streams live in their own stream directory, named by
+:func:`venue_stream`. Segment sequence numbers, ``.tmp`` files and orphan
+recovery are all scoped to one stream directory, so a directory shared by two
+venues (or two processes) is a shared sequence namespace. Binance keeps the
+historical unprefixed names because its recorded history lives there;
+Bybit and OKX are prefixed. See ``docs/STORAGE_NAMESPACES.md``.
 """
 from __future__ import annotations
 
@@ -25,6 +34,91 @@ _NAME = re.compile(
 
 class StorageCollisionError(RuntimeError):
     """Raised when legacy and sequenced files represent the same logical hour."""
+
+
+class StorageNamespaceError(RuntimeError):
+    """Raised when a stream name and the venue writing to it disagree."""
+
+
+#: Prefix that namespaces each venue's stream directories. BINANCE is empty on
+#: purpose: it was the only venue when the unprefixed names were chosen, its
+#: recorded history lives under them, and renaming would strand that history.
+VENUE_STREAM_PREFIX: dict[str, str] = {"BINANCE": "", "BYBIT": "bybit_", "OKX": "okx_"}
+
+#: Unprefixed stream names that PR #13 let OKX share with Binance. Legacy OKX
+#: frames and quality events may still sit in these directories; every row in
+#: them carries its own venue/exchange column, which is how readers separate
+#: them. New OKX data never goes here.
+LEGACY_SHARED_STREAMS = frozenset({"raw_wire", "raw_rest", "quality_events"})
+
+
+def _known_venue(venue: str) -> str:
+    key = str(venue).upper()
+    if key not in VENUE_STREAM_PREFIX:
+        raise ValueError(
+            f"unknown venue {venue!r}; register it in VENUE_STREAM_PREFIX so its "
+            f"streams get their own namespace (known: {sorted(VENUE_STREAM_PREFIX)})"
+        )
+    return key
+
+
+def venue_stream(venue: str, stream: str) -> str:
+    """Return the stream directory name ``venue`` writes ``stream`` to.
+
+    Raises for an unregistered venue rather than defaulting: a silent default
+    is exactly how two venues came to share ``raw_wire``.
+    """
+    return VENUE_STREAM_PREFIX[_known_venue(venue)] + stream
+
+
+def read_streams(venue: str, stream: str) -> tuple[str, ...]:
+    """Stream directories that may hold ``venue``'s rows for ``stream``.
+
+    The venue's own directory first. OKX additionally reads the legacy
+    unprefixed directory, where its pre-namespace captures live. Callers must
+    still filter the rows by their venue column: the legacy directory is
+    shared history, not OKX's.
+    """
+    key = _known_venue(venue)
+    own = venue_stream(key, stream)
+    if key == "OKX" and stream in LEGACY_SHARED_STREAMS:
+        return (own, stream)
+    return (own,)
+
+
+def stream_owner(stream_name: str) -> str | None:
+    """Venue whose non-empty prefix ``stream_name`` carries, if any."""
+    for venue, prefix in VENUE_STREAM_PREFIX.items():
+        if prefix and stream_name.startswith(prefix):
+            return venue
+    return None
+
+
+def check_stream_namespace(venue: str, stream_name: str) -> None:
+    """Refuse a writer whose declared venue contradicts its stream name.
+
+    Two rules, both of which are the misconfigurations that create shared
+    namespaces or misattribute a venue's storage faults:
+
+    * a prefixed venue (Bybit, OKX) must write to its own prefixed streams;
+    * a stream carrying another venue's prefix must not be written by a
+      writer declared as a different venue (including the BINANCE default).
+
+    A venue that is not registered is not policed here; the writer's own
+    stream lock still prevents it from sharing a directory concurrently.
+    """
+    key = str(venue).upper()
+    prefix = VENUE_STREAM_PREFIX.get(key)
+    if prefix and not stream_name.startswith(prefix):
+        raise StorageNamespaceError(
+            f"{key} writer must use a {prefix!r}-prefixed stream, got {stream_name!r}; "
+            f"use venue_stream({key!r}, ...) so venues never share a sequence namespace"
+        )
+    owner = stream_owner(stream_name)
+    if owner is not None and owner != key:
+        raise StorageNamespaceError(
+            f"stream {stream_name!r} belongs to {owner}, but the writer is declared as {key}"
+        )
 
 
 def segment_path(base_dir: str | Path, stream: str, hour_str: str, seq: int) -> Path:

@@ -36,17 +36,23 @@ from collector.collector.okx_capture import (
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RawCapture
+from collector.collector.storage_layout import venue_stream
 from collector.collector.utils import logger
 
 
 class OKXCaptureApp:
     def __init__(self, channels, inst_id: str, data_dir: str, url: str) -> None:
+        # Own stream directories, not Binance's ``raw_wire``/``quality_events``:
+        # segment sequence numbers and .tmp files are scoped to a stream
+        # directory, so sharing one with the Binance runner shares both. The
+        # writers also declare exchange="OKX" so their own storage faults are
+        # not attributed to Binance (the ParquetWriter default).
         self.quality_writer = ParquetWriter(
-            "quality_events", QUALITY_EVENTS_SCHEMA, base_dir=data_dir,
-            segment_rows=1, segment_seconds=1)
+            venue_stream("OKX", "quality_events"), QUALITY_EVENTS_SCHEMA,
+            base_dir=data_dir, exchange="OKX", segment_rows=1, segment_seconds=1)
         self.raw_wire_writer = ParquetWriter(
-            "raw_wire", RAW_WIRE_SCHEMA, base_dir=data_dir,
-            quality_event_sink=self._persist_quality_event)
+            venue_stream("OKX", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=data_dir,
+            exchange="OKX", quality_event_sink=self._persist_quality_event)
         self.raw_capture = RawCapture(
             self.raw_wire_writer, None,
             quality_event_sink=self._persist_quality_event)

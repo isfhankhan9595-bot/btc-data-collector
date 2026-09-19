@@ -50,8 +50,8 @@ which are documented **envelope** fields, not payload fields.
 |---|---|
 | `collector/collector/websocket_client.py` | extended with three optional venue hooks: `on_open`, `keepalive`, `control_frames` |
 | `collector/collector/okx_capture.py` | `OKXPublicCapture` — connect, subscribe, classify envelopes, persist raw frames with lineage |
-| `collector/run_okx_capture.py` | standalone bounded entrypoint; writes `raw_wire` + `quality_events` only |
-| `collector/scripts/okx_schema_report.py` | reads captured frames back and reports observed field structure per channel |
+| `collector/run_okx_capture.py` | standalone bounded entrypoint; writes `okx_raw_wire` + `okx_quality_events` only (its own namespace, not Binance's `raw_wire`/`quality_events`; captures made before the storage-namespace phase are in the unprefixed directories — see `docs/STORAGE_NAMESPACES.md`) |
+| `collector/scripts/okx_schema_report.py` | reads captured frames back (`okx_raw_wire`, plus legacy `raw_wire` filtered to OKX rows) and reports observed field structure per channel |
 
 ### Why the WS client needed extending rather than duplicating
 

@@ -264,7 +264,10 @@ def test_empty_parquet_sidecar_falls_back_to_declared_start(temp_dir, monkeypatc
 
     # Empty segments are intentionally never published: an empty .seg would
     # be indistinguishable from a real but useless collection interval.
-    assert not os.listdir(os.path.join(temp_dir, "raw", "test_stream_empty_sidecar"))
+    # The writer lock is a permanent, non-segment file by design; what must
+    # be absent is any segment, temporary segment or sidecar.
+    assert [name for name in os.listdir(os.path.join(temp_dir, "raw", "test_stream_empty_sidecar"))
+            if name != ".writer.lock"] == []
 
 
 def test_parquet_sidecar_created_next_to_parquet_file(temp_dir, monkeypatch):

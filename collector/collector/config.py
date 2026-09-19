@@ -118,17 +118,21 @@ LIQUIDATION_SCHEMA = pa.schema([
 #    Feature computation belongs in its own verified, causal, cross-venue
 #    phase, not bolted onto ingestion wiring for one exchange.
 #
-# Own stream names, not shared ones: `ParquetWriter._seq` is a per-instance
-# in-memory counter with no cross-process coordination. Two independently
-# constructed writers appending to the same stream name from two OS
-# processes (a real deployment shape here: Binance, Bybit and OKX are
-# separate runner processes) can race for the same segment sequence number.
-# The existing `FileExistsError` guard on publish means this fails loud
-# rather than corrupting data, but it is still an avoidable operational
-# fault -- PR #13's OKX capture reused "raw_wire"/"quality_events" with
-# Binance's own stream names, which carries exactly this risk if both are
-# ever run at once. Not fixed here (out of scope for Bybit's own wiring),
-# but not repeated: every Bybit stream below is named uniquely.
+# Own stream names, not shared ones: segment sequence numbers, `.tmp` files
+# and orphan recovery are all scoped to a stream directory, so two writers on
+# one stream name share all three (Binance, Bybit and OKX are separate runner
+# processes). Sequence allocation is scan-then-create with nothing reserved in
+# between, so both pick the same number and open the same `.tmp` path. The
+# publish-time `FileExistsError` guard does NOT make that safe: it fires only
+# after the damage, and the second writer's orphan recovery deletes the first
+# writer's live segment and reports it as a crash. PR #13's OKX capture reused
+# "raw_wire"/"quality_events" with Binance's names.
+#
+# Resolved in the storage-namespace phase: every venue's stream names come
+# from `storage_layout.venue_stream`, `ParquetWriter` refuses a stream that
+# contradicts its declared venue, and it holds a single-writer lock per stream
+# directory. See docs/STORAGE_NAMESPACES.md. Every Bybit stream below is named
+# uniquely.
 BYBIT_ORDERBOOK_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
