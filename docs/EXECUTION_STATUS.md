@@ -540,6 +540,33 @@ coroutine) + 2 new `ParquetWriter` exchange-attribution tests. Full suite:
 - OKX's six unimplemented channels (D11) remain blocked exactly as recorded
   in Phase 7 — unrelated to this phase, not attempted here.
 
+### Phase 8 addendum — ReplayEngine does not actually support Bybit yet — **DEFECT RECORDED, NOT FIXED**
+
+Checked while looking at item E (deterministic replay) as Phase 8's natural
+next dependency. `ReplayEngine.__init__(self, venue: str = "BINANCE", ...)`
+correctly parameterizes `LocalBook(venue, ...)` (so the sequence comparator
+is venue-correct), but **hardcodes `self.adapter = BinanceAdapter()`
+unconditionally** — the `venue` parameter does not select which adapter
+parses incoming frames. Passing `venue="BYBIT"` to `ReplayEngine` today would
+silently attempt to parse Bybit-shaped raw frames with `BinanceAdapter`,
+producing nothing usable, not an error.
+
+Separately, `ReplayEngine.run()`'s REST-snapshot-bridge path
+(`self.book.binance_snapshot(last_update_id, snapshot_event)`) is
+Binance-specific by name and by protocol (USD-M's snapshot-then-bridge
+model). Bybit's snapshot arrives as a `type: "snapshot"` message over the
+same WS stream, handled through `LocalBook.apply()`'s general `is_snapshot`
+branch — a different code path that this method does not call.
+
+**Not fixed here.** Extending `ReplayEngine` to genuinely support a second
+venue means parameterizing the adapter and branching the snapshot-handling
+path correctly for each venue's actual protocol — a real, scoped change to
+shared replay infrastructure, which is exactly the kind of narrow,
+insufficiently-tested-before-shipping change that caused this session's P0
+hotfix. Recorded precisely so a future session (or a person reading this
+file) does not assume Bybit replay works because the constructor accepts a
+`venue` argument.
+
 ### Phase 9 — Leakage-safe label horizons and chronological splits — **PARTIAL, VERIFIED**
 
 **Provenance.** Found as uncommitted work in the shared container (branch
