@@ -567,6 +567,83 @@ hotfix. Recorded precisely so a future session (or a person reading this
 file) does not assume Bybit replay works because the constructor accepts a
 `venue` argument.
 
+### Phase 8 addendum, fixed — ReplayEngine is now venue-aware; replay/live quality-transition parity — **COMPLETE, VERIFIED**
+
+Fixes both defects recorded immediately above, plus a second, related defect
+found while writing the regression test for the first.
+
+**`ReplayEngine.__init__` — defect fixed.** `self.adapter = BinanceAdapter()`
+was unconditional. Now dispatches on `venue` through a small
+`_ADAPTER_CLASSES` map (`{"BINANCE": BinanceAdapter, "BYBIT": BybitAdapter}`),
+matching the same venue-keyed-dict shape `LocalBook.comparator` already uses.
+`venue` is upper-cased once in the constructor so `"bybit"` and `"BYBIT"`
+resolve identically; an unrecognised venue raises `ValueError` at
+construction rather than silently defaulting to Binance. `_handle_snapshot`
+(the Binance REST-snapshot-bridge path, `binance_snapshot`/`lastUpdateId`
+shape) now refuses a `REST_SNAPSHOT` frame for any non-Binance venue instead
+of parsing it as Binance's shape by coincidence — Bybit's snapshot arrives on
+the wire itself (`type: "snapshot"`) and is already handled by `_handle_wire`
+via `LocalBook.apply()`'s general `is_snapshot` branch, so no Bybit code path
+was missing, only the guard against a REST frame that should never occur for
+that venue.
+
+**`ReplayEngine._handle_wire` — quality-transition parity defect fixed.**
+Previously recorded a transition only when `after is SEQUENCE_GAP`. Bybit's
+`is_resync_signal` (an `update_id` decrease, see `sequence.py`,
+`BybitSequenceComparator`) drives the book straight from `VALID` to
+`RECOVERING` via `BookQualityStateMachine.resync()` — never through
+`SEQUENCE_GAP` — so that transition was silently omitted from every replay,
+while `run_bybit_collector.BybitCollectorApp._apply_orderbook` recorded it
+live using the broader `before is not after` condition. Binance's comparator
+has no path that returns `is_resync_signal` (pinned by a new test,
+`test_binance_comparator_never_emits_a_resync_signal`, that exercises every
+id relationship it distinguishes), which is exactly why no existing
+Binance-only replay test ever exercised this. Fixed by matching live's
+condition and event-type choice exactly: `before is not after` records a
+transition, typed `SEQUENCE_GAP` if `after` lands on `SEQUENCE_GAP` or
+`RECOVERING`, else `RECOVERY`.
+
+**Second defect found while testing the fix above, also fixed:**
+`ReplayEngine._record_transition` read `previous_state`/`new_state` off
+`LocalBook.last_transition` rather than the `before`/`after` values the
+caller already had. `last_transition` is not updated by every state-changing
+path in `LocalBook` — `LocalBook.snapshot()` (the plain websocket-snapshot
+bridge Bybit's wire uses) changes state via `recovered()` without touching
+it, while Binance's `_attempt_bridge` does set it — so a Bybit recovery
+transition (`RECOVERING` → `VALID` via a fresh snapshot) was recorded with
+stale or absent `previous_state`/`new_state`, even after the first fix made
+replay attempt to record it at all. Fixed by changing `_record_transition`'s
+signature to take `before`/`after` explicitly at every call site, matching
+exactly what live's `_apply_orderbook` already does (compare its own local
+`before`/`after`, never a stored last-transition object) — removing the
+dependency on `LocalBook` remembering to set `last_transition` on every
+current and future state-changing path, rather than patching around one
+missing case.
+
+**Tests (new, 11):** `tests/test_replay_bybit_parity.py` —
+venue-aware adapter selection (default, explicit, case-insensitivity,
+unknown-venue rejection); a full Bybit session actually advancing the book
+end-to-end; a `REST_SNAPSHOT` frame refused for a non-Binance venue; a
+regression test proving `VALID → RECOVERING` is recorded (fails under the
+old `after is SEQUENCE_GAP` check, passes under the fix — verified by
+reverting the fix in a scratch copy and confirming the test fails, then
+restoring it); the symmetric `RECOVERING → VALID` recovery-recording test
+that caught the second defect above; a direct-drive parity test mirroring
+the existing `test_replay_reconstruction_matches_a_direct_book_drive` for
+Bybit; and the Binance-comparator invariant test. Full suite: **520 passed**
+(509 + 11 new). No existing test was changed.
+
+**Not claimed:**
+- Only Binance and Bybit are wired into `_ADAPTER_CLASSES`. OKX has no
+  replay support and is not claimed here — Phase 7's raw-capture work
+  predates OKX's adapter having a stable enough shape for this, and D11 (OKX
+  channel schema verification) is still open per the Phase 6/7 notes above.
+- Bybit's own live-collector code path (`run_bybit_collector.py`) was read
+  for parity but not modified or re-tested in this pass; only replay changed.
+- Multi-exchange storage namespace collision (`raw_wire`/`quality_events`
+  stream-name collision between OKX and Binance, noted in Phase 7) is
+  unrelated to this fix and remains open.
+
 ### Phase 9 — Leakage-safe label horizons and chronological splits — **PARTIAL, VERIFIED**
 
 **Provenance.** Found as uncommitted work in the shared container (branch
