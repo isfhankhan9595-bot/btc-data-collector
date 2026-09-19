@@ -720,7 +720,18 @@ two existing test files — 39 in the batch group, all passing. Full suite:
   list) is distinct from the chronological single-pass split here and is not
   built.
 
-### Storage-namespace phase — multi-venue stream namespaces and single-writer locks — **IMPLEMENTED, TESTED; not COMPLETE until merged (main ancestry is recorded on the PR)**
+### Storage-namespace phase — multi-venue stream namespaces and single-writer locks — **COMPLETE**
+
+**Post-merge verification (independent, this session).** PR #19 merged as
+`1c5d44e`. Confirmed: `1c5d44e` is current `origin/main` HEAD; `d2e2ea1`
+(PR #19 base) and `7b04078` (storage-namespace commit) are both ancestors
+of `main` via `git merge-base --is-ancestor`; full suite re-run clean —
+**538 passed**; latest CI check-run on `1c5d44e` is `success`. Re-read of
+`storage_layout.py` and `parquet_writer.py` confirms the writer lock is
+acquired before sequence allocation and orphan recovery in `__init__`, so a
+second writer's construction fails at the lock, before it can reach either —
+this is what makes S2/S3 structurally impossible rather than merely
+untriggered in tests.
 
 **Provenance.** The previous session's OKX renames were never pushed and were
 not present in the repository when this session began (`main` @ `d2e2ea1`,
