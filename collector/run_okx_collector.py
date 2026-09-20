@@ -203,6 +203,14 @@ class OKXCollectorApp:
             "timestamp": event.local_receive_ts,
             "exchange_timestamp": event.exchange_event_ts,
             "local_timestamp": event.local_receive_ts,
+            # event.instrument is set (or deliberately left None) by
+            # OKXAdapter.normalize() itself -- see its per-channel
+            # _instrument_scoped exceptions (index-tickers is the index
+            # pair, not the swap; liquidation-orders is only identified
+            # when its own inst_id matches this adapter's configured
+            # instrument). Nothing here re-derives or overrides that
+            # decision; a None here is exactly as meaningful as a key.
+            "instrument_key": event.instrument.key if event.instrument else None,
         }
         if isinstance(event, CanonicalTradeEvent):
             writer = self.trades_all_writer if event.stream == "trades-all" else self.trades_writer

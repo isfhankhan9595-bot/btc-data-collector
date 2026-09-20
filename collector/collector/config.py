@@ -148,7 +148,11 @@ BYBIT_ORDERBOOK_SCHEMA = pa.schema([
     ("update_id", pa.int64()),
     ("sequence", pa.int64()),
     ("is_snapshot", pa.bool_()),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_orderbook", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "bybit_orderbook", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key (InstrumentId.key, e.g. "
+                          "'BYBIT|linear_perpetual|BTC-USDT|BTCUSDT'); missing on rows "
+                          "written before this version, never fabricated for them"})
 
 BYBIT_TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -161,7 +165,9 @@ BYBIT_TRADES_SCHEMA = pa.schema([
     ("venue_sequence", pa.int64()),
     ("block_trade", pa.bool_()),
     ("rpi", pa.bool_()),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_trades", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "bybit_trades", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key; see bybit_orderbook v1.1 note"})
 
 BYBIT_MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -172,7 +178,9 @@ BYBIT_MARKPRICE_SCHEMA = pa.schema([
     ("funding_rate", pa.float64()),
     ("next_funding_time", pa.int64()),
     ("carried_forward", pa.list_(pa.string())),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_markprice", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "bybit_markprice", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key; see bybit_orderbook v1.1 note"})
 
 BYBIT_OPENINTEREST_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -182,8 +190,11 @@ BYBIT_OPENINTEREST_SCHEMA = pa.schema([
     # Unit of open_interest (OIUnit value). UNKNOWN for Bybit: see the adapter.
     ("oi_unit", pa.string()),
     ("carried_forward", pa.list_(pa.string())),
-], metadata={"schema_version": "1.1", "stream_name": "bybit_openinterest", "symbol": SYMBOL,
-             "note": "1.1 adds oi_unit; open_interest unit is UNKNOWN and must not be compared across venues"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.2", "stream_name": "bybit_openinterest", "symbol": SYMBOL,
+             "note": "1.1 adds oi_unit; open_interest unit is UNKNOWN and must not be compared across venues",
+             "migration": "v1.2 adds nullable instrument_key; see bybit_orderbook v1.1 note "
+                          "(this schema was already at 1.1, so this is 1.1 -> 1.2, not 1.0 -> 1.1)"})
 
 BYBIT_LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -192,7 +203,9 @@ BYBIT_LIQUIDATION_SCHEMA = pa.schema([
     ("side", pa.string()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_liquidation", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "bybit_liquidation", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key; see bybit_orderbook v1.1 note"})
 
 BINANCE_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),  # Canonical local processing timestamp.
@@ -241,7 +254,9 @@ OKX_TRADES_SCHEMA = pa.schema([
     ("quantity", pa.float64()),
     ("side", pa.string()),
     ("venue_sequence", pa.int64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_trades", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_trades", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key (OKX_SWAP_BTCUSDT.key); this channel is always instId-scoped, so a null here means legacy row, never a genuine unidentified trade"})
 
 OKX_TRADES_ALL_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -253,23 +268,29 @@ OKX_TRADES_ALL_SCHEMA = pa.schema([
     ("side", pa.string()),
     ("venue_sequence", pa.int64()),
     ("source", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_trades_all", "symbol": SYMBOL,
-             "note": "Distinct channel from okx_trades -- see docs/OKX_D11_CHANNEL_SCHEMAS.md"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_trades_all", "symbol": SYMBOL,
+             "note": "Distinct channel from okx_trades -- see docs/OKX_D11_CHANNEL_SCHEMAS.md",
+             "migration": "v1.1 adds nullable instrument_key; see okx_trades v1.1 note"})
 
 OKX_MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("mark_price", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_markprice", "symbol": SYMBOL,
-             "note": "mark-price channel only; never populated from index-tickers or funding-rate"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_markprice", "symbol": SYMBOL,
+             "note": "mark-price channel only; never populated from index-tickers or funding-rate",
+             "migration": "v1.1 adds nullable instrument_key; see okx_trades v1.1 note"})
 
 OKX_INDEXTICKERS_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("index_price", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_indextickers", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_indextickers", "symbol": SYMBOL,
+             "note": "instrument_key is ALWAYS null here, deliberately: this channel is keyed by the index pair, not the swap instrument (OKX_D11 open question #3) -- a value here would be a fabricated identity, not a resolved one"})
 
 OKX_FUNDINGRATE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -288,8 +309,10 @@ OKX_FUNDINGRATE_SCHEMA = pa.schema([
     ("formula_type", pa.string()),
     ("method", pa.string()),
     ("impact_value", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_fundingrate", "symbol": SYMBOL,
-             "note": "current(funding_rate/funding_time), next, and settled are three distinct observations, never merged"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_fundingrate", "symbol": SYMBOL,
+             "note": "current(funding_rate/funding_time), next, and settled are three distinct observations, never merged",
+             "migration": "v1.1 adds nullable instrument_key; see okx_trades v1.1 note"})
 
 OKX_OPENINTEREST_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -300,8 +323,10 @@ OKX_OPENINTEREST_SCHEMA = pa.schema([
     ("oi_usd", pa.float64()),
     # Unit of open_interest (OIUnit value): CONTRACTS for OKX.
     ("oi_unit", pa.string()),
-], metadata={"schema_version": "1.1", "stream_name": "okx_openinterest", "symbol": SYMBOL,
-             "note": "open_interest is contracts (oi field); oi_ccy (base currency)/oi_usd preserved alongside, not merged; 1.1 adds oi_unit"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.2", "stream_name": "okx_openinterest", "symbol": SYMBOL,
+             "note": "open_interest is contracts (oi field); oi_ccy (base currency)/oi_usd preserved alongside, not merged; 1.1 adds oi_unit",
+             "migration": "v1.2 adds nullable instrument_key (already at 1.1, so 1.1 -> 1.2, not 1.0 -> 1.1); see okx_trades v1.1 note"})
 
 OKX_LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -316,8 +341,14 @@ OKX_LIQUIDATION_SCHEMA = pa.schema([
     ("pos_side", pa.string()),
     ("inst_family", pa.string()),
     ("uly", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_liquidation", "symbol": SYMBOL,
-             "note": "subscription is instType-scoped; inst_id column lets downstream filter to BTC-USDT-SWAP"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "okx_liquidation", "symbol": SYMBOL,
+             "note": "subscription is instType-scoped; inst_id column lets downstream filter to BTC-USDT-SWAP",
+             "migration": "v1.1 adds instrument_key, resolved per-row from inst_id: BTC-USDT-SWAP rows "
+                          "get OKX_SWAP_BTCUSDT.key, every other instrument's rows get null -- inst_id "
+                          "remains the raw column (never removed), instrument_key is the resolved one; "
+                          "a null here is a genuine other-instrument liquidation, not a legacy row, since "
+                          "this stream is multi-instrument by design"})
 
 
 # Binance Spot canonical schemas (P5). Own spot_-prefixed streams via

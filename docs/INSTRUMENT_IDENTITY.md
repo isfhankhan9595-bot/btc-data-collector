@@ -77,6 +77,43 @@ returns, so no adapter can forget. It refuses an event whose `exchange` or
   events); `MarketState.instrument` and its `digest()` carry the identity. An
   unbound engine behaves as before.
 
+## Storage: canonical Parquet schemas
+
+`instrument_key` (`InstrumentId.key`, nullable string) added to Bybit's five
+canonical schemas (`bybit_orderbook`, `bybit_trades`, `bybit_markprice`,
+`bybit_openinterest`, `bybit_liquidation` — versions bumped, migration notes
+in each schema's metadata) and OKX's six non-book schemas (`okx_trades`,
+`okx_trades_all`, `okx_markprice`, `okx_indextickers`, `okx_fundingrate`,
+`okx_openinterest`, `okx_liquidation`).
+
+Bybit stamps a single validated constant (`BYBIT_LINEAR_BTCUSDT.key`) in the
+runner, not a per-event resolution: `run_bybit_collector.py`'s five topics
+are all built from one hardcoded `SYMBOL` constant, so the process cannot
+receive any other instrument — there is no per-event field to disagree with.
+`BybitAdapter` itself does not set `.instrument` (unlike OKX below), so this
+is the runner's own responsibility.
+
+OKX stamps `event.instrument.key` where `event.instrument` is already set by
+the generic base-class mechanism described above — the runner does no
+resolution of its own, just reads what the adapter already decided. This
+means `okx_indextickers` rows and non-BTC `okx_liquidation` rows correctly
+persist `instrument_key = NULL`, not because the runner special-cased them,
+but because `_instrument_scoped` already said so at the adapter layer.
+
+**Reading these rows back:** `resolve_canonical_instrument_key(row, expected=...)`
+distinguishes four states a naive reader would conflate: column absent
+(legacy row) and explicit null both resolve to `None`; a value that parses
+but disagrees with the row's own stream identity raises
+`InstrumentIdError` rather than being silently accepted (a Binance-Spot key
+sitting in a Bybit row is corruption, not an unusual-but-valid identity).
+
+**Not yet wired:** Binance USD-M (`run_collector.py`) and Binance Spot
+(`run_binance_spot_collector.py`) canonical writers do not yet persist
+`instrument_key`. `BinanceAdapter` does not set `.instrument` either, so
+(unlike OKX) there is nothing to read from the event yet for that venue —
+this needs the same validated-constant treatment Bybit got, applied
+case-by-case per the legacy-handler caveats below, not a blanket stamp.
+
 ## Intentionally not part of identity
 
 Tick/lot size, contract value, margin currency, listing status, index
@@ -84,10 +121,12 @@ membership, display symbol, and the storage namespace (`BINANCE_SPOT`).
 
 ## Limitations
 
-- **Canonical derived streams** (`spot_trades`, `okx_trades`, ...) carry no
-  explicit instrument column; their identity is implied by the venue namespace
-  plus schema metadata. Add an explicit `instrument_key` column before any
-  aggregation or cross-venue dataset is built on them.
+- **Binance canonical derived streams** (`spot_trades`, and USD-M's
+  `orderbook`/`trades`/`markprice`/`openinterest`/`liquidation`) still carry
+  no `instrument_key` column; their identity is implied by the venue
+  namespace plus schema metadata only. Bybit and OKX's non-book streams got
+  this column in the same session that wrote this limitation list, Binance
+  did not yet — see "Storage: canonical Parquet schemas" above.
 - Namespaces are single-instrument. A second instrument on one venue needs its
   own registry entry, adapter binding and namespace; replay does not yet
   cross-check each row's `symbol` against the adapter's instrument.

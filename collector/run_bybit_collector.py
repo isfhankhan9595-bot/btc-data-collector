@@ -73,6 +73,7 @@ from collector.collector.config import (
     SYMBOL,
 )
 from collector.collector.backoff import ExponentialBackoff
+from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
@@ -211,6 +212,18 @@ class BybitCollectorApp:
             "timestamp": event.local_receive_ts,
             "exchange_timestamp": event.exchange_event_ts,
             "local_timestamp": event.local_receive_ts,
+            # Every one of this runner's five canonical writers is safe to
+            # stamp with a single validated constant, not a per-event
+            # resolution: _topics() builds every subscription from the one
+            # module-level SYMBOL constant (config.py), so this process
+            # cannot receive any instrument other than BYBIT_LINEAR_BTCUSDT
+            # -- there is no other symbol for the wire to disagree with.
+            # BybitAdapter does not itself attach an InstrumentId to events
+            # (unlike the OKX/Binance adapter paths), so there is nothing
+            # from the event to prefer here; this is not a shortcut around
+            # a per-event identity that exists elsewhere and is being
+            # skipped, there simply is none.
+            "instrument_key": BYBIT_LINEAR_BTCUSDT.key,
         }
         if isinstance(event, CanonicalOrderBookEvent):
             self._apply_orderbook(event, base)
