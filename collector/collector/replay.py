@@ -67,6 +67,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from .adapters.binance import BinanceAdapter
+from .adapters.binance_spot import BinanceSpotAdapter
 from .binance_oi import BinanceOIParseError, normalize_binance_oi
 from .adapters.bybit import BybitAdapter
 from .adapters.okx import OKXAdapter
@@ -366,6 +367,12 @@ _ADAPTER_CLASSES: dict[str, type] = {
     "BINANCE": BinanceAdapter,
     "BYBIT": BybitAdapter,
     "OKX": OKXAdapter,
+    # P5: a distinct storage/book-engine venue from "BINANCE" -- see
+    # adapters/binance_spot.py's module docstring for the identity split
+    # (canonical events carry exchange="BINANCE", market_type="spot";
+    # this key is the replay/storage-internal one, matching LocalBook and
+    # storage_layout.VENUE_STREAM_PREFIX).
+    "BINANCE_SPOT": BinanceSpotAdapter,
 }
 
 
@@ -483,6 +490,21 @@ class ReplayEngine:
             before = self.book.state.state
             applied = self.book.apply(event)
             after = self.book.state.state
+            if applied is None and self.book.previous is None:
+                # This diff was buffered while unbridged (or the book is
+                # still RECOVERING). A retained "ahead of buffer" snapshot
+                # (see book_engine.LocalBook.binance_snapshot's docstring)
+                # deserves a chance against the now-larger buffer -- mirrors
+                # run_binance_spot_collector._apply_orderbook's live
+                # behaviour exactly, so live and replay treat a pending
+                # snapshot identically rather than replay silently rejecting
+                # what live would have bridged on the next diff.
+                if self.book.retry_pending_snapshot():
+                    after = self.book.state.state
+                    self.result.snapshots_applied += 1
+                    for pending_applied, event_kind, generation in self.book.committed_recovery_events:
+                        self._record_book(pending_applied, event_kind, generation)
+                    self.book.committed_recovery_events = []
             if before is not after:
                 # Match live exactly (see run_bybit_collector._apply_orderbook):
                 # any state change is recorded, not only a transition that
@@ -562,15 +584,16 @@ class ReplayEngine:
 
     def _handle_snapshot(self, frame: ReplayFrame) -> None:
         self.result.frames_snapshot += 1
-        if self.venue != "BINANCE":
-            # Only Binance bridges a gap with a REST snapshot; Bybit's
-            # snapshot arrives on the wire itself (``type": "snapshot"``,
-            # see BybitAdapter.normalize) and is handled by _handle_wire via
-            # LocalBook.snapshot(), never here. A REST_SNAPSHOT frame for
-            # any other venue means the recorded data does not match this
-            # venue's protocol -- treating it as Binance's ``lastUpdateId``
-            # format would either crash on the wrong shape or, worse, parse
-            # by coincidence and silently corrupt the book.
+        if self.venue not in ("BINANCE", "BINANCE_SPOT"):
+            # Only Binance (USD-M futures and Spot) bridges a gap with a REST
+            # snapshot; Bybit's snapshot arrives on the wire itself
+            # (``type": "snapshot"``, see BybitAdapter.normalize) and is
+            # handled by _handle_wire via LocalBook.snapshot(), never here. A
+            # REST_SNAPSHOT frame for any other venue means the recorded data
+            # does not match this venue's protocol -- treating it as
+            # Binance's ``lastUpdateId`` format would either crash on the
+            # wrong shape or, worse, parse by coincidence and silently
+            # corrupt the book.
             self.result.frames_unhandled += 1
             self.result.quality_events.append({
                 "event_type": QualityEventType.ERROR.value,
@@ -609,8 +632,17 @@ class ReplayEngine:
             })
             return
 
+        # Canonical identity: exchange is always "BINANCE" (Spot is not a
+        # separate exchange -- see adapters/binance_spot.py's module
+        # docstring); self.venue ("BINANCE" vs "BINANCE_SPOT") is the
+        # storage/book-engine key, not the canonical exchange field, so it
+        # must never be written into CanonicalOrderBookEvent.exchange
+        # directly or a Spot snapshot would compare unequal to every diff
+        # BinanceSpotAdapter itself produces for the exact same book.
+        is_spot = self.venue == "BINANCE_SPOT"
         snapshot_event = CanonicalOrderBookEvent(
-            self.venue, "orderbook", None, None, frame.timestamp_ms,
+            "BINANCE", "spot_orderbook" if is_spot else "orderbook", None, None,
+            frame.timestamp_ms, market_type="spot" if is_spot else "linear_perpetual",
             local_process_ts=frame.timestamp_ms, bids=bids, asks=asks,
             update_id=last_update_id, is_snapshot=True,
             book_source="DIFF_DEPTH_RECONSTRUCTED",
@@ -618,6 +650,14 @@ class ReplayEngine:
         before = self.book.state.state
         if not self.book.binance_snapshot(last_update_id, snapshot_event):
             after = self.book.state.state
+            if self.book.last_reason == "snapshot_ahead_of_buffer":
+                # Not a rejection: every buffered diff has u < lastUpdateId,
+                # so a later diff will straddle it and retry_pending_snapshot
+                # (called from _handle_wire above) will bridge it then. This
+                # mirrors the live runner's identical distinction -- see
+                # run_binance_spot_collector._recover_book.
+                self._drain_book_quality()
+                return
             self.result.snapshots_rejected += 1
             self._record_transition(self.book.last_reason or "snapshot_rejected",
                                     QualityEventType.ERROR.value, before, after)
