@@ -15,10 +15,11 @@ from pathlib import Path
 import pytest
 
 from collector.collector.canonical import CanonicalTradeEvent
+from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT, OKX_SWAP_BTCUSDT
 from collector.collector.replay import FrameKind, ReplayEngine, ReplayFrame, ReplaySource
 from collector.pipeline import cross_exchange_alignment as module
 from collector.pipeline.cross_exchange_alignment import (
-    AlignedObservation, AlignmentStatus, alignment_key, causally_align,
+    AlignedObservation, AlignmentStatus, UNIDENTIFIED as UNID, alignment_key, causally_align,
 )
 
 T = 1_780_000_000_000
@@ -42,25 +43,25 @@ def align(events, ts=T, **kw):
 
 def test_three_venues_remain_separate_keys():
     out = align([trade(e, recv=T) for e in ("BINANCE", "BYBIT", "OKX")])
-    assert set(out) == {(e, PERP, "trades") for e in ("BINANCE", "BYBIT", "OKX")}
+    assert set(out) == {(e, PERP, UNID, "trades") for e in ("BINANCE", "BYBIT", "OKX")}
 
 
 def test_same_exchange_same_stream_keeps_only_the_latest():
     out = align([trade(recv=T - 50, price=1.0), trade(recv=T - 10, price=2.0)])
-    assert len(out) == 1 and out[("BINANCE", PERP, "trades")].event.price == 2.0
+    assert len(out) == 1 and out[("BINANCE", PERP, UNID, "trades")].event.price == 2.0
 
 
 def test_perp_and_spot_of_one_exchange_and_stream_cannot_collide():
     perp, spot = trade(recv=T - 5, price=1.0), trade(recv=T - 1, price=2.0, market_type="spot")
     out = align([perp, spot])
-    assert out[("BINANCE", PERP, "trades")].event is perp
-    assert out[("BINANCE", "spot", "trades")].event is spot
+    assert out[("BINANCE", PERP, UNID, "trades")].event is perp
+    assert out[("BINANCE", "spot", UNID, "trades")].event is spot
 
 
 def test_different_streams_are_independent():
     out = align([trade(stream="trades", recv=T - 900), trade(stream="markprice", recv=T - 1)])
-    assert out[("BINANCE", PERP, "trades")].age_ms == 900
-    assert out[("BINANCE", PERP, "markprice")].age_ms == 1
+    assert out[("BINANCE", PERP, UNID, "trades")].age_ms == 900
+    assert out[("BINANCE", PERP, UNID, "markprice")].age_ms == 1
 
 
 # -- causal timestamp semantics ------------------------------------------------
@@ -83,13 +84,13 @@ def test_observation_boundary_is_inclusive_and_one_ms_later_is_excluded(recv, vi
 
 def test_no_nearest_timestamp_behavior_an_older_eligible_event_beats_a_nearer_future_one():
     older, nearer_future = trade(recv=T - 400, price=1.0), trade(recv=T + 1, price=2.0)
-    assert align([nearer_future, older])[("BINANCE", PERP, "trades")].event is older
+    assert align([nearer_future, older])[("BINANCE", PERP, UNID, "trades")].event is older
 
 
 def test_everything_in_the_future_yields_nothing_unless_expected():
     future = [trade(recv=T + 1), trade("BYBIT", recv=T + 9)]
     assert align(future) == {}
-    exp = [("BINANCE", PERP, "trades"), ("BYBIT", PERP, "trades")]
+    exp = [("BINANCE", PERP, UNID, "trades"), ("BYBIT", PERP, UNID, "trades")]
     assert {k: v.status for k, v in align(future, expected_keys=exp).items()} == {
         k: AlignmentStatus.NEVER_OBSERVED for k in exp}
 
@@ -98,9 +99,9 @@ def test_everything_in_the_future_yields_nothing_unless_expected():
 
 def test_exact_timestamp_tie_is_deterministic_last_input_wins():
     a, b = trade(recv=T - 5, price=1.0), trade(recv=T - 5, price=2.0)
-    assert align([a, b])[("BINANCE", PERP, "trades")].event is b
+    assert align([a, b])[("BINANCE", PERP, UNID, "trades")].event is b
     assert align([a, b]) == align([a, b])
-    assert align([b, a])[("BINANCE", PERP, "trades")].event is a     # documented: ties follow input order
+    assert align([b, a])[("BINANCE", PERP, UNID, "trades")].event is a     # documented: ties follow input order
 
 
 def test_out_of_order_input_does_not_change_the_result():
@@ -114,18 +115,18 @@ def test_out_of_order_input_does_not_change_the_result():
 # -- missingness ----------------------------------------------------------------
 
 def test_expected_but_never_observed_is_reported_not_fabricated():
-    key = ("OKX", PERP, "trades")
+    key = ("OKX", PERP, UNID, "trades")
     out = align([trade(recv=T)], expected_keys=[key])
     assert out[key] == AlignedObservation(key, None, None, AlignmentStatus.NEVER_OBSERVED)
 
 
 def test_unrequested_absent_stream_stays_absent():
     out = align([trade(recv=T)])
-    assert ("OKX", PERP, "trades") not in out and len(out) == 1
+    assert ("OKX", PERP, UNID, "trades") not in out and len(out) == 1
 
 
 def test_expected_key_that_was_observed_is_not_overwritten_by_never_observed():
-    key = ("BINANCE", PERP, "trades")
+    key = ("BINANCE", PERP, UNID, "trades")
     assert align([trade(recv=T)], expected_keys=[key])[key].status is AlignmentStatus.AVAILABLE
 
 
@@ -133,14 +134,14 @@ def test_expected_key_that_was_observed_is_not_overwritten_by_never_observed():
 
 def test_stale_observation_is_returned_as_stale_never_dropped_or_relabelled():
     old = trade(recv=T - 5_000)
-    obs = align([old], staleness_ms=1_000)[("BINANCE", PERP, "trades")]
+    obs = align([old], staleness_ms=1_000)[("BINANCE", PERP, UNID, "trades")]
     assert obs.status is AlignmentStatus.STALE and obs.event is old and obs.age_ms == 5_000
 
 
 @pytest.mark.parametrize("age,status", [(999, AlignmentStatus.AVAILABLE), (1_000, AlignmentStatus.AVAILABLE),
                                         (1_001, AlignmentStatus.STALE)])
 def test_freshness_boundary(age, status):
-    assert align([trade(recv=T - age)], staleness_ms=1_000)[("BINANCE", PERP, "trades")].status is status
+    assert align([trade(recv=T - age)], staleness_ms=1_000)[("BINANCE", PERP, UNID, "trades")].status is status
 
 
 def test_staleness_is_required_and_validated():
@@ -183,7 +184,7 @@ def test_original_event_is_returned_untouched_with_exchange_timestamps_verbatim(
 
 @pytest.mark.parametrize("quality", ["SEQUENCE_GAP", "RECOVERING", "INVALID"])
 def test_availability_does_not_imply_quality(quality):
-    obs = align([trade(recv=T - 1, quality=quality)])[("BINANCE", PERP, "trades")]
+    obs = align([trade(recv=T - 1, quality=quality)])[("BINANCE", PERP, UNID, "trades")]
     assert obs.status is AlignmentStatus.AVAILABLE and obs.event.quality_state == quality
 
 
@@ -193,7 +194,7 @@ def test_venues_with_different_receive_latency_are_judged_independently():
     bybit = trade("BYBIT", recv=exchange_ts + 5, ex_ts=exchange_ts)
     at = exchange_ts + 100                                                  # same exchange time, T=+100
     out = causally_align([binance, bybit], at, staleness_ms=1_000)
-    assert set(out) == {("BYBIT", PERP, "trades")}                          # Binance not yet received
+    assert set(out) == {("BYBIT", PERP, UNID, "trades")}                          # Binance not yet received
 
 
 def test_no_synchronized_or_current_status_exists():
@@ -239,6 +240,6 @@ def test_replay_produced_events_align_deterministically_and_causally():
     first = align(events)
     assert first == align(_replayed_events())                    # replay twice -> identical alignment
     assert first == align(list(reversed(events)))
-    bybit = first[("BYBIT", PERP, "trades")]
+    bybit = first[("BYBIT", PERP, BYBIT_LINEAR_BTCUSDT.key, "trades")]
     assert bybit.event.trade_id == "b1" and bybit.age_ms == 40   # the T+10 replay frame is not yet known
-    assert first[("OKX", PERP, "trades")].age_ms == 5
+    assert first[("OKX", PERP, OKX_SWAP_BTCUSDT.key, "trades")].age_ms == 5

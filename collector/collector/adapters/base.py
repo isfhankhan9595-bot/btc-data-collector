@@ -17,9 +17,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
+import functools
+from dataclasses import dataclass, replace as _replace
 from enum import Enum
 from typing import Any, Callable, Iterable, Optional
+
+from ..canonical import CanonicalEvent
+from ..instrument import InstrumentId, InstrumentIdError
 
 #: Bounded so a misbehaving venue cannot grow this without limit.
 UNHANDLED_BUFFER_MAX = 256
@@ -72,6 +76,44 @@ class ExchangeAdapter(ABC):
     #: Declaring them here makes the gap explicit in code and in tests
     #: instead of leaving it to be discovered by reading an early return.
     unimplemented_channels: frozenset[str] = frozenset()
+    #: The instrument this adapter's events are about; ``None`` when the adapter
+    #: is configured for an instrument outside the registry (never a fake one).
+    instrument: Optional[InstrumentId] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Make every concrete ``normalize()`` stamp its events with the adapter's
+        instrument, so no adapter (present or future) can forget to."""
+        super().__init_subclass__(**kwargs)
+        impl = cls.__dict__.get("normalize")
+        if impl is None or getattr(impl, "_stamps_instrument", False):
+            return
+
+        @functools.wraps(impl)
+        def normalize(self, raw, *, local_receive_ts=None):
+            return self._stamp_instrument(impl(self, raw, local_receive_ts=local_receive_ts))
+
+        normalize._stamps_instrument = True  # type: ignore[attr-defined]
+        cls.normalize = normalize  # type: ignore[method-assign]
+
+    def _instrument_scoped(self, event: Any) -> bool:
+        """Whether ``event`` is about this adapter's instrument. Override where a
+        channel is not scoped to it (see the OKX adapter)."""
+        return True
+
+    def _stamp_instrument(self, events: Any) -> Any:
+        instrument = self.instrument
+        if instrument is None or not isinstance(events, list):
+            return events
+        stamped = []
+        for event in events:
+            if isinstance(event, CanonicalEvent) and event.instrument is None and self._instrument_scoped(event):
+                if (event.exchange, event.market_type) != (instrument.exchange, instrument.market_type):
+                    raise InstrumentIdError(
+                        f"{type(self).__name__} produced an event for ({event.exchange!r}, "
+                        f"{event.market_type!r}) but is bound to {instrument.key}")
+                event = _replace(event, instrument=instrument)
+            stamped.append(event)
+        return stamped
 
     def __init__(self) -> None:
         self._unhandled: deque[UnhandledMessage] = deque(maxlen=UNHANDLED_BUFFER_MAX)

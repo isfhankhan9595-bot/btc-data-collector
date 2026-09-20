@@ -73,6 +73,8 @@ def _int(value: Any) -> Optional[int]:
         return None
 
 
+from ..instrument import MARKET_LINEAR_PERPETUAL, resolve_instrument
+
 class OKXAdapter(ExchangeAdapter):
     venue = "OKX"
     channel_event_types = {
@@ -118,6 +120,9 @@ class OKXAdapter(ExchangeAdapter):
     def __init__(self, inst_id: str = "BTC-USDT-SWAP", index_inst_id: str = "BTC-USDT") -> None:
         super().__init__()
         self.inst_id = inst_id
+        #: ``None`` if ``inst_id`` is not a registered instrument: unidentified,
+        #: never a guessed identity.
+        self.instrument = resolve_instrument("OKX", MARKET_LINEAR_PERPETUAL, inst_id)
         #: See subscribe_message docstring: unverified against a live
         #: connection (open question #3). Overridable, not hardcoded deep
         #: in normalize(), so a wrong guess is one constructor argument
@@ -126,6 +131,17 @@ class OKXAdapter(ExchangeAdapter):
 
     def route_message(self, raw):
         return raw.get("arg", {}).get("channel")
+
+    def _instrument_scoped(self, event) -> bool:
+        # `index-tickers` is keyed by the index pair (BTC-USDT), not the swap:
+        # OKX open question #3, so it is not stamped with the swap's identity.
+        if event.stream == "index-tickers":
+            return False
+        # `liquidation-orders` is instType-scoped: one stream, many instruments.
+        # Only rows whose own instId is this adapter's instrument are identified.
+        if event.stream == "liquidation-orders":
+            return getattr(event, "inst_id", None) == self.inst_id
+        return True
 
     def normalize(self, raw, *, local_receive_ts: Optional[int] = None):
         now = int(time.time() * 1000) if local_receive_ts is None else local_receive_ts

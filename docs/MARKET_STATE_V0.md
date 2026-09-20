@@ -15,7 +15,7 @@ received by a given moment.
   exchange (`update()` raises if given an event from another venue).
   `pipeline/cross_exchange_alignment.py` is a separate module (P6,
   `tests/test_cross_exchange_alignment.py`, 33 tests, keyed on
-  `(exchange, market_type, stream)` with causal
+  `(exchange, market_type, instrument_key, stream)` with causal
   `local_receive_ts <= observation_ts` availability) that this engine does
   not consume — deliberately out of scope for V0 regardless, not because
   the alignment primitive is unverified.

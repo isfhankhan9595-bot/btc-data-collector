@@ -1354,3 +1354,26 @@ registration):**
   was explicitly out of scope (task's own §20).
 - Whether `aggTrade` should also be collected for Spot remains an open
   question, unchanged from the prior pass -- not decided here either.
+
+### First-class instrument identity — **IMPLEMENTED, TESTED; not COMPLETE until merged (ancestry recorded on the PR)**
+
+Base `main` @ `3be06f7`, 781 tests. New: `collector/collector/instrument.py`,
+`docs/INSTRUMENT_IDENTITY.md`, `tests/test_instrument_identity.py` (71).
+
+- Real defect found: `MarketStateEngine("BINANCE")` accepted Binance Spot and USD-M
+  events into one state (`BinanceSpotAdapter.venue == "BINANCE_SPOT"` but its events
+  carry `exchange="BINANCE"`). Engines can now be bound to an instrument and refuse others.
+- `InstrumentId(exchange, market_type, instrument, native_symbol)`: strict, immutable,
+  all four fields in equality; existing market-type vocabulary reused; `None` = unidentified
+  (no UNKNOWN identity). A base-class hook stamps every adapter's events and refuses
+  contradictions. OKX `index-tickers` and non-BTC `liquidation-orders` rows are deliberately
+  unidentified.
+- Alignment key is now `(exchange, market_type, instrument_key, stream)`; semantics unchanged.
+  16 existing alignment assertions were updated for the new key shape (no test removed or weakened).
+- Mutation-checked: dropping exchange / market_type / instrument / native_symbol from the key
+  fails 6 / 7 / 5 / 5; unwiring the alignment key 4; disabling stamping 9; dropping the MarketState
+  guard 1; resolving BINANCE_SPOT+perpetual rows to perp 1; stamping every OKX liquidation as BTC 1.
+
+**Not claimed:** canonical derived streams have no explicit instrument column (raw layer does);
+namespaces are single-instrument and replay does not cross-check a row's `symbol` against the
+adapter; Bybit spot / COIN-M / inverse unregistered; no live verification.

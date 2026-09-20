@@ -12,8 +12,11 @@ Rules
   eligibility: an event stamped an hour ago but received after T is invisible
   at T, and one stamped in the future but received by T is visible. Both
   exchange timestamps are preserved verbatim on the original event.
-* **Identity** is ``(exchange, market_type, stream)``, so a venue's perpetual
-  and spot feeds of the same stream name cannot collide.
+* **Identity** is ``(exchange, market_type, instrument_key, stream)``, where
+  ``instrument_key`` is the event's first-class ``InstrumentId.key`` (or
+  ``UNIDENTIFIED`` for an event without one), so different instruments of one
+  stream name cannot collide: Binance spot vs perpetual, or BTCUSDT on Bybit
+  vs BTC-USDT-SWAP on OKX.
 * **Latest wins**, per key, among eligible events. There is no nearest-
   timestamp matching and no interpolation.
 * **Staleness is explicit.** The caller must pass ``staleness_ms``; a stale
@@ -30,11 +33,10 @@ Ties: two eligible events with the same key *and* the same ``local_receive_ts``
 resolve by input order (the later one in the input wins). Everything else is
 independent of input order.
 
-Limitation (deliberate): canonical events carry no instrument/symbol field. The
-collector is configured for a single instrument, so ``(exchange, market_type,
-stream)`` is sufficient *today*. Once a second instrument is collected,
-canonical identity must gain an instrument before cross-instrument alignment is
-safe; this module does not guess one.
+Unidentified events (``instrument is None``: legacy data, or channels not
+scoped to one registered instrument) share the ``UNIDENTIFIED`` slot per
+``(exchange, market_type, stream)``. They never collide with an identified
+event, but two unidentified events of one stream do, exactly as before.
 
 Pure: no clock, no network, no randomness, no global state.
 """
@@ -44,10 +46,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Optional
 
-__all__ = ["AlignmentKey", "AlignmentStatus", "AlignedObservation", "alignment_key", "causally_align"]
+__all__ = ["AlignmentKey", "UNIDENTIFIED", "AlignmentStatus", "AlignedObservation", "alignment_key", "causally_align"]
 
-#: (exchange, market_type, stream)
-AlignmentKey = tuple[str, str, str]
+#: (exchange, market_type, instrument_key, stream)
+UNIDENTIFIED = "<unidentified>"
+AlignmentKey = tuple[str, str, str, str]
 
 
 class AlignmentStatus(str, Enum):
@@ -72,7 +75,9 @@ class AlignedObservation:
 
 
 def alignment_key(event: Any) -> AlignmentKey:
-    return (event.exchange, event.market_type, event.stream)
+    instrument = getattr(event, "instrument", None)
+    return (event.exchange, event.market_type,
+            instrument.key if instrument is not None else UNIDENTIFIED, event.stream)
 
 
 def _require_int(name: str, value: Any) -> int:
@@ -88,7 +93,7 @@ def causally_align(
     staleness_ms: int,
     expected_keys: Optional[Iterable[AlignmentKey]] = None,
 ) -> dict[AlignmentKey, AlignedObservation]:
-    """Latest eligible event per ``(exchange, market_type, stream)`` at ``observation_ts``.
+    """Latest eligible event per ``(exchange, market_type, instrument_key, stream)`` at ``observation_ts``.
 
     ``staleness_ms`` is required (no default): whether an old observation is
     still usable is the caller's decision and must not be made silently here.

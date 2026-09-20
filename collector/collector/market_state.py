@@ -35,7 +35,7 @@ One engine instance describes one exchange. Cross-exchange derived state
 is deliberately out of scope for V0 (see docs/MARKET_STATE_V0.md,
 "Non-goals") -- `cross_exchange_alignment.py` is a separate module (P6,
 `tests/test_cross_exchange_alignment.py`, 33 tests) keyed on
-`(exchange, market_type, stream)` identity with causal
+`(exchange, market_type, instrument_key, stream)` identity with causal
 `local_receive_ts <= observation_ts` availability. This engine does not
 consume it: building derived cross-venue state directly into a venue-local
 engine would still risk the "silently collapse two venues into one"
@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .book_engine import NON_AUTHORITATIVE_BOOK_SOURCES
+from .instrument import InstrumentId
 from .canonical import (
     CanonicalLiquidationEvent,
     CanonicalMarkPriceEvent,
@@ -172,6 +173,8 @@ class MarketState:
     trade_flow: TradeFlowState = field(default_factory=TradeFlowState)
     liquidation: LiquidationState = field(default_factory=LiquidationState)
     derivatives: DerivativesState = field(default_factory=DerivativesState)
+    #: The instrument this state describes (``None`` if the engine was not bound to one).
+    instrument: Optional[InstrumentId] = None
 
     def digest(self) -> str:
         """A stable string for replay-parity comparison.
@@ -186,7 +189,8 @@ class MarketState:
         """
         import hashlib
         parts = (
-            self.exchange, self.observation_ts,
+            self.exchange, self.instrument.key if self.instrument is not None else None,
+            self.observation_ts,
             self.price.last_trade_price, self.price.last_trade_ts,
             self.price.mark_price, self.price.index_price, self.price.mark_ts,
             self.price.mark_stale, self.price.price_vs_mark,
@@ -219,13 +223,16 @@ class MarketStateEngine:
     remember to perform.
     """
 
-    def __init__(self, exchange: str, *,
+    def __init__(self, exchange: str, *, instrument: Optional[InstrumentId] = None,
                 trade_flow_window_ms: int = DEFAULT_TRADE_FLOW_WINDOW_MS,
                 book_stale_ms: int = DEFAULT_BOOK_STALE_MS,
                 mark_stale_ms: int = DEFAULT_MARK_STALE_MS,
                 oi_stale_ms: int = DEFAULT_OI_STALE_MS,
                 funding_stale_ms: int = DEFAULT_FUNDING_STALE_MS) -> None:
         self.exchange = exchange
+        if instrument is not None and instrument.exchange != exchange:
+            raise ValueError(f"instrument {instrument.key} does not belong to exchange {exchange!r}")
+        self.instrument = instrument
         self._trade_flow_window_ms = trade_flow_window_ms
         self._book_stale_ms = book_stale_ms
         self._mark_stale_ms = mark_stale_ms
@@ -245,6 +252,11 @@ class MarketStateEngine:
                 f"venues into one instance is exactly the collapse this "
                 f"project's multi-venue rules forbid. Use a separate engine "
                 f"per exchange.")
+        if self.instrument is not None and event.instrument != self.instrument:
+            raise ValueError(
+                f"MarketStateEngine bound to {self.instrument.key} received an event for "
+                f"{event.instrument.key if event.instrument is not None else 'an unidentified instrument'}. "
+                f"Spot, perpetual and other venues' BTCUSDT are different instruments; use one engine each.")
         if isinstance(event, CanonicalTradeEvent):
             self._trades.append(event)
         elif isinstance(event, CanonicalOrderBookEvent):
@@ -282,7 +294,7 @@ class MarketStateEngine:
 
     def snapshot(self, observation_ts: int) -> MarketState:
         return MarketState(
-            exchange=self.exchange, observation_ts=observation_ts,
+            exchange=self.exchange, instrument=self.instrument, observation_ts=observation_ts,
             price=self._price_state(observation_ts),
             book=self._book_state(observation_ts),
             trade_flow=self._trade_flow_state(observation_ts),
