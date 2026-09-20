@@ -36,7 +36,7 @@ __all__ = [
     "InstrumentId", "InstrumentIdError", "MARKET_SPOT", "MARKET_LINEAR_PERPETUAL",
     "KNOWN_MARKET_TYPES", "BINANCE_SPOT_BTCUSDT", "BINANCE_USDM_BTCUSDT",
     "BYBIT_LINEAR_BTCUSDT", "OKX_SWAP_BTCUSDT", "SUPPORTED_INSTRUMENTS",
-    "resolve_instrument", "resolve_raw_record",
+    "resolve_instrument", "resolve_raw_record", "resolve_canonical_instrument_key",
 ]
 
 MARKET_SPOT = "spot"
@@ -101,6 +101,42 @@ class InstrumentId:
         if missing:
             raise InstrumentIdError(f"instrument dict missing {sorted(missing)}")
         return cls(data["exchange"], data["market_type"], data["instrument"], data["native_symbol"])
+
+
+def resolve_canonical_instrument_key(row: dict, *, expected: InstrumentId) -> Optional[InstrumentId]:
+    """Resolve a canonical Parquet row's ``instrument_key`` column.
+
+    ``expected`` is the identity the row's own stream is architecturally
+    scoped to (e.g. ``BYBIT_LINEAR_BTCUSDT`` for every row a Bybit runner
+    writes) -- this function checks the persisted value agrees with it,
+    rather than trusting either side alone.
+
+    Four states, deliberately not collapsed into two:
+
+    * column absent entirely (a legacy row, written before this column
+      existed) -> ``None``. Missing is not malformed.
+    * column present but explicitly ``null`` -> ``None``. Same resolved
+      value as the legacy case (both genuinely have no persisted identity),
+      but reached without raising -- an explicit null is not corruption.
+    * column present with a value that parses and matches ``expected`` ->
+      the parsed :class:`InstrumentId`.
+    * column present with a value that fails to parse, or parses but
+      disagrees with ``expected`` -> raises :class:`InstrumentIdError`.
+      Never silently coerced to ``None``: a corrupted or contradictory
+      identity is a data-integrity fault, not an absent one, and collapsing
+      the two would let a Binance-Spot row silently pass as a USD-M row (or
+      similar) instead of failing loudly.
+    """
+    if "instrument_key" not in row:
+        return None
+    raw = row["instrument_key"]
+    if raw is None:
+        return None
+    parsed = InstrumentId.from_key(raw)
+    if parsed != expected:
+        raise InstrumentIdError(
+            f"instrument_key {raw!r} contradicts this stream's own identity {expected.key!r}")
+    return parsed
 
 
 BINANCE_SPOT_BTCUSDT = InstrumentId("BINANCE", MARKET_SPOT, "BTC-USDT", "BTCUSDT")
