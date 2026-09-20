@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
+from .instrument import InstrumentId
 from decimal import Decimal
 
 class OISource(str, Enum): REST_POLL = "REST_POLL"; WS_PUSH = "WS_PUSH"
@@ -29,6 +30,10 @@ class OIUnitError(ValueError):
 class CanonicalEvent:
     exchange: str; stream: str; exchange_event_ts: Optional[int]; exchange_transaction_ts: Optional[int]
     local_receive_ts: int; local_process_ts: Optional[int] = None; market_type: str = "linear_perpetual"; quality_state: str = "VALID"
+    #: Which instrument this observation is about (see instrument.py). ``None`` means
+    #: unidentified -- legacy data, or an event that is not scoped to one registered
+    #: instrument -- and must never be read as a default instrument.
+    instrument: Optional[InstrumentId] = None
 
 @dataclass(frozen=True)
 class CanonicalOrderBookEvent(CanonicalEvent):

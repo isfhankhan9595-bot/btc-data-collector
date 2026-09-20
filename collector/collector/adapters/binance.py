@@ -6,8 +6,11 @@ from .base import ExchangeAdapter, UnhandledReason
 from ..canonical import CanonicalLiquidationEvent, CanonicalMarkPriceEvent, CanonicalOIEvent, CanonicalOrderBookEvent, CanonicalTradeEvent, OISource
 from ..sequence import BinanceSequenceComparator, binance_snapshot_bridge
 
+from ..instrument import BINANCE_USDM_BTCUSDT
+
 class BinanceAdapter(ExchangeAdapter):
     venue = "BINANCE"
+    instrument = BINANCE_USDM_BTCUSDT
     channel_event_types = {"<symbol>@depth@100ms": ("CanonicalOrderBookEvent",), "<symbol>@depth10@100ms": ("CanonicalOrderBookEvent",), "<symbol>@aggTrade": ("CanonicalTradeEvent",), "<symbol>@markPrice@1s": ("CanonicalMarkPriceEvent",), "<symbol>@forceOrder": ("CanonicalLiquidationEvent",)}
     sequence_comparator = BinanceSequenceComparator()
     def connect(self): return None

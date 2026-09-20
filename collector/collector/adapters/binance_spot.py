@@ -13,7 +13,7 @@ Identity split
 Canonical events here carry ``exchange="BINANCE"`` (not a separate exchange
 name) with ``market_type="spot"`` explicit on every event -- this is the
 identity P6's cross-exchange alignment is keyed on
-(``(exchange, market_type, stream)``, see
+(``(exchange, market_type, instrument_key, stream)``, see
 ``pipeline/cross_exchange_alignment.py``), so Spot and USD-M futures are
 correctly distinguishable there without inventing a second "exchange".
 ``self.venue = "BINANCE_SPOT"`` below is a *different*, storage/book-engine
@@ -56,11 +56,14 @@ from ..sequence import SpotSequenceComparator, binance_spot_snapshot_bridge
 MARKET_TYPE_SPOT = "spot"
 
 
+from ..instrument import BINANCE_SPOT_BTCUSDT
+
 class BinanceSpotAdapter(ExchangeAdapter):
     #: Book-engine/storage-namespace key -- see module docstring. Canonical
     #: events' own `.exchange` field is "BINANCE", set explicitly below, not
     #: derived from this attribute.
     venue = "BINANCE_SPOT"
+    instrument = BINANCE_SPOT_BTCUSDT
     channel_event_types = {
         "<symbol>@depth": ("CanonicalOrderBookEvent",),
         "<symbol>@depth@100ms": ("CanonicalOrderBookEvent",),

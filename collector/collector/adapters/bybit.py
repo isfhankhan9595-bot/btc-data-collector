@@ -50,8 +50,11 @@ MARKPRICE_FIELDS = ("markPrice", "indexPrice", "fundingRate", "nextFundingTime")
 OI_FIELDS = ("openInterest",)
 
 
+from ..instrument import BYBIT_LINEAR_BTCUSDT
+
 class BybitAdapter(ExchangeAdapter):
     venue = "BYBIT"
+    instrument = BYBIT_LINEAR_BTCUSDT
     channel_event_types = {
         "orderbook.{depth}.BTCUSDT": ("CanonicalOrderBookEvent",),
         "publicTrade.BTCUSDT": ("CanonicalTradeEvent",),
