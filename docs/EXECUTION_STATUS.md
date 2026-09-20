@@ -1060,3 +1060,111 @@ vacuously.
 
 Suite: 637 passed, 0 failed, both `pytest` and `pytest collector` (G4
 contract) invocations agree.
+
+### P4 — Market State Engine V0 — **PARTIAL, VERIFIED**
+
+`collector/collector/market_state.py`: pure-function, causal, venue-local
+descriptive market state from validated canonical events. Full design
+rationale, causal contract, and stated limitations in
+`docs/MARKET_STATE_V0.md` — summarized here.
+
+**Architecture gate performed first**, against actual current files, not
+assumed ones: confirmed `feature_computer.py` is unchanged and still
+Binance-message-shaped (`msg.get("E", timestamp)` silent wall-clock
+fallback, no persistent-book state) and therefore not reused;
+`dataset_assembler.py`'s `merge_asof(direction="backward")` remains causal;
+`cross_exchange_alignment.py` remains a tested-nowhere 13-line primitive, so
+V0 deliberately produces no cross-exchange state; the already-merged
+`OIUnit`/`assert_comparable_oi` contract (PR #26) is reused, not
+re-implemented, and not weakened.
+
+**Design**: `snapshot(observation_ts)` recomputes state from scratch from
+the full stored event list on every call, rather than mutating one running
+state. Deliberate: it makes "a late event cannot rewrite an earlier
+snapshot", "replay order doesn't matter", and "no wall-clock/network/random
+access" structural properties of a pure function rather than properties that
+merely happen to hold today. The last of these is enforced by an AST-based
+test, not just a docstring claim.
+
+**Dimensions implemented**: price (last trade, mark/index, price-vs-mark
+gated on mark freshness), book (best bid/ask, mid, spread, book_imbalance —
+explicitly not called "OFI", which requires observing flow over time, not
+one snapshot), trade flow (cumulative and windowed buy/sell volume, CVD,
+trade count), liquidation (count and quantity by raw venue-reported side
+only — direction deliberately not relabelled long/short; see doc), OI/
+funding (using the existing OIUnit contract; same-venue OI-change computed,
+cross-venue comparison never attempted by this module at all since one
+engine is one venue by construction). Regime descriptor (TREND/RANGE/etc.)
+deferred — not needed to keep V0 auditable.
+
+**Adversarial findings, both fixed**:
+1. `_book_state` initially trusted callers to pre-filter non-authoritative
+   book sources (`PARTIAL_DEPTH`), matching what `run_collector.py`/
+   `run_bybit_collector.py` already do -- but a future third caller might
+   not remember to. Added defense-in-depth: `update()` now refuses any
+   event in `book_engine.NON_AUTHORITATIVE_BOOK_SOURCES` itself.
+2. A pre-existing, unrelated test
+   (`test_binance_oi_replayability.py::test_raw_rest_round_trips_an_oi_response`)
+   used `glob.glob(...)[0]` with an unfiltered wildcard, which could select
+   a `.seg.meta.json` sidecar file instead of the `.seg` parquet segment --
+   `glob.glob()`'s result order is filesystem-dependent, not alphabetical.
+   Surfaced only once wall-clock date/hour changed during this session
+   (unrelated to Market State V0 itself); root-caused precisely (confirmed
+   the sidecar file exists, confirmed unsorted glob order is the mechanism)
+   and fixed with an explicit `*.seg` filter, verified stable across
+   repeated runs before and after.
+
+**Tests**: `test_market_state_v0.py` (35) covering empty engine, CVD
+accumulation, liquidation accumulation without direction claims, book state
+and zero-denominator OBI, staleness for book/mark/OI distinctly, OI unit
+rejection cross-venue vs. allowed same-venue, causal ordering by
+`local_receive_ts` (not `exchange_event_ts`, including a future-claimed
+exchange timestamp that must not pull an event earlier), late-event
+non-rewrite via snapshot immutability, determinism/digest equality
+regardless of insertion order, explicit non-deduplication (documented, not
+hidden), venue-mismatch rejection, two-engine venue isolation, an AST-based
+structural check for wall-clock/network imports, and five separate
+digest-changes-on-real-mutation tests (trade price, liquidation quantity,
+funding, OI, orderbook level) plus one digest-unaffected-by-a-never-fed-event
+test that mutation-tests the causal cutoff itself.
+`test_market_state_replay_parity.py` (5) drives real recorded frames through
+the real `ReplayEngine` then the real `MarketStateEngine` for non-book
+dimensions, proving replay-twice equality and mutation sensitivity through
+the full pipeline, not just the unit-level engine.
+
+**Suite: 677 passed** (637 + 40, net of the one pre-existing test fixed
+along the way). `compileall` clean.
+
+**Not claimed**:
+- Book-state replay parity — `ReplayResult.book_updates` only records
+  `best_bid`/`best_ask` as strings, not full bid/ask arrays, so it cannot be
+  turned back into a `CanonicalOrderBookEvent` for feeding this engine. Only
+  trade flow/liquidation/mark/funding/OI have a replay-parity proof.
+- No trade-flow or liquidation staleness flag exists yet (only book/mark/OI/
+  funding do) — stated as a known limitation in `docs/MARKET_STATE_V0.md`,
+  not silently absent.
+- No live exchange session backs any of this; verified against recorded/
+  synthetic frames through the real code path, consistent with every other
+  phase's live-verification status in this document.
+- Regime descriptor, cross-exchange state, spot/perp basis: explicitly
+  deferred, not attempted.
+
+### Legacy pipeline audit (Step 14, scoped narrowly per instruction)
+
+- `feature_computer.py`: unchanged, still wall-clock/Binance-shaped. NEEDS
+  REFACTOR if ever reused; not blocking, since Market State V0 does not
+  depend on it.
+- `dataset_assembler.py`: `merge_asof(direction="backward")` with explicit
+  tolerances remains causal on inspection. SAFE as currently used; NEEDS
+  TESTS for the leakage-specific adversarial cases this project's rules
+  care about (none added in this pass -- out of scope for a "short audit").
+- `cross_exchange_alignment.py`: 13 lines, no dedicated test file. NEEDS
+  TESTS before any cross-exchange derived state is built on it -- this is
+  exactly why V0 does not attempt cross-exchange state.
+- `stats_computer.py`: no wall-clock calls; takes an explicit
+  `max_allowed_end_ts` boundary parameter suggesting causal-boundary
+  awareness already exists. SAFE on this pass's read; not exercised further.
+
+No P0/P1 defect found in this narrow pass that blocks the current
+architecture; nothing here was fixed beyond what's listed, per the
+instruction not to let a short audit become uncontrolled scope expansion.

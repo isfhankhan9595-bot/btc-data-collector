@@ -73,7 +73,12 @@ def test_raw_rest_round_trips_an_oi_response(tmp_path):
 
     import glob
     import pandas as pd
-    path = glob.glob(str(tmp_path / "raw" / "raw_rest" / "*"))[0]
+    # glob.glob()'s result order is filesystem-dependent, not alphabetical --
+    # picking [0] without filtering can select the .seg.meta.json sidecar
+    # instead of the .seg parquet segment, which is exactly what happened
+    # here once directory listing order shifted (observed non-deterministically
+    # across otherwise-identical runs). Filter explicitly for the real segment.
+    path = glob.glob(str(tmp_path / "raw" / "raw_rest" / "*.seg"))[0]
     row = pd.read_parquet(path).to_dict("records")[0]
     assert row["purpose"] == "open_interest"
     event = normalize_binance_oi(row["payload"], response_receive_ts=row["response_receive_ts"])
