@@ -158,7 +158,15 @@ def test_read_streams_is_explicit_about_legacy_shared_history():
     assert read_streams("OKX", "raw_wire") == ("okx_raw_wire", "raw_wire")
     assert read_streams("OKX", "quality_events") == ("okx_quality_events", "quality_events")
     assert read_streams("OKX", "orderbook") == ("okx_orderbook",)   # never shared, no legacy read
-    assert set(VENUE_STREAM_PREFIX) == set(VENUES)
+    # P5 registered a fourth venue, BINANCE_SPOT (its own "spot_" prefix,
+    # isolated from USD-M futures' unprefixed streams -- see
+    # storage_layout.VENUE_STREAM_PREFIX and test_binance_spot_adapter.py).
+    # No live runner writes it yet (see docs/EXECUTION_STATUS.md, "P5"), so
+    # it deliberately stays out of VENUES above -- the runner-existence and
+    # concurrent-write tests below assume a real writer per VENUES entry,
+    # which BINANCE_SPOT does not have yet. This assertion is checked
+    # against the registry directly instead.
+    assert set(VENUE_STREAM_PREFIX) == set(VENUES) | {"BINANCE_SPOT"}
 
 
 # ---------------------------------------------------------------------------

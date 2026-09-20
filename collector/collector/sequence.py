@@ -148,6 +148,46 @@ class OKXSequenceComparator(SequenceComparator):
         return SequenceResult()
 
 
+class SpotSequenceComparator(SequenceComparator):
+    """Binance **Spot** diff-depth continuity -- distinct from
+    :class:`BinanceSequenceComparator` (USD-M futures).
+
+    Verified 2026-09-19 against the official Spot procedure
+    ("How to manage a local order book correctly",
+    github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md,
+    mirrored at developers.binance.com/docs/binance-spot-api-docs/web-socket-streams).
+    Spot's ``depthUpdate`` payload has no ``pu`` field at all (confirmed
+    absent from the official payload example, unlike futures) -- continuity
+    is instead verified arithmetically: *"each new event's U should be equal
+    to the previous event's u+1"*. This is why Spot needs its own
+    comparator rather than reusing Binance USD-M's ``pu``-based one: there
+    is no ``pu`` to compare.
+
+    No stale/duplicate carve-out. ``BinanceSequenceComparator`` treats a
+    non-advancing ``u`` as harmless because the official futures procedure
+    documents ``pu``-chain verification as the sole continuity check, so a
+    retransmitted event with a matching ``pu`` legitimately passes it. Spot's
+    official procedure states the ``U == prev.u + 1`` check directly with no
+    documented exception for a retransmitted or duplicate event -- so a
+    non-advancing event here fails that check like any other break, and is
+    treated as a gap rather than assumed harmless. Absolute-quantity
+    semantics (steps 7/8, identical to futures) still hold, but nothing in
+    the official Spot procedure says a duplicate is exempt from the chain
+    check itself, and this comparator does not invent that exemption.
+    """
+
+    def check(self, current, previous):
+        if previous is None:
+            return SequenceResult()
+        current_first = getattr(current, "first_update_id", None)
+        previous_update = getattr(previous, "update_id", None)
+        if not isinstance(current_first, int) or not isinstance(previous_update, int):
+            return SequenceResult(True, False, "update_id_missing")
+        if current_first != previous_update + 1:
+            return SequenceResult(True, False, "u_chain_broken")
+        return SequenceResult()
+
+
 def binance_snapshot_bridge(event: Any, last_update_id: int) -> bool:
     """Documented step 5: ``U <= lastUpdateId AND u >= lastUpdateId``.
 
@@ -167,3 +207,22 @@ def binance_snapshot_bridge(event: Any, last_update_id: int) -> bool:
     if not isinstance(last_update_id, int):
         return False
     return first_update_id <= last_update_id <= update_id
+
+
+def binance_spot_snapshot_bridge(event: Any, last_update_id: int) -> bool:
+    """Spot's documented bridge step: ``U <= lastUpdateId+1 AND u >= lastUpdateId+1``.
+
+    The ``+1`` on both sides is the one-token difference from
+    :func:`binance_snapshot_bridge` (USD-M has none) -- confirmed against
+    the same official source as :class:`SpotSequenceComparator`. Getting
+    this wrong silently shifts which buffered event is treated as the
+    bridge by exactly one event, which is exactly the kind of off-by-one
+    that looks like a working book until the first genuine gap.
+    """
+    first_update_id = getattr(event, "first_update_id", None)
+    update_id = getattr(event, "update_id", None)
+    if not isinstance(first_update_id, int) or not isinstance(update_id, int):
+        return False
+    if not isinstance(last_update_id, int):
+        return False
+    return first_update_id <= last_update_id + 1 <= update_id

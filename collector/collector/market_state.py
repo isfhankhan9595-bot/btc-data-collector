@@ -33,10 +33,14 @@ Venue-local, not cross-exchange
 --------------------------------
 One engine instance describes one exchange. Cross-exchange derived state
 is deliberately out of scope for V0 (see docs/MARKET_STATE_V0.md,
-"Non-goals") -- `cross_exchange_alignment.py` has no dedicated tests yet
-and building derived cross-venue state on top of an unverified alignment
-primitive would risk exactly the "silently collapse two venues into one"
-failure this project's rules forbid.
+"Non-goals") -- `cross_exchange_alignment.py` is a separate module (P6,
+`tests/test_cross_exchange_alignment.py`, 33 tests) keyed on
+`(exchange, market_type, stream)` identity with causal
+`local_receive_ts <= observation_ts` availability. This engine does not
+consume it: building derived cross-venue state directly into a venue-local
+engine would still risk the "silently collapse two venues into one"
+failure this project's rules forbid, regardless of how well-tested the
+alignment primitive itself now is.
 """
 from __future__ import annotations
 

@@ -13,10 +13,12 @@ received by a given moment.
   from V0" below).
 - **Not cross-exchange.** One `MarketStateEngine` instance describes one
   exchange (`update()` raises if given an event from another venue).
-  `pipeline/cross_exchange_alignment.py` exists but has no dedicated test
-  file, and building derived cross-venue state on top of an unverified
-  alignment primitive risks silently collapsing two venues' semantics into
-  one — deliberately out of scope until that primitive is itself tested.
+  `pipeline/cross_exchange_alignment.py` is a separate module (P6,
+  `tests/test_cross_exchange_alignment.py`, 33 tests, keyed on
+  `(exchange, market_type, stream)` with causal
+  `local_receive_ts <= observation_ts` availability) that this engine does
+  not consume — deliberately out of scope for V0 regardless, not because
+  the alignment primitive is unverified.
 - **Not spot-aware.** No real BTC spot feed exists in this collector yet, so
   no spot/perp basis is computed or implied anywhere in this module.
 - **Not derived from `feature_computer.py` or `dataset_assembler.py`.**

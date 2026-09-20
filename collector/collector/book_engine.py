@@ -5,7 +5,20 @@ from decimal import Decimal
 from threading import RLock
 from .canonical import CanonicalOrderBookEvent
 from .quality_events import BookQuality, BookQualityStateMachine, QualityEvent, QualityEventType
-from .sequence import BinanceSequenceComparator, BybitSequenceComparator, OKXSequenceComparator, binance_snapshot_bridge
+from .sequence import BinanceSequenceComparator, BybitSequenceComparator, OKXSequenceComparator, SpotSequenceComparator, binance_snapshot_bridge, binance_spot_snapshot_bridge
+
+#: Venues whose local book buffers every event until a REST snapshot bridges
+#: it (the "buffer diffs, then bridge with a snapshot" flow both Binance
+#: products document, as opposed to Bybit/OKX's plain websocket-snapshot
+#: bridge via `is_snapshot`). Binance Spot follows the identical flow --
+#: same buffering philosophy, different discard/bridge arithmetic (see
+#: sequence.py) -- so it belongs in this set, not a new code path.
+_BUFFER_UNTIL_BRIDGED_VENUES = frozenset({"BINANCE", "BINANCE_SPOT"})
+
+#: Per-venue snapshot-bridge predicate for `_attempt_bridge`. Only venues in
+#: `_BUFFER_UNTIL_BRIDGED_VENUES` ever reach `_attempt_bridge`, so this needs
+#: no entry for Bybit/OKX.
+_SNAPSHOT_BRIDGE_FNS = {"BINANCE": binance_snapshot_bridge, "BINANCE_SPOT": binance_spot_snapshot_bridge}
 
 #: Sources that may never mutate an authoritative reconstructed book.
 #: ``<symbol>@depth10@100ms`` is a top-N *snapshot* pushed periodically, not a
@@ -40,7 +53,7 @@ class LocalBook:
         self._pending_snapshot=None
         self.pending_snapshot_bridges=0
         self._lock=RLock()
-        self.comparator={"BINANCE":BinanceSequenceComparator(),"BYBIT":BybitSequenceComparator(),"OKX":OKXSequenceComparator()}[venue]
+        self.comparator={"BINANCE":BinanceSequenceComparator(),"BYBIT":BybitSequenceComparator(),"OKX":OKXSequenceComparator(),"BINANCE_SPOT":SpotSequenceComparator()}[venue]
 
     @staticmethod
     def _valid_levels(levels):
@@ -144,11 +157,19 @@ class LocalBook:
 
     def _attempt_bridge(self,last_update_id,event,*,retain_if_ahead):
         with self._lock:
+            # Step 4 (discard rule) differs by one token between the two
+            # Binance products: futures keeps `u >= lastUpdateId` (discards
+            # strictly `<`); Spot keeps `u > lastUpdateId` (discards `<=`).
+            # See sequence.py's SpotSequenceComparator/binance_spot_snapshot_bridge
+            # docstrings for the sourcing.
+            keep_equal = self.venue != "BINANCE_SPOT"
+            bridge_fn = _SNAPSHOT_BRIDGE_FNS[self.venue]
             original=list(self.buffer); candidates=[]
             for diff in original:
                 if not isinstance(diff.update_id, int) or not isinstance(diff.first_update_id, int):
                     self.buffer=original; self.last_reason="malformed_update_ids"; return False
-                if diff.update_id >= last_update_id: candidates.append(diff)
+                if (diff.update_id >= last_update_id) if keep_equal else (diff.update_id > last_update_id):
+                    candidates.append(diff)
             if not candidates:
                 self.buffer=original; self.state.resync()
                 if retain_if_ahead:
@@ -157,7 +178,7 @@ class LocalBook:
                     self._pending_snapshot=None; self.last_reason="snapshot_bridge_not_found"
                 return False
             bridge=candidates[0]
-            if not binance_snapshot_bridge(bridge,last_update_id):
+            if not bridge_fn(bridge,last_update_id):
                 self.buffer=original; self._pending_snapshot=None
                 self.last_reason="snapshot_bridge_not_found"; self.state.resync(); return False
             maps=self._validated_maps(event, {}, {})
@@ -201,7 +222,7 @@ class LocalBook:
                 self.non_authoritative_count += 1
                 self.last_reason=f"non_authoritative_book_source:{event.book_source}"
                 return None
-            if self.venue=="BINANCE" and (self.state.state != BookQuality.VALID or self.previous is None):
+            if self.venue in _BUFFER_UNTIL_BRIDGED_VENUES and (self.state.state != BookQuality.VALID or self.previous is None):
                 self._buffer_event(event); return None
             if event.is_snapshot:
                 if self.snapshot(event): self.state.recovered(); return self._apply(event)

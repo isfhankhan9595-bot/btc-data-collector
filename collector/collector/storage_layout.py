@@ -43,7 +43,16 @@ class StorageNamespaceError(RuntimeError):
 #: Prefix that namespaces each venue's stream directories. BINANCE is empty on
 #: purpose: it was the only venue when the unprefixed names were chosen, its
 #: recorded history lives under them, and renaming would strand that history.
-VENUE_STREAM_PREFIX: dict[str, str] = {"BINANCE": "", "BYBIT": "bybit_", "OKX": "okx_"}
+#: BINANCE_SPOT is a distinct storage-namespace key from BINANCE, even though
+#: P5 canonical events use exchange="BINANCE" (market_type="spot" is the
+#: differentiator P6's cross-exchange identity uses -- see canonical.py and
+#: docs/EXECUTION_STATUS.md, "P5"). Storage namespace identity and P6
+#: cross-exchange identity are deliberately two different keyspaces: this one
+#: exists so Spot's segments/sequence/orphan-recovery can never share a
+#: directory with USD-M futures' (the exact PR #19 collision class this
+#: registry exists to prevent), while P6 alignment still sees both as the
+#: same exchange with a different market_type, which is what it's supposed to.
+VENUE_STREAM_PREFIX: dict[str, str] = {"BINANCE": "", "BYBIT": "bybit_", "OKX": "okx_", "BINANCE_SPOT": "spot_"}
 
 #: Unprefixed stream names that PR #13 let OKX share with Binance. Legacy OKX
 #: frames and quality events may still sit in these directories; every row in
