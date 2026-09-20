@@ -610,3 +610,57 @@ def test_storage_round_trip_never_pulls_in_futures_rows(tmp_path):
     trades = [e for e in result.non_book_events if isinstance(e, CanonicalTradeEvent)]
     assert len(trades) == 1
     assert trades[0].market_type == "spot"
+
+
+# --------------------------------------------------------------------------
+# Live-impacting regression: WebSocketClient._consume() calls every
+# on_raw_frame callback with control_frame=, unconditionally. This runner's
+# callback did not accept it, so every real call raised TypeError inside
+# _consume's fail-open try/except -- meaning live raw-wire capture silently
+# produced zero rows. Confirmed by direct reproduction before fixing:
+# capturing 0 frames through the real _consume() coroutine and the real
+# app callback, not a hand-rolled substitute.
+# --------------------------------------------------------------------------
+
+def test_capture_raw_frame_survives_the_shared_client_contract(tmp_path):
+    """Regression pin for the same class of bug as this session's P0 hotfix
+    to run_collector.py, rediscovered here because this file predates that
+    fix and was never updated to match. Drives the actual
+    WebSocketClient._consume() coroutine against the actual production
+    callback, not a substitute -- a hand-rolled **kwargs double would not
+    have caught the original regression either."""
+    app = _app(str(tmp_path))
+    captured = []
+    app.raw_capture.capture_wire = lambda record: captured.append(record)
+
+    class _FakeSocket:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def __aiter__(self):
+            async def gen():
+                for frame in self.frames:
+                    yield frame
+            return gen()
+
+    app.client.running = True
+    asyncio.run(app.client._consume(_FakeSocket([
+        '{"stream":"btcusdt@trade","data":{}}',
+        "{not valid json",
+    ])))
+
+    assert len(captured) == 2, (
+        "every inbound frame must reach durable raw capture; "
+        f"only {len(captured)} did"
+    )
+    assert captured[0].decode_ok is True
+    assert captured[1].decode_ok is False
+
+
+def test_capture_raw_frame_accepts_control_frame_directly():
+    """Narrower, faster-to-read companion to the _consume()-driven test
+    above: the callback itself must accept the kwarg by name."""
+    import inspect
+    app = _app(tempfile.mkdtemp())
+    signature = inspect.signature(app._capture_raw_frame)
+    assert "control_frame" in signature.parameters

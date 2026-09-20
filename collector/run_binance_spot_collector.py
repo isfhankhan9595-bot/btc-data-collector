@@ -168,7 +168,23 @@ class BinanceSpotCollectorApp:
 
     def _capture_raw_frame(self, payload, *, local_receive_ts, connection_id=None,
                            connection_generation=None, decode_ok=True,
-                           decode_error=None, parsed=None):
+                           decode_error=None, parsed=None, control_frame=False):
+        """Persist the exact frame before any lossy transformation.
+
+        ``control_frame`` exists because ``WebSocketClient._consume()`` calls
+        every ``on_raw_frame`` callback with it unconditionally (added for
+        OKX's non-JSON ping/pong control frames). Binance Spot has none, so
+        this always arrives ``False`` and nothing below reads it -- but the
+        parameter must exist. Without it, every single call raised
+        ``TypeError`` inside ``_consume``'s fail-open ``try/except``, so raw
+        capture silently produced zero rows -- this was the exact same
+        regression already found and fixed once this session for
+        ``run_collector.py`` (CollectorApp, the P0 hotfix) and guarded
+        against by design in ``run_bybit_collector.py`` and
+        ``run_okx_collector.py``, but this file predates that fix and was
+        never updated to match. Confirmed live-impacting: this runner is
+        the one described as currently deployed on the user's VPS.
+        """
         stream = channel = None
         if isinstance(parsed, dict):
             stream = parsed.get("stream")
