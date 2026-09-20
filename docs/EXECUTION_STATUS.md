@@ -1168,3 +1168,30 @@ along the way). `compileall` clean.
 No P0/P1 defect found in this narrow pass that blocks the current
 architecture; nothing here was fixed beyond what's listed, per the
 instruction not to let a short audit become uncontrolled scope expansion.
+
+### P6 — Causal cross-exchange alignment — **IMPLEMENTED, TESTED; not COMPLETE until merged (ancestry recorded on the PR)**
+
+Base `main` @ `f1a9d1d`, 677 tests. Closes G5. The previous session's P6 test
+spec was never committed or pushed and was not in the repository; the tests were
+rewritten from its 26-point description, not restored.
+
+- Replaced the 13-line `causally_align()` (key `"exchange:stream"`, no staleness,
+  no missingness) with `(exchange, market_type, stream)` identity, an explicit
+  `AlignedObservation{event, age_ms, status}`, AVAILABLE / STALE / NEVER_OBSERVED,
+  required `staleness_ms`, and `expected_keys`. Zero production callers, verified
+  repo-wide; not wired into `MarketStateEngine`.
+- `tests/test_cross_exchange_alignment.py` (33), mutation-checked: eligibility by
+  exchange timestamp fails 4; dropping `market_type` from the key fails 16;
+  exclusive boundary fails 5; silently dropping stale fails 2.
+
+**Leakage audit.** Lookahead: eligibility is receive-time only (tested at T-1/T/T+1).
+Timestamp leakage: exchange timestamps cannot affect eligibility (tested both directions).
+Cross-venue synchronisation: no simultaneity status exists; venues with different receive
+latency are judged independently. Staleness: STALE is returned and labelled, never fresh.
+Missingness: NEVER_OBSERVED only for expected keys; nothing fabricated. Replay: events
+from the real `ReplayEngine` align identically across runs. Instrument contamination:
+perp/spot separated by `market_type`, **but** no instrument field exists (documented
+limitation). Quality: availability is not quality; the original event is returned.
+
+**Not claimed:** exact-timestamp ties depend on input order (documented); no consumer
+exists; no live verification; no spot adapter sets `market_type` yet.
