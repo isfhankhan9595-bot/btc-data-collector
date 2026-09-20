@@ -1169,7 +1169,12 @@ No P0/P1 defect found in this narrow pass that blocks the current
 architecture; nothing here was fixed beyond what's listed, per the
 instruction not to let a short audit become uncontrolled scope expansion.
 
-### P6 — Causal cross-exchange alignment — **IMPLEMENTED, TESTED; not COMPLETE until merged (ancestry recorded on the PR)**
+### P6 — Causal cross-exchange alignment — **COMPLETE**
+
+**Post-merge verification (this session, P5 pass).** Merged as PR #31,
+merge commit `d86bc07` (also current `main` HEAD at the time this note was
+added). Ancestry and the 33-test count independently re-confirmed via
+`git log`/`pytest` before starting P5 work on top of it.
 
 Base `main` @ `f1a9d1d`, 677 tests. Closes G5. The previous session's P6 test
 spec was never committed or pushed and was not in the repository; the tests were
@@ -1194,4 +1199,86 @@ perp/spot separated by `market_type`, **but** no instrument field exists (docume
 limitation). Quality: availability is not quality; the original event is returned.
 
 **Not claimed:** exact-timestamp ties depend on input order (documented); no consumer
-exists; no live verification; no spot adapter sets `market_type` yet.
+exists; no live verification. P5 (below) is the first adapter to set `market_type`
+explicitly (`"spot"`); `MarketStateEngine` still does not consume this module (see
+`market_state.py`'s own docstring).
+
+### P5 — Real BTC Spot ingestion — **PARTIAL** (trade stream + order-book sequence primitives; no live runner, no replay integration)
+
+Branch `p5-spot-ingestion` off verified `d86bc07` (PR #31 merge commit).
+Official sources: `github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md`
+(trade stream payload, Diff. Depth Stream payload, "How to manage a local
+order book correctly" Spot procedure), verified 2026-09-19.
+
+**Done, tested, mutation-checked:**
+- `sequence.SpotSequenceComparator` — Spot's `depthUpdate` has no `pu` field
+  (confirmed absent from the official payload, unlike USD-M futures);
+  continuity is verified arithmetically instead (`U == prev.u + 1`, per the
+  official procedure's own wording). No stale/duplicate carve-out: unlike
+  `BinanceSequenceComparator`, nothing in the official Spot procedure
+  documents an exception for a retransmitted event, so this comparator does
+  not invent one.
+- `sequence.binance_spot_snapshot_bridge` — the one documented difference
+  from futures' bridge formula: `U <= lastUpdateId+1 AND u >= lastUpdateId+1`
+  (futures has no `+1`). Regression-tested against `binance_snapshot_bridge`
+  directly on the same event to pin the off-by-one both ways.
+- `book_engine.LocalBook("BINANCE_SPOT")` — venue-aware dispatch added for
+  the snapshot-discard rule (`u <= lastUpdateId` discarded for Spot, vs.
+  strict `<` for futures) and the bridge predicate in `_attempt_bridge`;
+  Spot joins futures in `_BUFFER_UNTIL_BRIDGED_VENUES` (same
+  buffer-until-bridged flow, different arithmetic). Full snapshot-bridge,
+  post-bridge chain continuation, broken-chain, and missing-overlap cases
+  tested against `LocalBook` directly, mirroring the existing USD-M test
+  pattern in `tests/test_adapters_sequence.py`.
+- `adapters/binance_spot.BinanceSpotAdapter` — `trade` and
+  `depth`/`depth@100ms` streams. `market_type="spot"` explicit on every
+  event; canonical `exchange="BINANCE"` (not a separate exchange name) so
+  P6's `(exchange, market_type, stream)` identity is the actual
+  differentiator, per the task's own instruction. `t` (raw per-execution
+  Trade ID) mapped to `trade_id`, never `a` (aggTrade's aggregate ID) --
+  **aggTrade is not implemented**; whether it should also be collected is
+  left as an open question (task's own §5), not guessed.
+- `storage_layout` — `BINANCE_SPOT` registered with its own `spot_` prefix,
+  isolated from USD-M futures' unprefixed streams. Namespace-isolation
+  regression test added (`check_stream_namespace` refuses cross-declaration
+  either direction).
+- P6 integration: two tests using the real `causally_align`/`alignment_key`
+  (not a reimplementation) prove Case A (exchange-early, receive-late ->
+  NOT available) and Case B (exchange-late, receive-early -> available) from
+  the task's §21, plus that a Spot and a same-exchange futures event never
+  collide as P6 keys.
+- **Mutation testing actually performed, not merely claimed:** (1) removed
+  `market_type="spot"` from both `BinanceSpotAdapter` constructions --
+  confirmed the market-type test failed with `"linear_perpetual"` instead of
+  `"spot"`, then restored. (2) swapped `LocalBook`'s `"BINANCE_SPOT"`
+  comparator for `BinanceSequenceComparator` (the futures rule) -- confirmed
+  3 of the `LocalBook` tests failed, including one on the exact reason
+  string (`"pu_missing"` instead of `"u_chain_broken"`) that only a futures
+  comparator would produce, then restored. Both mutations and restorations
+  are in this session's tool history; nothing was left mutated.
+- `tests/test_binance_spot_adapter.py`: 29 tests. Full suite: **739 passed**
+  (was 710 before this branch).
+
+**Not done in this pass -- explicitly, not silently:**
+- No live collector runner (`run_binance_spot_collector.py`) -- nothing
+  wires `BinanceSpotAdapter` to a real WebSocket connection or to storage
+  writers yet. Live verification is therefore **LIVE-UNVERIFIED,
+  ENVIRONMENT BLOCKED** the same as every other venue in this collector
+  (`stream.binance.com` is not on this environment's egress allowlist,
+  unverified this session but consistent with every prior venue's finding).
+- No storage round-trip test (raw capture -> persisted segment -> read ->
+  replay) -- there is no writer to persist through yet.
+- No `ReplayEngine` integration for Spot -- `ReplayEngine`'s
+  `_ADAPTER_CLASSES` has no `BINANCE_SPOT` entry; PR #23 registered OKX
+  there but this pass did not touch that registry for Spot.
+- Order-book malformed/duplicate/out-of-order coverage exists only at the
+  level the `LocalBook`/comparator unit tests exercise (crossed levels,
+  non-integer ids, broken chains); no fixture-based adapter-level malformed
+  event suite comparable to `test_okx_d11_channels.py`'s was written for
+  Spot depth events beyond `U`/`u` missing-or-non-integer.
+- `docs/DATA_SUFFICIENCY.md` and other cross-referenced docs are not
+  updated for Spot's existence yet.
+
+None of P5's acceptance criteria (task §33) should be read as met in full;
+the items above are the ones actually satisfied, and the "Not done" list is
+what remains before P5 can be called complete.
