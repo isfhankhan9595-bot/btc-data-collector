@@ -18,6 +18,10 @@ BYBIT_PUBLIC_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_ORDERBOOK_DEPTH = 50
 BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth@100ms"
 BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@forceOrder"
+
+# Binance Spot (P5) -- a distinct API surface from USD-M futures above.
+BINANCE_SPOT_WS_URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@depth@100ms"
+BINANCE_SPOT_DEPTH_SNAPSHOT_URL = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=1000"
 # Intervals and Thresholds
 ORDERBOOK_STALE_MS = 500
 TRADES_STALE_MS = 5000   # was 30000
@@ -314,3 +318,36 @@ OKX_LIQUIDATION_SCHEMA = pa.schema([
     ("uly", pa.string()),
 ], metadata={"schema_version": "1.0", "stream_name": "okx_liquidation", "symbol": SYMBOL,
              "note": "subscription is instType-scoped; inst_id column lets downstream filter to BTC-USDT-SWAP"})
+
+
+# Binance Spot canonical schemas (P5). Own spot_-prefixed streams via
+# storage_layout.venue_stream("BINANCE_SPOT", ...) -- never USD-M futures'
+# unprefixed "orderbook"/"trades". Mirrors BINANCE_ORDERBOOK_RAW_SCHEMA's
+# raw-canonical shape (decimal-string levels, no derived features) rather
+# than the older feature-computed ORDERBOOK_SCHEMA, since Spot has no
+# feature_computer path yet and inventing one is out of P5's scope.
+SPOT_ORDERBOOK_RAW_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_receive_ts", pa.timestamp("ms", tz="UTC")), ("local_process_ts", pa.timestamp("ms", tz="UTC")),
+    ("bids", pa.list_(pa.list_(pa.string()))), ("asks", pa.list_(pa.list_(pa.string()))),
+    ("update_id", pa.int64()), ("first_update_id", pa.int64()),
+    # Always NULL for Spot -- the official depthUpdate payload has no `pu`
+    # field (see adapters/binance_spot.py); the column is kept for schema
+    # symmetry with BINANCE_ORDERBOOK_RAW_SCHEMA, not because Spot has one.
+    ("previous_update_id", pa.int64()),
+    ("book_source", pa.string()), ("event_kind", pa.string()),
+    ("recovery_generation", pa.int64()), ("quality_state", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "spot_orderbook_raw", "symbol": SYMBOL,
+             "note": "previous_update_id always NULL: Spot depthUpdate has no pu field"})
+
+SPOT_TRADES_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("trade_id", pa.string()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+    ("side", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "spot_trades", "symbol": SYMBOL,
+             "note": "trade_id is the raw per-execution `t`, never aggTrade's `a` -- see adapters/binance_spot.py"})

@@ -1203,7 +1203,7 @@ exists; no live verification. P5 (below) is the first adapter to set `market_typ
 explicitly (`"spot"`); `MarketStateEngine` still does not consume this module (see
 `market_state.py`'s own docstring).
 
-### P5 — Real BTC Spot ingestion — **PARTIAL** (trade stream + order-book sequence primitives; no live runner, no replay integration)
+### P5 — Real BTC Spot ingestion — **COMPLETE** (live runner, replay integration, storage round-trip; live network verification blocked)
 
 Branch `p5-spot-ingestion` off verified `d86bc07` (PR #31 merge commit).
 Official sources: `github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md`
@@ -1259,26 +1259,98 @@ order book correctly" Spot procedure), verified 2026-09-19.
 - `tests/test_binance_spot_adapter.py`: 29 tests. Full suite: **739 passed**
   (was 710 before this branch).
 
+**Completed this pass (`run_binance_spot_collector.py` + `ReplayEngine` Spot
+registration):**
+
+- `run_binance_spot_collector.py` -- a dedicated, standalone live runner
+  (same single-file style as `run_okx_collector.py`; imports nothing from
+  `run_collector.py`). Wires: raw wire capture before parsing, REST
+  snapshot capture with request/response lineage, `BinanceSpotAdapter` ->
+  `LocalBook("BINANCE_SPOT")`, durable quality events on every state
+  transition, `spot_`-prefixed storage via `storage_layout.venue_stream`.
+  Own `RecoveryController` instance (`name="binance_spot_orderbook"`) --
+  never shares a recovery budget with USD-M futures'.
+- **Pending-snapshot handling, fixed in both live and replay.** The
+  official Spot procedure's step 4 ("if every buffered diff has
+  `u < lastUpdateId`, the snapshot cannot yet bridge") is not a failure --
+  the next diff will straddle it. The first version of this runner treated
+  `LocalBook.binance_snapshot()` returning `False` as a hard error
+  unconditionally, which is wrong for this specific `last_reason ==
+  "snapshot_ahead_of_buffer"` case: it spent the bounded recovery budget on
+  a problem that resolves itself on the next diff. Fixed by checking
+  `last_reason` and calling `retry_pending_snapshot()` after each buffered
+  diff. **`ReplayEngine._handle_wire`/`_handle_snapshot` had the identical
+  gap** (pre-existing, not introduced this session, and not specific to
+  Spot -- USD-M futures replay has the same code path) -- found via this
+  session's own replay tests, fixed for parity so live and replay treat a
+  pending snapshot identically.
+- `ReplayEngine` now accepts `venue="BINANCE_SPOT"`
+  (`_ADAPTER_CLASSES["BINANCE_SPOT"] = BinanceSpotAdapter`). The
+  replay-constructed snapshot event's canonical identity is `exchange=
+  "BINANCE", market_type="spot"` (not `exchange="BINANCE_SPOT"` -- that
+  would make a replayed snapshot compare unequal to every diff
+  `BinanceSpotAdapter` itself produces for the same book, a bug caught by
+  `test_spot_replay_includes_trade_events`'s market_type assertion during
+  mutation testing).
+- **Storage round-trip test** (`test_storage_round_trip_matches_in_memory_replay`):
+  synthetic frames -> `RawCapture` -> `ParquetWriter` -> disk -> `ReplaySource.from_directory`
+  -> `ReplayEngine` -> digest, compared against the equivalent in-memory
+  replay. Digests match. A second round-trip test
+  (`test_storage_round_trip_never_pulls_in_futures_rows`) proves a
+  Spot-and-futures directory read isolates by venue namespace.
+- **Malformed-frame fixture suite**: missing/non-integer `U`/`u`, malformed
+  bid/ask price/quantity, missing trade id (documented as valid --
+  `trade_id=None` -- not malformed, since the adapter only requires
+  price/quantity), malformed price/quantity, unroutable stream, empty
+  payload, control response. Each pinned to its actual `UnhandledReason`.
+- **Bridge-boundary mutation test**: `binance_spot_snapshot_bridge` tested
+  at exactly `lastUpdateId+1`, one event late, one event short, and a wide
+  straddling event -- plus a direct pin that the futures formula (no `+1`)
+  and the Spot formula disagree on the same event.
+- **Causality tests**: snapshot eligibility is `response_receive_ts`
+  (verified both at the runner level via the captured `RawRestRecord`, and
+  in `ReplaySource.from_records` directly), never a value from inside the
+  payload -- the Spot snapshot response carries no exchange timestamp at
+  all, so there is nothing to substitute even by accident.
+- **Duplicate/gap tests, corrected to the actual documented contract**: a
+  resent diff is **not** silently accepted -- `SpotSequenceComparator` has
+  no duplicate carve-out (an earlier session's own deliberate decision,
+  re-confirmed here, not re-litigated), so a retransmitted event fails
+  `U == prev.u+1` and is classified `SEQUENCE_GAP`. An initial draft of this
+  test asserted the opposite before the actual comparator behaviour was
+  checked; corrected to match verified behaviour rather than an assumption.
+- `tests/test_binance_spot_collector.py`: 42 tests. Full suite: **781
+  passed** (was 739 before this branch), both `pytest` and
+  `pytest collector` invocations agree (G4 contract preserved).
+- **Mutation testing performed** (in addition to the prior session's two):
+  (3) stripped `market_type="spot"` from `BinanceSpotAdapter`'s trade
+  event -- confirmed `test_spot_replay_includes_trade_events` failed with
+  `"linear_perpetual"`, then restored. (4) swapped `LocalBook`'s
+  `BINANCE_SPOT` comparator for `BinanceSequenceComparator` -- confirmed 2
+  tests failed (`test_contiguous_update_stays_valid`,
+  `test_a_resent_diff_is_treated_as_a_gap_not_silently_accepted`), then
+  restored and reverified the full suite (781 passed). Both mutations and
+  restorations are in this session's tool history.
+
 **Not done in this pass -- explicitly, not silently:**
-- No live collector runner (`run_binance_spot_collector.py`) -- nothing
-  wires `BinanceSpotAdapter` to a real WebSocket connection or to storage
-  writers yet. Live verification is therefore **LIVE-UNVERIFIED,
-  ENVIRONMENT BLOCKED** the same as every other venue in this collector
-  (`stream.binance.com` is not on this environment's egress allowlist,
-  unverified this session but consistent with every prior venue's finding).
-- No storage round-trip test (raw capture -> persisted segment -> read ->
-  replay) -- there is no writer to persist through yet.
-- No `ReplayEngine` integration for Spot -- `ReplayEngine`'s
-  `_ADAPTER_CLASSES` has no `BINANCE_SPOT` entry; PR #23 registered OKX
-  there but this pass did not touch that registry for Spot.
-- Order-book malformed/duplicate/out-of-order coverage exists only at the
-  level the `LocalBook`/comparator unit tests exercise (crossed levels,
-  non-integer ids, broken chains); no fixture-based adapter-level malformed
-  event suite comparable to `test_okx_d11_channels.py`'s was written for
-  Spot depth events beyond `U`/`u` missing-or-non-integer.
+- **Live network verification: `LIVE-UNVERIFIED, ENVIRONMENT BLOCKED`.**
+  This environment's egress allowlist does not include
+  `stream.binance.com`/`api.binance.com` (consistent with every other
+  venue's prior finding in this collector; not independently re-tested
+  this session since no attempt was made to reach the live network -- see
+  §21 of the originating task). Everything above is offline-verified only:
+  unit tests, replay, and a storage round-trip through real `ParquetWriter`
+  instances and real Parquet files on disk -- not a live WebSocket session.
 - `docs/DATA_SUFFICIENCY.md` and other cross-referenced docs are not
   updated for Spot's existence yet.
-
-None of P5's acceptance criteria (task §33) should be read as met in full;
-the items above are the ones actually satisfied, and the "Not done" list is
-what remains before P5 can be called complete.
+- No 24-hour WebSocket lifecycle / reconnect-storm test specific to Spot
+  beyond what `WebSocketClient`'s own venue-agnostic tests already cover.
+- `feature_computer`-style derived microstructure features (OBI, spread,
+  micro_price) are not computed for Spot -- `SPOT_ORDERBOOK_RAW_SCHEMA`
+  stores raw canonical book state only, matching
+  `BINANCE_ORDERBOOK_RAW_SCHEMA`'s precedent, not the older
+  feature-computed `ORDERBOOK_SCHEMA`. Deliberate: inventing a
+  feature-computation path for one venue outside its own verified phase
+  was explicitly out of scope (task's own §20).
+- Whether `aggTrade` should also be collected for Spot remains an open
+  question, unchanged from the prior pass -- not decided here either.
