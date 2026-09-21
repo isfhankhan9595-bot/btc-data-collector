@@ -55,7 +55,14 @@ ORDERBOOK_SCHEMA = pa.schema([
     ("obi_level_1", pa.float64()),
     ("obi_level_3", pa.float64()),
     ("obi_level_5", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "orderbook", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "orderbook", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key (InstrumentId.key, e.g. "
+                          "'BINANCE|linear_perpetual|BTC-USDT|BTCUSDT'); missing on rows "
+                          "written before this version, never fabricated for them. This "
+                          "stream is per-event resolved from BinanceAdapter.normalize()'s "
+                          "own instrument stamp (see adapters/base.py __init_subclass__), "
+                          "not a blind constant -- see instrument.py"})
 
 TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -67,13 +74,19 @@ TRADES_SCHEMA = pa.schema([
     ("is_buyer_maker", pa.bool_()),
     ("side_sign", pa.int8()),
     ("signed_qty", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "trades", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "trades", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key; see orderbook v1.1 note -- "
+                          "same per-event BinanceAdapter.normalize() resolution"})
 
 BINANCE_TRADES_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")), ("local_receive_ts", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")), ("trade_id", pa.int64()),
     ("native_trade_id", pa.string()), ("price", pa.float64()), ("quantity", pa.float64()),
-], metadata={"schema_version": "2.0", "migration": "v2: native_trade_id is authoritative; legacy trade_id is nullable", "stream_name": "binance_trades_raw", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "2.1", "migration": "v2: native_trade_id is authoritative; legacy trade_id is nullable. "
+                                                     "v2.1 adds nullable instrument_key; see orderbook v1.1 note",
+             "stream_name": "binance_trades_raw", "symbol": SYMBOL})
 
 MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -84,14 +97,26 @@ MARKPRICE_SCHEMA = pa.schema([
     ("next_funding_time", pa.int64()),
     ("funding_rate_bps", pa.float64()),
     ("hours_to_funding", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "markprice", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "markprice", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key. This stream bypasses "
+                          "BinanceAdapter (legacy raw-dict handler, see run_collector."
+                          "_handle_markprice): the key is the validated BINANCE_USDM_BTCUSDT "
+                          "constant, stamped only after the payload's own 's' symbol field "
+                          "(when present) is checked against config.SYMBOL -- a mismatch is "
+                          "rejected, never silently stamped"})
 
 OPENINTEREST_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("open_interest", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "openinterest", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "openinterest", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key, resolved in binance_oi."
+                          "normalize_binance_oi from the REST response's own 'symbol' field "
+                          "via instrument.resolve_instrument -- never fabricated for a "
+                          "response whose symbol does not match what was requested"})
 
 LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -103,7 +128,12 @@ LIQUIDATION_SCHEMA = pa.schema([
     ("signed_qty", pa.float64()),
     ("order_status", pa.string()),
     ("time_in_force", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "liquidation", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "liquidation", "symbol": SYMBOL,
+             "migration": "v1.1 adds nullable instrument_key. forceOrder is a symbol-scoped "
+                          "subscription (btcusdt@forceOrder), unlike OKX's instType-scoped "
+                          "liquidation-orders channel -- see run_collector._handle_liquidation "
+                          "for the same payload-symbol contradiction check as markprice"})
 
 # Bybit canonical schemas (Phase 8).
 #
@@ -214,7 +244,12 @@ BINANCE_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("bids", pa.list_(pa.list_(pa.string()))), ("asks", pa.list_(pa.list_(pa.string()))),
     ("update_id", pa.int64()), ("first_update_id", pa.int64()), ("previous_update_id", pa.int64()),
     ("book_source", pa.string()), ("event_kind", pa.string()), ("recovery_generation", pa.int64()), ("quality_state", pa.string()),
-], metadata={"schema_version": "2.0", "migration": "v2: book levels are canonical decimal strings; timestamp is canonical local event processing timestamp", "stream_name": "binance_orderbook_raw", "symbol": SYMBOL})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "2.1", "migration": "v2: book levels are canonical decimal strings; timestamp is canonical local event "
+                                                     "processing timestamp. v2.1 adds nullable instrument_key; see orderbook v1.1 note -- "
+                                                     "every row here is a committed book event carried through from an adapter-normalized "
+                                                     "diff, so it carries the same per-event instrument stamp",
+             "stream_name": "binance_orderbook_raw", "symbol": SYMBOL})
 
 QUALITY_EVENTS_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
