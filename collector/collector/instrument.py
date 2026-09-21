@@ -103,6 +103,23 @@ class InstrumentId:
         return cls(data["exchange"], data["market_type"], data["instrument"], data["native_symbol"])
 
 
+def _is_null_cell(value: object) -> bool:
+    """Whether a stored cell is a null, in any form the read paths produce.
+
+    ``pyarrow`` yields ``None``; ``pandas`` (which this repository's readers use,
+    see ``replay._row_venue``) yields a float ``NaN`` for a null string cell, and
+    ``pandas.NA`` for nullable dtypes. Recognising only ``None`` would classify
+    a legitimate explicit null as malformed depending on which reader produced
+    the row. Only a *NaN* float counts: any other float is a corrupted value.
+    ``pandas.NA`` is recognised by type name so this module stays pandas-free.
+    """
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return value != value
+    return type(value).__name__ == "NAType"
+
+
 def resolve_canonical_instrument_key(row: dict, *, expected: InstrumentId) -> Optional[InstrumentId]:
     """Resolve a canonical Parquet row's ``instrument_key`` column.
 
@@ -115,7 +132,8 @@ def resolve_canonical_instrument_key(row: dict, *, expected: InstrumentId) -> Op
 
     * column absent entirely (a legacy row, written before this column
       existed) -> ``None``. Missing is not malformed.
-    * column present but explicitly ``null`` -> ``None``. Same resolved
+    * column present but explicitly ``null`` (``None``, or the ``NaN`` / ``pandas.NA``
+      that pandas hands back for a null cell) -> ``None``. Same resolved
       value as the legacy case (both genuinely have no persisted identity),
       but reached without raising -- an explicit null is not corruption.
     * column present with a value that parses and matches ``expected`` ->
@@ -130,8 +148,13 @@ def resolve_canonical_instrument_key(row: dict, *, expected: InstrumentId) -> Op
     if "instrument_key" not in row:
         return None
     raw = row["instrument_key"]
-    if raw is None:
+    if _is_null_cell(raw):
         return None
+    if not isinstance(raw, str):
+        # A non-string, non-null cell (an int, a list, 1.5) is a corrupted
+        # value, not an absent one -- and must fail as InstrumentIdError like
+        # every other malformed key, not as an incidental AttributeError.
+        raise InstrumentIdError(f"instrument_key must be a str or null, got {raw!r}")
     parsed = InstrumentId.from_key(raw)
     if parsed != expected:
         raise InstrumentIdError(

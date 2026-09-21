@@ -18,6 +18,12 @@ from collector.collector.config import (
     ORDERBOOK_SCHEMA,
     TRADES_SCHEMA,
 )
+from collector.collector.instrument import (
+    BINANCE_USDM_BTCUSDT,
+    InstrumentId,
+    InstrumentIdError,
+    resolve_canonical_instrument_key,
+)
 from collector.collector.utils import logger
 from collector.collector.storage_layout import iter_segments, parse_segment_name
 STREAM_SCHEMAS: dict[str, pa.Schema] = {
@@ -28,6 +34,15 @@ STREAM_SCHEMAS: dict[str, pa.Schema] = {
     "liquidation": LIQUIDATION_SCHEMA,
 }
 ALL_STREAMS = tuple(STREAM_SCHEMAS.keys())
+#: Every stream compacted here is a Binance USD-M BTCUSDT stream, so each row's
+#: persisted ``instrument_key`` must be null or exactly this identity.
+STREAM_INSTRUMENT: InstrumentId = BINANCE_USDM_BTCUSDT
+#: Columns a pre-migration (legacy) hourly segment may legitimately lack. Only
+#: ``instrument_key`` (added by the v1.1 schema migrations) qualifies; any other
+#: missing column is still a hard error. Absent -> filled with nulls, never with
+#: a fabricated identity: null means "unidentified", the same value the resolver
+#: returns for a legacy row.
+LEGACY_ABSENT_COLUMNS = frozenset({"instrument_key"})
 TIMESTAMP_TYPE = pa.timestamp("ms", tz="UTC")
 DEFAULT_GUARD_SECONDS = 90
 class CompactionError(RuntimeError):
@@ -231,6 +246,9 @@ def _align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     arrays = []
     for field in schema:
         if field.name not in table.column_names:
+            if field.name in LEGACY_ABSENT_COLUMNS and field.nullable:
+                arrays.append(pa.nulls(table.num_rows, type=field.type))
+                continue
             raise CompactionError(f"missing required column: {field.name}")
         arrays.append(table.column(field.name).cast(field.type))
     return pa.Table.from_arrays(arrays, schema=schema)
@@ -240,6 +258,7 @@ def _validate_table(table: pa.Table, stream: str) -> None:
         raise CompactionError("hourly file contains no rows")
     if timestamps.null_count:
         raise CompactionError("timestamp column contains null values")
+    _validate_instrument_key_column(table)
     timestamp_ms = timestamps.cast(pa.int64())
     left = timestamp_ms.slice(0, table.num_rows - 1)
     right = timestamp_ms.slice(1)
@@ -253,6 +272,25 @@ def _validate_table(table: pa.Table, stream: str) -> None:
         _raise_if_duplicate_groups(table, ["timestamp"], f"duplicate timestamp values found in {stream}")
     if stream == "orderbook":
         _warn_orderbook_quality(table)
+def _validate_instrument_key_column(table: pa.Table) -> None:
+    """Fail loudly on a malformed or contradictory persisted identity.
+
+    Null is allowed (legacy / unidentified). Any non-null value must be exactly
+    this stream's identity; the first offending value is re-run through the
+    canonical resolver so the error says whether it was malformed or
+    contradictory, instead of being copied silently into the daily file.
+    """
+    column = table.column("instrument_key")
+    offending = pc.filter(column, pc.and_(pc.is_valid(column),
+                                          pc.not_equal(column, pa.scalar(STREAM_INSTRUMENT.key))))
+    if len(offending) == 0:
+        return
+    value = offending[0].as_py()
+    try:
+        resolve_canonical_instrument_key({"instrument_key": value}, expected=STREAM_INSTRUMENT)
+    except InstrumentIdError as exc:
+        raise CompactionError(f"invalid instrument_key in hourly file: {exc}") from exc
+    raise CompactionError(f"instrument_key {value!r} does not equal {STREAM_INSTRUMENT.key!r}")
 def _raise_if_duplicate_groups(table: pa.Table, keys: list[str], message: str) -> None:
     grouped = table.select(keys).group_by(keys).aggregate([([], "count_all")])
     counts = grouped.column("count_all")

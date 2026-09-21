@@ -16,6 +16,7 @@ from collector.collector.config import (
     ORDERBOOK_SCHEMA,
     TRADES_SCHEMA,
 )
+from collector.collector.instrument import BINANCE_USDM_BTCUSDT
 from collector.scripts import compact_daily as cd
 
 DATE = "2026-06-10"
@@ -46,6 +47,10 @@ def _values_for_field(stream, field, timestamps, offset=0):
     if pa.types.is_boolean(field.type):
         return [False for _ in range(n)]
     if pa.types.is_string(field.type):
+        if name == "instrument_key":
+            # A real identity: compaction now rejects any non-null value that is not
+            # the stream's own (a filler string here was silently copied through).
+            return [BINANCE_USDM_BTCUSDT.key for _ in range(n)]
         return ["FILLED" if name == "order_status" else "GTC" for _ in range(n)]
     if pa.types.is_int64(field.type):
         if name == "trade_id":
