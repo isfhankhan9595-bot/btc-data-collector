@@ -569,8 +569,11 @@ class ReplayEngine:
             })
             return
         try:
+            # `symbol` is what live passes; omitting it left replayed OI events
+            # unidentified while live's were identified (live != replay).
             event = normalize_binance_oi(
-                frame.payload, response_receive_ts=frame.timestamp_ms)
+                frame.payload, response_receive_ts=frame.timestamp_ms,
+                symbol=self.adapter.instrument.native_symbol)
         except BinanceOIParseError as exc:
             self.result.oi_rejected += 1
             self.result.quality_events.append({
@@ -640,13 +643,11 @@ class ReplayEngine:
         # directly or a Spot snapshot would compare unequal to every diff
         # BinanceSpotAdapter itself produces for the exact same book.
         is_spot = self.venue == "BINANCE_SPOT"
-        snapshot_event = CanonicalOrderBookEvent(
-            "BINANCE", "spot_orderbook" if is_spot else "orderbook", None, None,
-            frame.timestamp_ms, market_type="spot" if is_spot else "linear_perpetual",
-            local_process_ts=frame.timestamp_ms, bids=bids, asks=asks,
-            update_id=last_update_id, is_snapshot=True,
-            book_source="DIFF_DEPTH_RECONSTRUCTED",
-        )
+        # Built by the same adapter method the live runners call, so replay's
+        # snapshot event has exactly live's stream, market_type and instrument.
+        snapshot_event = self.adapter.snapshot_event(
+            last_update_id, bids, asks,
+            local_receive_ts=frame.timestamp_ms, local_process_ts=frame.timestamp_ms)
         before = self.book.state.state
         if not self.book.binance_snapshot(last_update_id, snapshot_event):
             after = self.book.state.state

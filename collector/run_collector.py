@@ -421,9 +421,11 @@ class CollectorApp:
                 local_process_ts=process_ts))
             if not isinstance(snapshot, dict) or "lastUpdateId" not in snapshot: raise ValueError("missing_last_update_id")
             if not snapshot.get("bids") or not snapshot.get("asks"): raise ValueError("empty_snapshot")
-            snapshot_event=CanonicalOrderBookEvent("BINANCE","orderbook",None,None,receive_ts, local_process_ts=process_ts,
-                bids=tuple((Decimal(p),Decimal(q)) for p,q in snapshot["bids"]), asks=tuple((Decimal(p),Decimal(q)) for p,q in snapshot["asks"]),
-                update_id=int(snapshot["lastUpdateId"]),is_snapshot=True,book_source="DIFF_DEPTH_RECONSTRUCTED")
+            snapshot_event=self.binance_adapter.snapshot_event(
+                int(snapshot["lastUpdateId"]),
+                tuple((Decimal(p),Decimal(q)) for p,q in snapshot["bids"]),
+                tuple((Decimal(p),Decimal(q)) for p,q in snapshot["asks"]),
+                local_receive_ts=receive_ts, local_process_ts=process_ts)
             async with self._book_snapshot_lock:
                 if not self.binance_book.binance_snapshot(snapshot_event.update_id,snapshot_event):
                     why=self.binance_book.last_reason

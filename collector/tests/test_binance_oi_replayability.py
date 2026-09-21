@@ -17,6 +17,7 @@ import json
 
 import pytest
 
+from collector.collector.config import SYMBOL
 from collector.collector.binance_oi import BinanceOIParseError, normalize_binance_oi
 from collector.collector.canonical import CanonicalOIEvent, OISource, OIUnit
 from collector.collector.replay import FrameKind, ReplayEngine, ReplaySource
@@ -105,7 +106,10 @@ def test_replay_produces_an_oi_event_from_a_recorded_response():
 def test_live_and_replay_produce_identical_canonical_events_from_the_same_body():
     """The actual G2 contract: one normalizer, two call sites, same output."""
     body = json.dumps({"openInterest": "999.9", "time": BASE_TS - 100})
-    live_event = normalize_binance_oi(body, response_receive_ts=BASE_TS)
+    # Built exactly as run_collector's poll loop calls it (symbol=SYMBOL). Omitting
+    # `symbol` here mirrored replay's own omission, so the test asserted equality
+    # while live's identified event and replay's unidentified one differed.
+    live_event = normalize_binance_oi(body, response_receive_ts=BASE_TS, symbol=SYMBOL)
 
     source = ReplaySource.from_records(rest_rows=[{
         "purpose": "open_interest", "response_receive_ts": BASE_TS,
@@ -113,6 +117,7 @@ def test_live_and_replay_produce_identical_canonical_events_from_the_same_body()
     }])
     replay_event = ReplayEngine().run(source).non_book_events[0]
 
+    assert live_event.instrument is not None
     assert live_event == replay_event
 
 

@@ -1377,3 +1377,28 @@ Base `main` @ `3be06f7`, 781 tests. New: `collector/collector/instrument.py`,
 **Not claimed:** canonical derived streams have no explicit instrument column (raw layer does);
 namespaces are single-instrument and replay does not cross-check a row's `symbol` against the
 adapter; Bybit spot / COIN-M / inverse unregistered; no live verification.
+
+### Phase E - live/replay identity parity - **IMPLEMENTED, TESTED; not COMPLETE until merged (ancestry recorded on the PR)**
+
+Base `main` @ `3389c3b`, 964 tests. Two real defects found by tracing, plus one false comment:
+
+| # | Defect | Root cause | Fix |
+|---|---|---|---|
+| E1 | REST depth snapshot events carried **no identity**; the snapshot row persisted beside diff rows had a null `instrument_key` (accidentally lost, not legitimately unidentified) | snapshot event hand-built at 3 sites (replay, Spot runner, USD-M runner), bypassing the adapter stamp | one `snapshot_event()` on each Binance adapter, used by all three sites |
+| E2 | Replayed Binance OI events were **unidentified**; live's were identified | replay called `normalize_binance_oi` without `symbol` | replay passes the adapter's native symbol |
+| E3 | Bybit runner comment claimed the adapter attaches no identity | stale; `__init_subclass__` stamping is active | comment corrected; runner now cross-checks the event's identity and raises on contradiction |
+
+An existing test (`test_live_and_replay_produce_identical_canonical_events_from_the_same_body`)
+built its "live" side without `symbol`, mirroring replay's omission, so it passed while live != replay.
+Its live side now uses `symbol=SYMBOL` as the runner does; no assertion was weakened.
+
+`tests/test_phase_e_identity_parity.py` (19): full identity compared field by field for every
+non-book event type on all four venues (live vs replay), snapshot and diff events fed to the book
+engine, OKX legitimately-unidentified vs accidentally-lost, a structural guard against hand-built
+book events, and raw -> adapter -> replay -> alignment end to end. Mutation-checked (all fail):
+stamping removed 23, Bybit loses identity 10, Spot -> USD-M 9, market_type out of equality 6,
+replay snapshot identity != live 2, OKX index-tickers faked 3, OI symbol dropped 2, snapshot
+constructors unstamped 3+3, Bybit guard removed 1.
+
+**Not verified this phase:** Phase D read-path cases 1-14 and mutations G/H were not re-run (covered by
+Phase D's own tests); Phase F (alignment audit) not started beyond the end-to-end test; no live verification.

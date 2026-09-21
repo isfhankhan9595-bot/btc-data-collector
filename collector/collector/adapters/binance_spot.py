@@ -71,6 +71,21 @@ class BinanceSpotAdapter(ExchangeAdapter):
     }
     sequence_comparator = SpotSequenceComparator()
 
+    def snapshot_event(self, last_update_id, bids, asks, *, local_receive_ts, local_process_ts=None):
+        """The one place a REST depth snapshot becomes a canonical book event.
+
+        Live runners and replay both call this. Building the event by hand at each
+        site (the previous state) bypassed the adapter's identity stamp, so the
+        snapshot row persisted beside diff rows carried a null ``instrument_key``,
+        and live and replay could only agree by both being wrong.
+        """
+        event = CanonicalOrderBookEvent(
+            "BINANCE", "spot_orderbook", None, None, local_receive_ts, local_process_ts=local_process_ts,
+            market_type=MARKET_TYPE_SPOT,
+            bids=bids, asks=asks, update_id=last_update_id, is_snapshot=True,
+            book_source="DIFF_DEPTH_RECONSTRUCTED")
+        return self._stamp_instrument([event])[0]
+
     def connect(self):
         return None
 

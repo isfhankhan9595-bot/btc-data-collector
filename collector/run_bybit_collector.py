@@ -73,7 +73,7 @@ from collector.collector.config import (
     SYMBOL,
 )
 from collector.collector.backoff import ExponentialBackoff
-from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT
+from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT, InstrumentIdError
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
@@ -218,13 +218,16 @@ class BybitCollectorApp:
             # module-level SYMBOL constant (config.py), so this process
             # cannot receive any instrument other than BYBIT_LINEAR_BTCUSDT
             # -- there is no other symbol for the wire to disagree with.
-            # BybitAdapter does not itself attach an InstrumentId to events
-            # (unlike the OKX/Binance adapter paths), so there is nothing
-            # from the event to prefer here; this is not a shortcut around
-            # a per-event identity that exists elsewhere and is being
-            # skipped, there simply is none.
+            # BybitAdapter DOES stamp every instrument-scoped event with
+            # BYBIT_LINEAR_BTCUSDT (ExchangeAdapter.__init_subclass__ wraps its
+            # normalize()). The constant is therefore not a substitute for the
+            # event's identity: it is cross-checked against it below, and a
+            # contradiction fails loudly instead of being persisted.
             "instrument_key": BYBIT_LINEAR_BTCUSDT.key,
         }
+        if event.instrument is not None and event.instrument != BYBIT_LINEAR_BTCUSDT:
+            raise InstrumentIdError(
+                f"Bybit event carries {event.instrument.key}, not {BYBIT_LINEAR_BTCUSDT.key}")
         if isinstance(event, CanonicalOrderBookEvent):
             self._apply_orderbook(event, base)
         elif isinstance(event, CanonicalTradeEvent):

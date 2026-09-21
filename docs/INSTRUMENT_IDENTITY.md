@@ -114,6 +114,23 @@ sitting in a Bybit row is corruption, not an unusual-but-valid identity).
 this needs the same validated-constant treatment Bybit got, applied
 case-by-case per the legacy-handler caveats below, not a blanket stamp.
 
+## Replay identity: what is the source of truth?
+
+**Raw venue frame + the venue's adapter.** Replay reads only `raw_wire` / `raw_rest`
+and recomputes identity by running the same adapter (and the same shared
+constructors) that live runs. The `instrument_key` persisted on canonical Parquet
+streams is a *derived assertion*: replay never reads it, so a corrupted persisted
+key cannot become truth in replay. Canonical readers (compaction, Phase D) validate
+a persisted key against the stream's expected identity and reject malformed or
+contradictory values rather than trusting them or collapsing them to unidentified.
+
+Two live/replay divergences were closed by making live and replay share one
+constructor: REST depth snapshots are built only by `BinanceAdapter.snapshot_event`
+/ `BinanceSpotAdapter.snapshot_event` (stamped), and replay's Binance OI call passes
+the adapter's native symbol exactly as live does. `BookUpdate` carries no identity by
+design: a replay run is bound to one venue/instrument through its adapter, and the
+identity is asserted on the events that feed the book engine (tests capture them).
+
 ## Intentionally not part of identity
 
 Tick/lot size, contract value, margin currency, listing status, index
