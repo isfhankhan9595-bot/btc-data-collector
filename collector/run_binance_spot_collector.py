@@ -279,6 +279,10 @@ class BinanceSpotCollectorApp:
                 "local_timestamp": event.local_receive_ts,
                 "trade_id": event.trade_id, "price": event.price,
                 "quantity": event.quantity, "side": event.side,
+                # Per-event stamp from BinanceSpotAdapter.normalize() via the
+                # generic ExchangeAdapter.__init_subclass__ mechanism (see
+                # adapters/base.py) -- not re-derived here.
+                "instrument_key": event.instrument.key if event.instrument is not None else None,
             })
             self.stream_counters["trades"]["written"] += 1
             return
@@ -311,6 +315,8 @@ class BinanceSpotCollectorApp:
                             "previous_update_id": pending_applied.previous_update_id,
                             "book_source": pending_applied.book_source, "event_kind": event_kind,
                             "recovery_generation": generation, "quality_state": pending_applied.quality_state,
+                            "instrument_key": (pending_applied.instrument.key
+                                               if pending_applied.instrument is not None else None),
                         })
                         self.stream_counters["orderbook"]["written"] += 1
                     self.book.committed_recovery_events = []
@@ -341,6 +347,10 @@ class BinanceSpotCollectorApp:
                 "book_source": applied.book_source, "event_kind": "NORMAL_INCREMENTAL",
                 "recovery_generation": self.book.recovery_generation,
                 "quality_state": applied.quality_state,
+                # Carried through from BinanceSpotAdapter.normalize()'s per-event
+                # stamp via LocalBook's dataclasses.replace (see book_engine.py),
+                # never re-derived here -- same pattern as Phase B's USD-M writer.
+                "instrument_key": applied.instrument.key if applied.instrument is not None else None,
             })
             self.stream_counters["orderbook"]["written"] += 1
 
@@ -434,6 +444,7 @@ class BinanceSpotCollectorApp:
                     "previous_update_id": applied.previous_update_id,
                     "book_source": applied.book_source, "event_kind": event_kind,
                     "recovery_generation": generation, "quality_state": applied.quality_state,
+                    "instrument_key": applied.instrument.key if applied.instrument is not None else None,
                 })
             self.book.committed_recovery_events = []
             self._persist_quality_event({
