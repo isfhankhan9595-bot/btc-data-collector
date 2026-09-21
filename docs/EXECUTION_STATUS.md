@@ -1402,3 +1402,53 @@ constructors unstamped 3+3, Bybit guard removed 1.
 
 **Not verified this phase:** Phase D read-path cases 1-14 and mutations G/H were not re-run (covered by
 Phase D's own tests); Phase F (alignment audit) not started beyond the end-to-end test; no live verification.
+
+### Phase G — Causal observation layer: the missing consumer of `causally_align()` — **COMPLETE**
+
+- **Branch:** `phase-g-causal-observation-integration` (base: `main` @ `14a93b7`, post-merge of PR #41)
+- **Objective:** `causally_align()` (Phase F) had no production or replay
+  caller. Design and implement the smallest correct consumer.
+- **Architecture decision (recorded in the module docstring, not just here):**
+  `causally_align()` stays a pure primitive — no changes to it, no changes
+  needed given Phase F's existing mutation-tested coverage.
+  `MarketStateEngine` was considered and rejected as the integration point:
+  it is explicitly venue-local by prior design and reimplements the same
+  `local_receive_ts <= observation_ts` rule in its own `_available_at()` for
+  a genuinely different data shape (per-venue derived state, not
+  cross-venue identity-keyed latest-event lookup) — not a duplicate worth
+  consolidating. The gap was a missing *stateful accumulator* around the
+  pure function, which is what this phase adds.
+- **New `collector/pipeline/observation.py`:**
+  - `CausalObservationBuilder` — accumulates canonical events (`append`/
+    `extend`), calls `causally_align()` fresh on every `snapshot()` call
+    (deliberate reference-first design, O(N) per call, not prematurely
+    optimized — see module docstring for the explicit reasoning).
+  - `ObservationSnapshot` — a thin, self-describing wrapper recording
+    `observation_ts`/`staleness_ms` alongside the alignment result, since
+    the bare dict doesn't record what question produced it.
+  - `CausalObservationBuilder.from_replay_result()` — the replay half of
+    live/replay parity, seeded from `ReplayResult.non_book_events`.
+  - **Known limitation, stated in the docstring and asserted by a test:**
+    order-book state is explicitly out of scope. `ReplayResult.book_updates`
+    holds `BookUpdate` records, not `CanonicalOrderBookEvent`-shaped objects
+    with the attributes `causally_align()` requires; retrofitting that would
+    be a real change to `replay.py`, not "the smallest correct architecture".
+- **Tests:** `tests/test_causal_observation.py` — 48 tests: basic, causal
+  boundary, the future-timestamp trap (both directions), staleness
+  thresholds, `NEVER_OBSERVED` distinctness, quality-independent-of-
+  availability, multi-venue/multi-instrument/unidentified identity
+  isolation, no forced cross-venue synchronization, determinism under
+  shuffled input, purity (buffer and event immutability), late-arrival
+  non-retroactivity, and replay parity against `ReplayEngine`.
+- **Mutation testing — performed against the real source, not just pinned
+  assertions:** (1) boundary `>` → `>=` (inclusive-becomes-exclusive) — 17
+  tests failed across both this file and the existing
+  `test_cross_exchange_alignment.py`. (2) eligibility switched from
+  `local_receive_ts` to `exchange_event_ts` — caught. (3) `instrument`
+  dropped from `alignment_key` (identity collapse) — caught. All three
+  mutations restored; full suite reverified at 1056 passed after each.
+- **Suite:** 1056 passed, 0 failed (baseline: 1008). Both `pytest` (root)
+  and `pytest collector` (G4 contract) invocations agree.
+- **Live/production status:** repository and replay work only. The
+  production AWS collector was not touched, accessed, or referenced by any
+  code change in this phase.
