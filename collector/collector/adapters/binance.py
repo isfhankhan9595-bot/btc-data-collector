@@ -13,6 +13,20 @@ class BinanceAdapter(ExchangeAdapter):
     instrument = BINANCE_USDM_BTCUSDT
     channel_event_types = {"<symbol>@depth@100ms": ("CanonicalOrderBookEvent",), "<symbol>@depth10@100ms": ("CanonicalOrderBookEvent",), "<symbol>@aggTrade": ("CanonicalTradeEvent",), "<symbol>@markPrice@1s": ("CanonicalMarkPriceEvent",), "<symbol>@forceOrder": ("CanonicalLiquidationEvent",)}
     sequence_comparator = BinanceSequenceComparator()
+
+    def snapshot_event(self, last_update_id, bids, asks, *, local_receive_ts, local_process_ts=None):
+        """The one place a REST depth snapshot becomes a canonical book event.
+
+        Live runners and replay both call this. Building the event by hand at each
+        site (the previous state) bypassed the adapter's identity stamp, so the
+        snapshot row persisted beside diff rows carried a null ``instrument_key``,
+        and live and replay could only agree by both being wrong.
+        """
+        event = CanonicalOrderBookEvent(
+            "BINANCE", "orderbook", None, None, local_receive_ts, local_process_ts=local_process_ts,
+            bids=bids, asks=asks, update_id=last_update_id, is_snapshot=True,
+            book_source="DIFF_DEPTH_RECONSTRUCTED")
+        return self._stamp_instrument([event])[0]
     def connect(self): return None
     def subscribe_message(self, streams): return {"method":"SUBSCRIBE", "params":list(streams), "id":1}
     def route_message(self, raw):

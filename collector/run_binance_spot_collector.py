@@ -400,11 +400,8 @@ class BinanceSpotCollectorApp:
             last_update_id = int(snapshot["lastUpdateId"])
             bids = tuple((Decimal(p), Decimal(q)) for p, q in snapshot["bids"])
             asks = tuple((Decimal(p), Decimal(q)) for p, q in snapshot["asks"])
-            snapshot_event = CanonicalOrderBookEvent(
-                "BINANCE", "spot_orderbook", None, None, receive_ts,
-                local_process_ts=process_ts, market_type="spot",
-                bids=bids, asks=asks, update_id=last_update_id, is_snapshot=True,
-                book_source="DIFF_DEPTH_RECONSTRUCTED")
+            snapshot_event = self.adapter.snapshot_event(
+                last_update_id, bids, asks, local_receive_ts=receive_ts, local_process_ts=process_ts)
 
             async with self._book_lock:
                 bridged = self.book.binance_snapshot(last_update_id, snapshot_event)
