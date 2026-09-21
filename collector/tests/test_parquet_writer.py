@@ -6,6 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pa_parquet
 import pandas as pd
 from collector.collector.parquet_writer import ParquetWriter
+from collector.collector.instrument import BINANCE_USDM_BTCUSDT
 
 @pytest.fixture
 def temp_dir(tmp_path):
@@ -96,6 +97,7 @@ def _trade_record(timestamp_ms=1770000000000):
         "is_buyer_maker": False,
         "side_sign": 1,
         "signed_qty": 0.25,
+        "instrument_key": BINANCE_USDM_BTCUSDT.key,
     }
 
 
@@ -139,6 +141,7 @@ def _openinterest_record(timestamp_ms=1770000000000):
         "exchange_timestamp": timestamp_ms + 1,
         "local_timestamp": timestamp_ms + 2,
         "open_interest": 123.45,
+        "instrument_key": BINANCE_USDM_BTCUSDT.key,
     }
 
 
@@ -153,6 +156,7 @@ def _liquidation_record(timestamp_ms=1770000000000):
         "signed_qty": 0.5,
         "order_status": "FILLED",
         "time_in_force": "IOC",
+        "instrument_key": BINANCE_USDM_BTCUSDT.key,
     }
 
 

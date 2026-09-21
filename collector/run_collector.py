@@ -23,6 +23,7 @@ from collector.collector.config import (
     SYMBOL,
 )
 from collector.collector.adapters.binance import BinanceAdapter
+from collector.collector.instrument import BINANCE_USDM_BTCUSDT
 from collector.collector.raw_capture import RawCapture, RawRestRecord, RawWireRecord
 from collector.collector.backoff import ExponentialBackoff, rate_limit_penalty
 from collector.collector.recovery_control import RecoveryController
@@ -504,6 +505,9 @@ class CollectorApp:
             features=compute_orderbook_features(data)
             if not features: self.stream_counters["orderbook"]["empty_features"] += 1; return
             features["timestamp"]=applied.local_process_ts; features["local_timestamp"]=applied.local_receive_ts; features["exchange_timestamp"]=applied.exchange_event_ts
+            # Same per-event stamp as raw_book_writer's row above -- not re-derived,
+            # just carried from the same `applied` event into this sibling writer.
+            features["instrument_key"]=applied.instrument.key if applied.instrument is not None else None
             self._write_orderbook_features(features)
 
     def _persist_reconstructed_books(self, rows):
@@ -515,7 +519,12 @@ class CollectorApp:
                 "local_receive_ts":applied.local_receive_ts,"local_process_ts":applied.local_process_ts,
                 "bids":[[str(p),str(q)] for p,q in applied.bids],"asks":[[str(p),str(q)] for p,q in applied.asks],"update_id":applied.update_id,
                 "first_update_id":applied.first_update_id,"previous_update_id":applied.previous_update_id,
-                "book_source":applied.book_source,"event_kind":event_kind,"recovery_generation":generation,"quality_state":applied.quality_state})
+                "book_source":applied.book_source,"event_kind":event_kind,"recovery_generation":generation,"quality_state":applied.quality_state,
+                # Carried through from BinanceAdapter.normalize()'s per-event stamp (see
+                # adapters/base.py); this row IS that same event after book-state merge
+                # (book_engine.LocalBook uses dataclasses.replace, which preserves fields
+                # it does not touch), never re-derived here.
+                "instrument_key": applied.instrument.key if applied.instrument is not None else None})
 
     def _write_orderbook_features(self, features: dict):
         self.stream_counters["orderbook"]["computed"] += 1
@@ -549,11 +558,13 @@ class CollectorApp:
             try: trade_id = self._lossless_legacy_trade_id(event.trade_id)
             except (TypeError, ValueError): trade_id = None
             process_ts = int(time.time() * 1000)
+            instrument_key = event.instrument.key if event.instrument is not None else None
             raw_trade_writer=getattr(self, "raw_trades_writer", None)
             if raw_trade_writer is not None:
                 raw_trade_writer.write({"timestamp":process_ts, "local_receive_ts":event.local_receive_ts,
                     "exchange_timestamp":event.exchange_transaction_ts or event.exchange_event_ts, "trade_id":trade_id,
-                    "native_trade_id":event.trade_id, "price":event.price, "quantity":event.quantity})
+                    "native_trade_id":event.trade_id, "price":event.price, "quantity":event.quantity,
+                    "instrument_key": instrument_key})
             if trade_id is None:
                 self.stream_counters["trades"]["rejected"] += 1
                 self._record_validation_rejection("trades", "legacy_trade_id_not_lossless")
@@ -566,6 +577,7 @@ class CollectorApp:
                 "is_buyer_maker": event.side == "SELL",
                 "side_sign": -1 if event.side == "SELL" else 1,
                 "signed_qty": -event.quantity if event.side == "SELL" else event.quantity,
+                "instrument_key": instrument_key,
             }
             self._handle_trade_features(features)
         self._drain_integrity_quality_events()
@@ -628,14 +640,43 @@ class CollectorApp:
         self.stream_counters["trades"]["written"] += 1
         self.health_monitor.record_message("trades", features["timestamp"])
 
+    def _binance_usdm_instrument_key(self, native_symbol, *, stream_name: str):
+        """The validated BINANCE_USDM_BTCUSDT key, or None if the payload contradicts it.
+
+        Used by the legacy raw-dict handlers (markprice, liquidation) that bypass
+        BinanceAdapter.normalize() and so never get the per-event instrument stamp
+        adapters/base.py provides. Both this collector's WS URLs are hardcoded to
+        BTCUSDT-only streams and _route_stream already re-checks the envelope's
+        stream name prefix before either handler is ever reached -- two independent
+        layers proving this process cannot receive another instrument -- but a
+        payload's own symbol field (when the venue includes one) is still checked
+        rather than trusted blindly. Absence of the field is not a contradiction
+        (older/partial payloads); only an explicit mismatch is.
+        """
+        if native_symbol is not None and native_symbol != SYMBOL:
+            self._persist_quality_event({
+                "stream": stream_name, "event_type": QualityEventType.ERROR,
+                "reason": f"symbol_contradicts_configured_instrument:{native_symbol}",
+                "rows_lost": 1, "local_ts": int(time.time() * 1000)})
+            return None
+        return BINANCE_USDM_BTCUSDT.key
+
     def _handle_liquidation(self, data: dict, stream: str):
         self.stream_counters["liquidation"]["received"] += 1
         try:
+            instrument_key = self._binance_usdm_instrument_key(
+                data.get("o", {}).get("s") if isinstance(data.get("o"), dict) else None,
+                stream_name="liquidation")
+            if instrument_key is None:
+                self.stream_counters["liquidation"]["rejected"] += 1
+                self._record_validation_rejection("liquidation", "symbol_contradicts_configured_instrument")
+                return
             features = compute_liquidation_features(data)
             if not features:
                 self.stream_counters["liquidation"]["empty_features"] += 1
                 logger.warning("Feature extraction returned empty", stream="liquidation", raw_stream=stream, keys=sorted(data.keys()))
                 return
+            features["instrument_key"] = instrument_key
             self.stream_counters["liquidation"]["computed"] += 1
             valid, reason = self.validator.validate_liquidation(features)
             self._drain_integrity_quality_events()
@@ -656,11 +697,17 @@ class CollectorApp:
 
     def _handle_markprice(self, data: dict, stream: str):
         self.stream_counters["markprice"]["received"] += 1
+        instrument_key = self._binance_usdm_instrument_key(data.get("s"), stream_name="markprice")
+        if instrument_key is None:
+            self.stream_counters["markprice"]["rejected"] += 1
+            self._record_validation_rejection("markprice", "symbol_contradicts_configured_instrument")
+            return
         features = compute_markprice_features(data)
         if not features:
             self.stream_counters["markprice"]["empty_features"] += 1
             logger.warning("Feature extraction returned empty", stream="markprice", raw_stream=stream, keys=sorted(data.keys()))
             return
+        features["instrument_key"] = instrument_key
         self.stream_counters["markprice"]["computed"] += 1
         valid, reason = self.validator.validate_markprice(features)
         self._drain_integrity_quality_events()
@@ -775,6 +822,10 @@ class CollectorApp:
                         "exchange_timestamp": event.exchange_event_ts,
                         "local_timestamp": event.local_receive_ts,
                         "open_interest": event.open_interest,
+                        # Resolved in normalize_binance_oi from the REST response's own
+                        # 'symbol' field via instrument.resolve_instrument -- not stamped
+                        # here from a constant.
+                        "instrument_key": event.instrument.key if event.instrument is not None else None,
                     }
                     self.stream_counters["openinterest"]["computed"] += 1
                     self.stream_counters["openinterest"]["validated"] += 1

@@ -45,6 +45,7 @@ import json
 from typing import Optional
 
 from .canonical import CanonicalOIEvent, OISource, OIUnit
+from .instrument import MARKET_LINEAR_PERPETUAL, resolve_instrument
 
 __all__ = ["normalize_binance_oi", "BinanceOIParseError"]
 
@@ -90,6 +91,23 @@ def normalize_binance_oi(
     if open_interest <= 0 or open_interest != open_interest:  # NaN check
         raise BinanceOIParseError(f"non-positive or NaN openInterest: {open_interest!r}")
 
+    # The response's own 'symbol' echo, checked against what was actually
+    # requested -- never trusted blindly and never silently accepted when it
+    # disagrees. Absent (older/alternate response shapes) is not the same as
+    # wrong: only an explicit mismatch is a contradiction.
+    response_symbol = data.get("symbol")
+    if symbol is not None and response_symbol is not None and response_symbol != symbol:
+        raise BinanceOIParseError(
+            f"response symbol {response_symbol!r} contradicts requested symbol {symbol!r}")
+
+    instrument = None
+    if symbol is not None:
+        # None (not raised) for an unregistered symbol: an unsupported
+        # instrument is unidentified, not an error -- this poller has never
+        # supported anything but the configured BTCUSDT triple in practice,
+        # but the identity is resolved generically rather than hardcoded.
+        instrument = resolve_instrument("BINANCE", MARKET_LINEAR_PERPETUAL, symbol)
+
     exchange_event_ts: Optional[int] = None
     raw_time = data.get("time")
     if raw_time is not None:
@@ -112,4 +130,5 @@ def normalize_binance_oi(
         # Not verified against current official documentation: kept UNKNOWN,
         # never guessed. See module docstring and docs/BINANCE_OI.md.
         unit=OIUnit.UNKNOWN,
+        instrument=instrument,
     )
