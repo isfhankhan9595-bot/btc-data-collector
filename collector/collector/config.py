@@ -404,8 +404,17 @@ SPOT_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("previous_update_id", pa.int64()),
     ("book_source", pa.string()), ("event_kind", pa.string()),
     ("recovery_generation", pa.int64()), ("quality_state", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "spot_orderbook_raw", "symbol": SYMBOL,
-             "note": "previous_update_id always NULL: Spot depthUpdate has no pu field"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "spot_orderbook_raw", "symbol": SYMBOL,
+             "note": "previous_update_id always NULL: Spot depthUpdate has no pu field",
+             "migration": "v1.1 adds nullable instrument_key (InstrumentId.key for "
+                          "BINANCE_SPOT_BTCUSDT); missing on rows written before this "
+                          "version, never fabricated for them. Resolved per-event from "
+                          "BinanceSpotAdapter.normalize()'s own instrument stamp (see "
+                          "adapters/base.py __init_subclass__, adapters/binance_spot.py's "
+                          "`instrument = BINANCE_SPOT_BTCUSDT` class attribute) -- the same "
+                          "generic mechanism Phase B used for Binance USD-M's adapter-routed "
+                          "orderbook/trades, not a second identity calculation"})
 
 SPOT_TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -415,5 +424,8 @@ SPOT_TRADES_SCHEMA = pa.schema([
     ("price", pa.float64()),
     ("quantity", pa.float64()),
     ("side", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "spot_trades", "symbol": SYMBOL,
-             "note": "trade_id is the raw per-execution `t`, never aggTrade's `a` -- see adapters/binance_spot.py"})
+    ("instrument_key", pa.string()),
+], metadata={"schema_version": "1.1", "stream_name": "spot_trades", "symbol": SYMBOL,
+             "note": "trade_id is the raw per-execution `t`, never aggTrade's `a` -- see adapters/binance_spot.py",
+             "migration": "v1.1 adds nullable instrument_key; see spot_orderbook_raw v1.1 "
+                          "note -- same per-event BinanceSpotAdapter.normalize() resolution"})
