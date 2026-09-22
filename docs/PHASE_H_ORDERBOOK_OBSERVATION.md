@@ -97,22 +97,47 @@ and an AST-based no-wall-clock/network structural check.
 
 ## Not done — the bulk of the full Phase H specification remains
 
-This phase's own scoping document describes an enormous surface: full
-architecture audits of Binance Spot/USD-M/Bybit/OKX sequence semantics
-independently (largely already covered by earlier sessions' Phase 6/8
-work, re-confirmed here only for the paths this addition touches), a
-cross-exchange end-to-end adversarial dataset spanning all four venues, a
-storage→replay→alignment corruption-resistance test proving a corrupted
-canonical `instrument_key` cannot rewrite raw-replay-derived identity, and
-12 mutations (5 performed above; mutations 3/4/5/6/9/10/11/12 — sequence
-validation skipping, double-apply, VALID-after-gap, Spot/USD-M identity
-collapse, cross-venue collision, contradictory-identity acceptance, replay
-consuming canonical identity as truth — not attempted in this pass).
+This phase's own scoping document describes an enormous surface. Status
+after this session's continuation:
 
-**OKX order-book reconstruction is not touched at all here.** This addition
-was verified against Binance (thoroughly) and Bybit (one test); OKX's
-`books`/`books-l2-tbt` distinction and checksum semantics are unaudited in
-this phase.
+**Closed this session:**
+- OKX order-book reconstruction (18 tests, `tests/test_book_observation_okx.py`):
+  snapshot-only, snapshot+deltas, level update/delete, causal boundary,
+  future-exchange-timestamp rejection, duplicate non-double-application
+  (OKX has no dedicated is_stale carve-out unlike Binance — pinned as the
+  actual, not assumed, behavior), sequence-gap visibility, recovery via a
+  fresh wire snapshot, both NEVER_OBSERVED causes, staleness boundary,
+  replay-twice determinism, input-order independence, instrument identity,
+  and OKX/Binance reconstructions proven independent. One real fixture bug
+  was hit and root-caused during this work (a crossed-book test snapshot —
+  the exact class of gotcha this document already flagged from the
+  original Binance/Bybit work), not a defect in the reconstruction code.
+- Storage→replay→alignment corruption resistance
+  (`tests/test_storage_replay_corruption_resistance.py`, 2 tests): a real
+  OKX raw-wire session is persisted through the actual collector's writer,
+  a canonical row with a deliberately wrong `instrument_key` (a Bybit
+  identity) is written alongside it on disk, and `reconstruct_book_at` is
+  proven to reconstruct the correct OKX identity and book state regardless
+  — the corrupted row is never read, confirmed both dynamically (the
+  reconstruction result is compared against an uncorrupted control run) and
+  statically (neither `replay.py` nor `book_observation.py` references
+  `instrument_key` anywhere in source).
+
+**Still not attempted:**
+- The full four-venue (Binance Spot/USD-M, Bybit, OKX) end-to-end
+  adversarial dataset with mixed staleness/missing-venue/gap/recovery
+  scenarios exercised together in one test.
+- Mutations 3/4/5/6/9/10/11/12 (sequence validation skipping, double-apply,
+  VALID-after-gap, Spot/USD-M identity collapse, cross-venue collision,
+  contradictory-identity acceptance, ordering-depends-on-input, replay
+  consuming canonical identity as truth) — mutations 1/2/7/8 not yet
+  independently pinned either, only the 5 from the original Phase H commit.
+- OKX's `books-l2-tbt` channel (distinct from `books`) and checksum
+  semantics remain unaudited.
+- Full-depth vs. bounded-depth terminology audit: this session did not
+  verify what depth OKX's `books` channel actually delivers in production;
+  the existing D11 raw-capture work should be consulted before claiming a
+  specific depth guarantee.
 
 No live exchange session backs any of this; verified against real fixtures
 and the real reconstruction code path, consistent with every other phase's
