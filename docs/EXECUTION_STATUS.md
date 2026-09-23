@@ -1452,3 +1452,47 @@ Phase D's own tests); Phase F (alignment audit) not started beyond the end-to-en
 - **Live/production status:** repository and replay work only. The
   production AWS collector was not touched, accessed, or referenced by any
   code change in this phase.
+
+### Windowed CVD hostile-audit follow-up: reconciliation + 5 new tests - **COMPLETE**
+
+Base `main` @ `ad695b8`, 1214 tests. This session's handoff described local
+uncommitted changes (32 tests, revised empty-window semantics: NEVER_OBSERVED
+-> AVAILABLE+cvd=0.0) that were never found anywhere in this repository's
+history, on disk, in any branch, or in any PR body -- confirmed by full
+reconciliation (`git status`, `git stash list`, `git log --all`, a repo-wide
+grep). They did not exist to recover. Windowed CVD (PR #47), its hostile
+mutation-testing audit (PR #48), trade deduplication (PR #49), and the
+bounded-memory design decision (PR #50) were all already merged and are not
+redone here.
+
+**Verified the handoff's central concern was already resolved correctly, not
+regressed:** the merged `observe_windowed_trade_flow_at` returns
+`NEVER_OBSERVED` (never a fabricated `AVAILABLE` + `cvd=0.0`) when a window
+has no trades, with a comment explicitly naming and rejecting the
+fabricated-zero alternative. `AVAILABLE`+`cvd=0.0` does not appear anywhere in
+this module's history.
+
+**Two genuine, previously-uncovered gaps found and closed** (everything else
+in the requested 36-item test matrix already existed in
+`test_windowed_trade_flow_observation.py`, `test_trade_flow_observation.py`,
+or `test_trade_flow_mutation_audit.py` -- confirmed by inspection before
+writing anything, per "add only missing coverage"):
+- Two trades sharing one `local_receive_ts`: both counted, summed correctly,
+  and the call is order-independent (the dataclass has no field that could
+  reveal which one order_key ranks last when their timestamps are equal, so
+  the test claims exactly that and no more).
+- `age_ms` cannot go negative, with a future trade actually present in the
+  fixture so the causal filter has something to exclude (an earlier draft of
+  this test used no future trade and so failed to catch anything -- caught by
+  mutation-testing my own test before trusting it).
+
+Mutation-checked: removing the shared causal filter fails the new cumulative
+negative-age test (1 failure); the windowed function's own redundant upper
+bound (established in PR #48) means this same mutation does not affect the
+windowed-side new tests, consistent with that prior finding.
+
+5 new tests. Full suite: **1219 passed** (1214 + 5). `compileall` and
+`git diff --check` clean.
+
+**Not done:** no source change to `trade_flow_observation.py` (none was
+needed); no live verification; AWS VPS/live collectors untouched.

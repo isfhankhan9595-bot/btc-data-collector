@@ -400,3 +400,83 @@ def test_mutation_6_bypassing_side_normalization_would_misclassify_bybit():
     mutated_buy_volume = sum(t.quantity for t in trades if t.side == "BUY")   # "Buy" != "BUY"
     assert mutated_buy_volume == 0   # mutated: silently misses every Bybit buy
     assert mutated_buy_volume != real.buy_volume
+
+
+# ---------------------------------------------------------------------------
+# Hostile audit addendum: tie-break determinism and the negative-age
+# invariant (task sections 15-17). Not previously covered -- everything
+# else in the requested matrix (boundaries, causality, missingness,
+# staleness, sides, venues, determinism-by-order, validation, required
+# windows, mutation) already has a test above or in
+# test_trade_flow_observation.py / test_trade_flow_mutation_audit.py.
+# ---------------------------------------------------------------------------
+
+
+def test_two_trades_with_identical_local_receive_ts_are_both_counted_and_summed():
+    """Equal timestamps must not cause one trade to be dropped or double-summed.
+    Uses two different agg_ids (source_index) at the same ts, per replay.py's
+    own tie-break -- (timestamp, kind_rank, source_index) -- confirmed by
+    reading order_key, not assumed."""
+    trades = [_binance_trade(T, "65000.0", agg_id=1, index=1),
+              _binance_trade(T, "65100.0", agg_id=2, index=2)]
+    result = observe_windowed_trade_flow_at(trades, T, W, venue="BINANCE")
+    assert result.trade_count == 2
+    assert result.status is AlignmentStatus.AVAILABLE
+    assert result.cvd == pytest.approx(0.5 * 2)          # both sides BUY-equivalent (m=False) in _binance_trade
+
+
+def test_equal_timestamp_trades_give_an_order_independent_result():
+    """order_key's tie-break is (timestamp, kind_rank, source_index) --
+    source_index travels with each frame, not with its position in the list
+    passed here -- so calling with [low, high] vs [high, low] must produce
+    the identical result. (The two trades share one local_receive_ts, so the
+    dataclass's own fields cannot reveal *which* one order_key ranks last --
+    that is not what this test claims; it claims the call is deterministic
+    regardless of argument order, which is the only thing observable and the
+    only thing that matters for correctness here.)"""
+    low = _binance_trade(T, "65000.0", agg_id=1, index=1)
+    high = _binance_trade(T, "65100.0", agg_id=2, index=2)
+
+    forward = observe_windowed_trade_flow_at([low, high], T, W, venue="BINANCE")
+    reversed_ = observe_windowed_trade_flow_at([high, low], T, W, venue="BINANCE")
+
+    assert forward == reversed_        # full dataclass equality: nothing about the result differs by input order
+    assert forward.trade_count == 2 and forward.last_trade_local_receive_ts == T
+
+
+def test_age_ms_can_never_be_negative_for_an_available_or_stale_observation():
+    """The causal upper-bound filter should make a negative age structurally
+    impossible: no counted trade's local_receive_ts can exceed observation_ts.
+    Pins the invariant directly, at a boundary that also has a future trade
+    present so the filter has something to actually exclude."""
+    future = _binance_trade_at(T + 5_000, agg_id=99)
+    for ts in (T - 59_999, T - 1, T):
+        result = observe_windowed_trade_flow_at(
+            [future, _binance_trade_at(ts, agg_id=1)], T, W, venue="BINANCE")
+        assert result.status in (AlignmentStatus.AVAILABLE, AlignmentStatus.STALE)
+        assert result.age_ms is not None and result.age_ms >= 0
+        assert result.trade_count == 1     # the future trade must not have been counted
+
+
+def test_cumulative_age_ms_cannot_go_negative_with_a_future_trade_present():
+    """Same invariant on observe_trade_flow_at, which -- unlike the windowed
+    function -- has no second filter after _causal_trades (PR #48's finding:
+    windowed's own upper bound is redundant with the shared filter, but
+    cumulative has no such second filter), so this is the one that would
+    actually go negative if the shared pre-replay filter broke."""
+    future = _binance_trade_at(T + 5_000, agg_id=99)
+    past = _binance_trade_at(T - 1, agg_id=1)
+    result = observe_trade_flow_at([future, past], T, venue="BINANCE")
+    assert result.trade_count == 1 and result.age_ms is not None and result.age_ms >= 0
+
+
+def test_cumulative_observation_also_has_the_tie_break_and_non_negative_age_properties():
+    """Same two invariants, for observe_trade_flow_at -- it shares _causal_trades
+    with the windowed function, so a regression in the shared primitive would
+    show here too, not only in the windowed tests above."""
+    low = _binance_trade(T, "65000.0", agg_id=1, index=1)
+    high = _binance_trade(T, "65100.0", agg_id=2, index=2)
+    forward = observe_trade_flow_at([low, high], T, venue="BINANCE")
+    reversed_ = observe_trade_flow_at([high, low], T, venue="BINANCE")
+    assert forward == reversed_
+    assert forward.age_ms is not None and forward.age_ms >= 0
