@@ -57,6 +57,35 @@ def test_missing_trade_id_is_never_deduplicated_against_anything():
     assert report.duplicate_count == 0
 
 
+def test_missing_trade_id_is_counted_not_silently_dropped():
+    """Audit finding: the report must surface how many records had no
+    trade_id at all -- required by this task's own Definition of Done
+    ("missing IDs") -- not merely exclude them from duplicate detection
+    with no visible trace."""
+    records = [_rec("BINANCE", "linear_perpetual", "trades", None, 1000),
+              _rec("BINANCE", "linear_perpetual", "trades", "1", 1010),
+              _rec("BINANCE", "linear_perpetual", "trades", None, 1020)]
+    result = analyze_dedup_evidence(records)
+    assert result.missing_id_count == 2
+    assert result.total_records == 3
+    assert result.duplicate_count == 0
+
+
+def test_same_local_receive_ts_duplicate_has_zero_delay_regardless_of_input_order():
+    """Audit finding: tie-breaking for which record is 'first' when two
+    share an identical local_receive_ts is input-order-dependent (no
+    secondary key exists), documented in analyze_dedup_evidence's own
+    docstring. This pins the one thing that IS guaranteed regardless of
+    that tie-break: delay_ms is always exactly 0 for such a pair, whichever
+    record ends up labeled 'first'."""
+    a = _rec("BINANCE", "linear_perpetual", "trades", "1", 5000)
+    b = _rec("BINANCE", "linear_perpetual", "trades", "1", 5000)
+    forward = analyze_dedup_evidence([a, b])
+    reversed_input = analyze_dedup_evidence([b, a])
+    assert forward.duplicate_count == reversed_input.duplicate_count == 1
+    assert forward.duplicates[0].delay_ms == reversed_input.duplicates[0].delay_ms == 0
+
+
 def test_same_trade_id_different_stream_is_not_a_duplicate():
     """OKX trades vs trades-all: must never be compared against each other."""
     records = [_rec("OKX", "linear_perpetual", "trades", "5", 1000,
