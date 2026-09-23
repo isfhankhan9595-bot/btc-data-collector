@@ -187,3 +187,54 @@ ruling out any universal high-water-mark design), and the memory
 benchmark (~160-195 bytes/entry; ~150-185 MiB per million remembered
 trade identities). No source change was made; `_seen_trade_ids` remains
 the exact unbounded reference set, pinned by a regression test.
+
+
+---
+
+**Addendum — independent hostile audit of PR #50 (this session, no source change)**
+
+Independently re-verified before accepting Outcome B, rather than trusting
+"1214 passed" or the doc's own prior summary:
+
+* Read `ExchangeAdapter._dedupe_trades` and `__init__` directly in
+  `collector/collector/adapters/base.py` -- confirmed the implementation
+  matches every claim in this document exactly (identity key shape,
+  `None`-trade-id exemption, unbounded `set`, no eviction).
+* Searched the repository for any real or replayable raw trade capture
+  data (`*.parquet`, fixture directories) that could support empirical
+  redelivery/monotonicity analysis. **None exists.** Every existing test
+  fixture is synthetic. This independently confirms the doc's own
+  statement that empirical analysis was not attempted -- it also could
+  not have been, with what is actually in this repository.
+* Re-fetched Bybit's official `publicTrade` documentation page live this
+  session: the example payload's `i` field is still
+  `"20f43950-d8dd-5b31-9112-a178eb6023af"` -- OFFICIAL-DOC-VERIFIED,
+  unchanged, UUID-shaped, confirming no drift since PR #50.
+* Re-fetched Binance's official aggTrade/trade stream documentation live
+  this session: `a` (Aggregate trade ID) and `t` (Trade ID) are both
+  plain integers in the example payloads; the REST `aggTrades?fromId=`
+  pagination semantics ("return aggtrades with aggregate trade ID
+  >= fromId") are, again, REST pagination behavior, not a WebSocket
+  delivery-order guarantee. No websocket monotonicity or redelivery-window
+  statement was found anywhere in official Binance documentation.
+  OFFICIAL-DOC-VERIFIED for field shape; NOT VERIFIED for the two
+  properties that would matter for a bounded design.
+* One **new** data point, found this session, explicitly labeled by its
+  actual provenance: a third-party historical-data vendor's documentation
+  (Tardis.dev, not OKX's own official docs) describes OKX's `trades-all`
+  channel as "All trades stream including non-aggregated trade messages,"
+  distinct from `trades` ("Public swap/futures trade executions stream").
+  This is **INFERRED**, not OFFICIAL-DOC-VERIFIED (the source is a data
+  vendor's characterization, not `okx.com`'s own documentation) -- but it
+  is a new reason, not merely the previously-cited absence of one, to keep
+  the two channels' dedup identity separate: if `trades-all` genuinely
+  carries non-aggregated messages while `trades` carries aggregated ones,
+  they are not redundant duplicate feeds of the same events at all, and
+  merging their identity space would not just be unproven -- it would
+  likely be wrong. This *reinforces* the existing `stream`-inclusive
+  identity key; it does not change the Outcome B decision.
+
+**No defect was found in PR #50's implementation, evidence, or
+conclusion.** Outcome B stands independently re-confirmed, not merely
+re-accepted. No source change was made in this session;
+`_seen_trade_ids` remains the exact unbounded reference set.
