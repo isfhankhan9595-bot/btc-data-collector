@@ -29,6 +29,15 @@ lowercase ``"buy"``/``"sell"`` (confirmed by reading each adapter's
 adapter's raw-preserving choice is itself intentional (see OKX's
 ``trades``/``trades-all`` docstrings) and not this module's business to
 alter.
+
+Unknown-side finding (from independent audit before adding windowed CVD):
+a trade whose ``side`` is missing, empty, or any spelling other than a
+BUY/SELL variant contributes to *neither* buy_volume nor sell_volume --
+confirmed by direct test, not just by reading the ``.upper()`` comparison
+and assuming. It still counts in ``trade_count``, so ``buy_volume +
+sell_volume < trade_count`` is possible and is the caller's signal that
+some trade's direction went unrecorded, rather than a fabricated BUY or
+SELL guess.
 """
 from __future__ import annotations
 
@@ -67,6 +76,41 @@ class TradeFlowObservation:
     frames_considered: int
 
 
+def _causal_trades(frames, observation_ts: int, venue: str):
+    """Shared primitive for both the cumulative and windowed observations:
+    every trade with ``local_receive_ts <= observation_ts``, in causal/
+    replay order, plus how many frames were considered. Frames past
+    ``observation_ts`` are excluded before ``ReplaySource`` is even built --
+    see ``observe_trade_flow_at``'s docstring for why that matters (not
+    merely "excluded from the tally", excluded from being able to
+    influence anything about the replay at all).
+
+    Factored out so windowed CVD does not reimplement this -- reuse the
+    existing causal-trade-extraction logic rather than build a second
+    replay path that could silently diverge from this one.
+    """
+    causal_frames = [f for f in frames if f.timestamp_ms <= observation_ts]
+    if not causal_frames:
+        return [], 0
+    engine = ReplayEngine(venue=venue)
+    engine.run(ReplaySource(causal_frames))
+    trades = [e for e in engine.result.non_book_events if isinstance(e, CanonicalTradeEvent)]
+    return trades, len(causal_frames)
+
+
+def _side_volumes(trades):
+    """BUY/SELL volumes with casing normalized (see module docstring). A
+    trade whose side is missing, empty, or any value other than a BUY/SELL
+    spelling contributes to *neither* sum -- audited, not accidental: it
+    must never be guessed into a direction it wasn't reported to have. It
+    still counts toward the caller's own trade_count, so a caller comparing
+    ``buy_volume + sell_volume`` against ``trade_count`` can detect this
+    case rather than silently losing that trade's volume with no trace."""
+    buy_volume = sum(t.quantity for t in trades if (t.side or "").upper() == "BUY")
+    sell_volume = sum(t.quantity for t in trades if (t.side or "").upper() == "SELL")
+    return buy_volume, sell_volume
+
+
 def observe_trade_flow_at(
     frames, observation_ts: int, *, venue: str, staleness_ms: int = 5_000,
 ) -> TradeFlowObservation:
@@ -80,37 +124,30 @@ def observe_trade_flow_at(
     after: exclusion has to happen before the frame can influence anything,
     including sequence/gap state for the trade stream itself, not merely
     before it is counted in the final tally.
+
+    **Known, pre-existing limitation, inherited rather than fixed here**
+    (report a pipeline correctness hole rather than silently compensate
+    for it inside a feature module): the trade pipeline has no
+    duplicate-trade-message protection anywhere -- unlike order-book
+    diffs, which sequence.py validates for continuity and duplication, a
+    resent trade wire message (a real reconnect/replay scenario on every
+    venue) would be counted twice, by every consumer of
+    ``non_book_events``, this module included. Fixing this belongs in the
+    adapter/replay layer, not here, and was not attempted in this pass.
     """
     if isinstance(observation_ts, bool) or not isinstance(observation_ts, int):
         raise TypeError(f"observation_ts must be an int (epoch ms), got {observation_ts!r}")
 
-    causal_frames = [f for f in frames if f.timestamp_ms <= observation_ts]
-    if not causal_frames:
-        return TradeFlowObservation(
-            exchange=venue, instrument=None, observation_ts=observation_ts,
-            status=AlignmentStatus.NEVER_OBSERVED, cvd=None, buy_volume=None,
-            sell_volume=None, trade_count=0, last_trade_local_receive_ts=None,
-            age_ms=None, frames_considered=0,
-        )
-
-    engine = ReplayEngine(venue=venue)
-    engine.run(ReplaySource(causal_frames))
-    trades = [e for e in engine.result.non_book_events if isinstance(e, CanonicalTradeEvent)]
-
+    trades, frames_considered = _causal_trades(frames, observation_ts, venue)
     if not trades:
-        # Frames existed (malformed, or a different stream entirely) but no
-        # trade was ever produced. Distinct from zero frames, same
-        # distinction reconstruct_book_at makes for "considered but nothing
-        # applied" -- there IS provenance, just nothing to report from it.
         return TradeFlowObservation(
             exchange=venue, instrument=None, observation_ts=observation_ts,
             status=AlignmentStatus.NEVER_OBSERVED, cvd=None, buy_volume=None,
             sell_volume=None, trade_count=0, last_trade_local_receive_ts=None,
-            age_ms=None, frames_considered=len(causal_frames),
+            age_ms=None, frames_considered=frames_considered,
         )
 
-    buy_volume = sum(t.quantity for t in trades if (t.side or "").upper() == "BUY")
-    sell_volume = sum(t.quantity for t in trades if (t.side or "").upper() == "SELL")
+    buy_volume, sell_volume = _side_volumes(trades)
     last_trade = trades[-1]   # last in causal/replay order, not max(local_receive_ts):
                               # ReplaySource's own deterministic ordering already IS
                               # the causal-arrival order (see replay.py's order_key),
@@ -124,5 +161,104 @@ def observe_trade_flow_at(
         observation_ts=observation_ts, status=status,
         cvd=buy_volume - sell_volume, buy_volume=buy_volume, sell_volume=sell_volume,
         trade_count=len(trades), last_trade_local_receive_ts=last_trade.local_receive_ts,
-        age_ms=age_ms, frames_considered=len(causal_frames),
+        age_ms=age_ms, frames_considered=frames_considered,
+    )
+
+
+@dataclass(frozen=True)
+class WindowedTradeFlowObservation:
+    """Causal trade flow over exactly ``(window_start, window_end]`` --
+    i.e. ``(observation_ts - window_ms, observation_ts]``. A trade at
+    ``window_start`` itself is EXCLUDED (open lower bound); a trade at
+    ``observation_ts`` (``window_end``) is INCLUDED (closed upper bound).
+    This is the same convention a causal person would expect from "the
+    last W of data as of T": T itself counts, T-W exactly does not (it is
+    the instant the window opens, not inside it).
+
+    ``status`` distinguishes what the cumulative observation's two-state
+    NEVER_OBSERVED/AVAILABLE/STALE already covers, applied to the window:
+    NEVER_OBSERVED here means no trade fell inside this specific window,
+    which is different from no trade existing at all up to observation_ts
+    (there may be plenty of older trades, just none in the last W) --
+    ``frames_considered`` is still the *cumulative* count up to
+    observation_ts (matching what ``_causal_trades`` actually computed),
+    not a window-scoped frame count, since frames don't have a lower
+    causal bound the way trades' window membership does.
+    """
+    exchange: str
+    instrument: Optional[InstrumentId]
+    observation_ts: int
+    window_start: int
+    window_end: int
+    window_ms: int
+    status: AlignmentStatus
+    cvd: Optional[float]
+    buy_volume: Optional[float]
+    sell_volume: Optional[float]
+    trade_count: int
+    first_trade_local_receive_ts: Optional[int]
+    last_trade_local_receive_ts: Optional[int]
+    age_ms: Optional[int]
+    frames_considered: int
+
+
+def observe_windowed_trade_flow_at(
+    frames, observation_ts: int, window_ms: int, *, venue: str, staleness_ms: int = 5_000,
+) -> WindowedTradeFlowObservation:
+    """Causal trade flow over the last ``window_ms`` as of ``observation_ts``.
+
+    Reuses ``_causal_trades`` -- the exact same causal-frame-filter-before-
+    replay step ``observe_trade_flow_at`` uses -- for the upper bound
+    (``local_receive_ts <= observation_ts``), then applies the window's
+    lower bound (``local_receive_ts > observation_ts - window_ms``) as a
+    plain filter over the resulting, already-causally-safe trade list.
+    This is safe to do post-replay, unlike the upper bound: trades are
+    stateless-cumulative (no sequence/gap dependency the way order-book
+    diffs have), so which of the causally-known trades get *tallied* is
+    exactly a counting decision, not a replay-input decision -- nothing
+    about excluding an old trade from this window could let a future trade
+    leak in, because the upper-bound exclusion already happened first, at
+    the frame level, before this function ever sees the trade list.
+    """
+    if isinstance(observation_ts, bool) or not isinstance(observation_ts, int):
+        raise TypeError(f"observation_ts must be an int (epoch ms), got {observation_ts!r}")
+    if isinstance(window_ms, bool) or not isinstance(window_ms, int):
+        raise TypeError(f"window_ms must be an int (milliseconds), got {window_ms!r}")
+    if window_ms <= 0:
+        raise ValueError(f"window_ms must be positive, got {window_ms!r}")
+
+    window_start = observation_ts - window_ms
+    window_end = observation_ts
+
+    all_causal_trades, frames_considered = _causal_trades(frames, observation_ts, venue)
+    windowed = [t for t in all_causal_trades if window_start < t.local_receive_ts <= window_end]
+
+    if not windowed:
+        # Deliberately NOT distinguishing "zero frames at all" from "trades
+        # exist but none fall in this window" with a different status: both
+        # are "nothing observable in this window", and the task's own
+        # completeness warning (Case B) is why this status is NEVER_OBSERVED
+        # rather than a fabricated AVAILABLE-with-cvd=0 -- a window with no
+        # trades is not proof the window was complete, only that nothing
+        # causally-known landed in it.
+        return WindowedTradeFlowObservation(
+            exchange=venue, instrument=None, observation_ts=observation_ts,
+            window_start=window_start, window_end=window_end, window_ms=window_ms,
+            status=AlignmentStatus.NEVER_OBSERVED, cvd=None, buy_volume=None,
+            sell_volume=None, trade_count=0, first_trade_local_receive_ts=None,
+            last_trade_local_receive_ts=None, age_ms=None, frames_considered=frames_considered,
+        )
+
+    buy_volume, sell_volume = _side_volumes(windowed)
+    first_trade, last_trade = windowed[0], windowed[-1]
+    age_ms = observation_ts - last_trade.local_receive_ts
+    status = AlignmentStatus.STALE if age_ms > staleness_ms else AlignmentStatus.AVAILABLE
+    return WindowedTradeFlowObservation(
+        exchange=last_trade.exchange, instrument=last_trade.instrument,
+        observation_ts=observation_ts, window_start=window_start, window_end=window_end,
+        window_ms=window_ms, status=status, cvd=buy_volume - sell_volume,
+        buy_volume=buy_volume, sell_volume=sell_volume, trade_count=len(windowed),
+        first_trade_local_receive_ts=first_trade.local_receive_ts,
+        last_trade_local_receive_ts=last_trade.local_receive_ts,
+        age_ms=age_ms, frames_considered=frames_considered,
     )
