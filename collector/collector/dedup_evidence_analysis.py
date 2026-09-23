@@ -98,6 +98,7 @@ class OrderingReport:
 class DedupEvidenceReport:
     total_records: int
     duplicate_count: int
+    missing_id_count: int = 0   # records with trade_id=None -- never compared, but reported, not dropped silently
     duplicates: list = field(default_factory=list)          # list[DuplicateDelayReport]
     delay_min: ObservedStatistic = None
     delay_median: ObservedStatistic = None
@@ -129,14 +130,29 @@ def _is_numeric_id(trade_id: Optional[str]) -> bool:
 def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
     """Analyze a sequence of DedupEvidenceRecord for duplicates and ID
     ordering. Pure function; does not mutate or sort its input in place
-    (a local copy is sorted for the ordering pass)."""
+    (a local copy is sorted for the ordering pass).
+
+    Known limitation, documented rather than papered over with more
+    machinery: when two or more records of the same identity share the
+    exact same ``local_receive_ts``, which one is labeled "first" (vs.
+    "duplicate") is decided by Python's stable sort, i.e. by their
+    position in the input list -- there is no secondary ordering key in
+    the record schema to break the tie any other way. This does not
+    affect any reported delay (it is always exactly 0 for a same-timestamp
+    pair, regardless of which record is picked as "first"), so no
+    statistic in this report is wrong because of it; only forensic
+    inspection of *which specific record* is labeled which would be
+    input-order-sensitive in this one case.
+    """
     total = len(records)
 
     # --- Duplicate detection: group by identity, matching _dedupe_trades's
     # own None-id exemption exactly (design doc section C).
     by_identity: dict = {}
+    missing_id_count = 0
     for r in records:
         if r.trade_id is None:
+            missing_id_count += 1
             continue
         by_identity.setdefault(r.identity(), []).append(r)
 
@@ -213,7 +229,8 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
         )
 
     return DedupEvidenceReport(
-        total_records=total, duplicate_count=len(duplicates), duplicates=duplicates,
+        total_records=total, duplicate_count=len(duplicates), missing_id_count=missing_id_count,
+        duplicates=duplicates,
         delay_min=delay_min, delay_median=delay_median, delay_p95=delay_p95,
         delay_p99=delay_p99, delay_max=delay_max, ordering_by_stream=ordering_by_stream,
     )
