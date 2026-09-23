@@ -36,6 +36,11 @@ present in the record shape now so a real capture experiment does not need
 a schema change later, even though this session has no data to populate
 them with.
 
+`local_receive_ts` validity is explicit and evidence-preserving: `None`,
+bool, non-int, malformed, and negative values are classified as invalid
+timestamp evidence (reported with provenance), not clamped or silently
+coerced into delay math.
+
 ## C. What constitutes an exact duplicate?
 
 Two records with an identical
@@ -46,6 +51,9 @@ compared against anything, including another `None` record — mirroring
 of "duplicate" cannot silently diverge from the production dedup
 contract's notion of it.
 
+Current venue semantics are preserved: `trade_id=""` is still an identity
+value; only `trade_id is None` is treated as missing-ID.
+
 ## D. How is duplicate delay measured?
 
 `duplicate.local_receive_ts - first.local_receive_ts`, where "first" is
@@ -55,6 +63,10 @@ p99.9/max) is reported labeled **"observed in this sample"** — never
 "maximum possible" or "guaranteed" (Section 19 of the task; see also
 `ObservedStatistic`'s own docstring below).
 
+When two records share the same `local_receive_ts`, the analyzer does not
+invent a meaningful arrival order: duplicate reports carry an explicit
+`arrival_order_ambiguous=True` marker.
+
 ## E. How is reconnect association measured?
 
 If a `reconnect_marker` is present on the duplicate record and absent (or
@@ -62,6 +74,9 @@ different) on the first record, the duplicate is classified
 `reconnect_associated=True`. This is **correlation, not proven causality**
 — the task explicitly warns against inferring causality merely because
 two events occurred near a reconnect, and this tool does not attempt to.
+
+Where available, a transition in `connection_generation` is also treated as
+temporal reconnect association (still correlation-only, never causal proof).
 
 ## F. How is ID ordering measured?
 
@@ -97,6 +112,18 @@ whatever `DedupEvidenceRecord` sequence it is given —
 session did not build a capture pipeline (no live authorization), only
 the analysis a future capture pipeline's output could be fed into.
 
+Raw-wire conversion helpers are now included:
+
+- `convert_raw_wire_to_dedup_evidence(raw_rows)` parses raw payloads via
+  existing adapter `normalize()` semantics (without calling production trade
+  dedup), emits forensic trade records, and classifies malformed evidence.
+- `analyze_dedup_evidence_from_raw_wire(raw_rows)` runs conversion and
+  duplicate analysis in one step.
+
+Malformed JSON, missing payload, empty payload, truncated payload, and
+unsupported/unroutable/non-trade frames remain explicit invalid evidence
+records rather than disappearing.
+
 ## J. How are observations distinguished from guarantees?
 
 Every numeric result in `DedupEvidenceReport` is wrapped in
@@ -105,6 +132,34 @@ Every numeric result in `DedupEvidenceReport` is wrapped in
 making it structurally awkward to accidentally quote a bare "17 seconds"
 without the qualifier attached, rather than relying on every future
 caller to remember to add the caveat in prose.
+
+Duplicate classes:
+
+- `EXACT_DUPLICATE`: identity match + same compared payload semantics.
+- `IDENTITY_PAYLOAD_CONFLICT`: identity match but at least one of
+  `canonical_price`, `canonical_quantity`, `canonical_side`, or
+  `exchange_event_ts` differs.
+
+For each duplicate, `different_fields` and provenance/hash locators are
+reported without embedding full payload bodies in every duplicate object.
+
+Raw payload hash semantics are strict: SHA-256 is computed over the exact
+captured payload-string bytes (`utf-8`). Hash equality means byte equality
+only; it is not itself semantic equality, and hash inequality alone does
+not prove an economic conflict.
+
+## K. Explicit non-claims
+
+This evidence path does **not** claim:
+
+- any protocol guarantee,
+- any maximum duplicate-redelivery horizon,
+- universal ordering across all delivery paths,
+- capture completeness,
+- reconnect causality.
+
+This repository-only change does **not** perform live exchange capture and
+therefore does not create empirical exchange evidence by itself.
 
 ## Status of this session's work
 
