@@ -362,6 +362,23 @@ def test_parse_is_deterministic_same_frame_same_result(channel, payload):
     a = OKXAdapter().normalize(copy.deepcopy(frame), local_receive_ts=42)
     b = OKXAdapter().normalize(copy.deepcopy(frame), local_receive_ts=42)
     assert a == b
+    # Two fresh instances, same frame -> same result: this holds for every
+    # channel, trades included, since duplicate-trade suppression is keyed
+    # on per-instance state that a fresh OKXAdapter() never carries.
+    if channel in ("trades", "trades-all"):
+        # Same instance, same trade twice: the second call is now correctly
+        # a real duplicate, suppressed by trade deduplication (adapters/base.py
+        # ExchangeAdapter._dedupe_trades) -- this is the new, intentional
+        # architectural contract, not the accidental-cache bug the
+        # same-instance check below still guards against for every other
+        # channel. See test_trade_deduplication.py for the dedicated
+        # positive-path test of this exact behavior.
+        adapter = OKXAdapter()
+        c = adapter.normalize(copy.deepcopy(frame), local_receive_ts=42)
+        d = adapter.normalize(copy.deepcopy(frame), local_receive_ts=42)
+        assert c == a
+        assert d == [], "second identical trade on one adapter instance must be deduplicated"
+        return
     # Same instance, called twice -- rules out any adapter-instance state
     # (e.g. a cache) silently affecting the second parse.
     adapter = OKXAdapter()

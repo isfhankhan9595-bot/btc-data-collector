@@ -54,7 +54,13 @@ def test_trade_maps_official_example_and_is_explicitly_spot():
 def test_trade_side_semantics_both_directions():
     adapter = BinanceSpotAdapter()
     maker_buyer = dict(OFFICIAL_TRADE_EXAMPLE, m=True)
-    taker_buyer = dict(OFFICIAL_TRADE_EXAMPLE, m=False)
+    # Distinct trade_id from maker_buyer: two genuinely different trades are
+    # being tested for side semantics here, not the same trade replayed --
+    # since Phase (trade deduplication) added per-adapter-instance duplicate
+    # suppression keyed on trade_id, reusing OFFICIAL_TRADE_EXAMPLE's t=12345
+    # unchanged would make the second call a legitimate duplicate rejection,
+    # not a side-semantics check.
+    taker_buyer = dict(OFFICIAL_TRADE_EXAMPLE, m=False, t=12346)
     assert adapter.normalize(_frame("bnbbtc@trade", maker_buyer), local_receive_ts=1)[0].side == "SELL"
     assert adapter.normalize(_frame("bnbbtc@trade", taker_buyer), local_receive_ts=1)[0].side == "BUY"
 

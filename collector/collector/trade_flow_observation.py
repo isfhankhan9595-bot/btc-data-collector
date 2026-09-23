@@ -125,15 +125,16 @@ def observe_trade_flow_at(
     including sequence/gap state for the trade stream itself, not merely
     before it is counted in the final tally.
 
-    **Known, pre-existing limitation, inherited rather than fixed here**
-    (report a pipeline correctness hole rather than silently compensate
-    for it inside a feature module): the trade pipeline has no
-    duplicate-trade-message protection anywhere -- unlike order-book
-    diffs, which sequence.py validates for continuity and duplication, a
-    resent trade wire message (a real reconnect/replay scenario on every
-    venue) would be counted twice, by every consumer of
-    ``non_book_events``, this module included. Fixing this belongs in the
-    adapter/replay layer, not here, and was not attempted in this pass.
+    **Duplicate-trade protection**: lives at the adapter layer
+    (``adapters/base.py``'s ``ExchangeAdapter._dedupe_trades``, wired
+    through the same ``__init_subclass__`` hook that stamps instrument
+    identity), not here. A resent wire message for a trade this adapter
+    instance already produced is suppressed before it ever reaches
+    ``non_book_events``, so this module needs no duplicate-awareness of
+    its own -- the causal trade stream it consumes is already correct by
+    the time it gets here. See ``test_trade_deduplication.py`` for the
+    full venue-by-venue audit and the acceptance tests proving this module
+    does not double-count a duplicate.
     """
     if isinstance(observation_ts, bool) or not isinstance(observation_ts, int):
         raise TypeError(f"observation_ts must be an int (epoch ms), got {observation_ts!r}")

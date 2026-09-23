@@ -122,6 +122,7 @@ class BybitCollectorApp:
             "bybit_liquidation", BYBIT_LIQUIDATION_SCHEMA, base_dir=data_dir, exchange="BYBIT")
 
         self.adapter = BybitAdapter()
+        self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
         self.book = LocalBook("BYBIT")
         self.running = False
         self.messages_handled = 0
@@ -198,6 +199,17 @@ class BybitCollectorApp:
                                      "event_type": event_type, "reason": reason,
                                      "connection_id": connection_id,
                                      "local_ts": int(time.time() * 1000)})
+
+    def _record_adapter_unhandled(self, message) -> None:
+        """Wires BybitAdapter's unhandled/duplicate outcomes into durable
+        quality events -- previously missing entirely for this venue (the
+        other three runners already had this; unrouted/malformed/duplicate
+        Bybit messages were counted on the adapter but never persisted).
+        Added here because trade deduplication's DUPLICATE quality event
+        would otherwise be silently invisible for Bybit specifically,
+        undermining this feature's cross-venue uniformity -- a direct
+        prerequisite for this task, not unrelated scope creep."""
+        self._persist_quality_event(message.to_quality_event())
 
     # -- message handling --------------------------------------------------
 

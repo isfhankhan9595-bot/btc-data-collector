@@ -29,6 +29,15 @@ it inside a feature module"), this is recorded here and in
 `trade_flow_observation.py`'s docstring, not patched around. Fixing it
 belongs in the adapter/replay layer.
 
+**Resolved in a later phase:** `ExchangeAdapter._dedupe_trades`
+(`adapters/base.py`) now suppresses a duplicate trade message before it
+ever reaches `non_book_events`, at the same shared layer every runner and
+`ReplayEngine` already funnel through — see `test_trade_deduplication.py`
+for the venue-by-venue audit and the acceptance tests proving this fix
+required no change to either CVD function. This finding is left as
+written above rather than rewritten, as the accurate record of what was
+true when this doc was written.
+
 ## What windowed CVD answers
 
 "What was net aggressive flow during the last W as of observation time T?"
