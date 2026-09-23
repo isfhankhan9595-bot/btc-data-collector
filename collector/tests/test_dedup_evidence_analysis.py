@@ -8,20 +8,30 @@ being useful once real evidence exists, not a substitute for that evidence.
 """
 from __future__ import annotations
 
+import hashlib
+
 from collector.collector.dedup_evidence_analysis import (
     DedupEvidenceRecord,
+    EXACT_DUPLICATE,
+    IDENTITY_PAYLOAD_CONFLICT,
     analyze_dedup_evidence,
+    analyze_dedup_evidence_from_raw_wire,
+    convert_raw_wire_to_dedup_evidence,
 )
 
 
 def _rec(exchange, market_type, stream, trade_id, local_receive_ts, *,
          instrument_key="BINANCE|linear_perpetual|BTC-USDT|BTCUSDT",
-         exchange_event_ts=None, connection_id=None, reconnect_marker=None):
+         exchange_event_ts=None, connection_id=None, reconnect_marker=None,
+         connection_generation=None, canonical_price=100.0, canonical_quantity=1.0,
+         canonical_side="BUY", raw_payload_sha256=None):
     return DedupEvidenceRecord(
         exchange=exchange, market_type=market_type, instrument_key=instrument_key,
         stream=stream, trade_id=trade_id, exchange_event_ts=exchange_event_ts or local_receive_ts,
         local_receive_ts=local_receive_ts, connection_id=connection_id,
-        reconnect_marker=reconnect_marker,
+        reconnect_marker=reconnect_marker, connection_generation=connection_generation,
+        canonical_price=canonical_price, canonical_quantity=canonical_quantity,
+        canonical_side=canonical_side, raw_payload_sha256=raw_payload_sha256,
     )
 
 
@@ -39,11 +49,14 @@ def test_no_duplicates_in_a_clean_set():
 
 
 def test_exact_duplicate_is_detected_with_correct_delay():
-    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000),
-              _rec("BINANCE", "linear_perpetual", "trades", "1", 1250)]
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000, exchange_event_ts=900),
+              _rec("BINANCE", "linear_perpetual", "trades", "1", 1250, exchange_event_ts=900)]
     report = analyze_dedup_evidence(records)
     assert report.duplicate_count == 1
+    assert report.exact_duplicate_count == 1
+    assert report.identity_payload_conflict_count == 0
     assert report.duplicates[0].delay_ms == 250
+    assert report.duplicates[0].classification == EXACT_DUPLICATE
     assert report.delay_min.value == 250 and report.delay_max.value == 250
 
 
@@ -84,6 +97,8 @@ def test_same_local_receive_ts_duplicate_has_zero_delay_regardless_of_input_orde
     reversed_input = analyze_dedup_evidence([b, a])
     assert forward.duplicate_count == reversed_input.duplicate_count == 1
     assert forward.duplicates[0].delay_ms == reversed_input.duplicates[0].delay_ms == 0
+    assert forward.duplicates[0].arrival_order_ambiguous is True
+    assert reversed_input.duplicates[0].arrival_order_ambiguous is True
 
 
 def test_same_trade_id_different_stream_is_not_a_duplicate():
@@ -185,6 +200,179 @@ def test_no_reconnect_marker_at_all_is_not_flagged_associated():
     report = analyze_dedup_evidence(records)
     assert report.duplicates[0].reconnect_associated is False
 
+
+def test_duplicate_across_connection_generations_is_associated_even_without_marker():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000, connection_generation=1),
+               _rec("BINANCE", "linear_perpetual", "trades", "1", 1050, connection_generation=2)]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicates[0].reconnect_associated is True
+
+
+# ---------------------------------------------------------------------------
+# Hostile forensic payload conflict checks.
+# ---------------------------------------------------------------------------
+
+
+def test_same_identity_different_price_is_identity_payload_conflict():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "dup-1", 1000, canonical_price=100.0, exchange_event_ts=900),
+               _rec("BINANCE", "linear_perpetual", "trades", "dup-1", 1100, canonical_price=101.0, exchange_event_ts=900)]
+    report = analyze_dedup_evidence(records)
+    dup = report.duplicates[0]
+    assert dup.classification == IDENTITY_PAYLOAD_CONFLICT
+    assert dup.different_fields == ("canonical_price",)
+
+
+def test_same_identity_different_quantity_side_and_exchange_ts_are_conflict():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "dup-2", 1000,
+                    canonical_quantity=1.0, canonical_side="BUY", exchange_event_ts=1000),
+               _rec("BINANCE", "linear_perpetual", "trades", "dup-2", 1100,
+                    canonical_quantity=2.0, canonical_side="SELL", exchange_event_ts=1001)]
+    report = analyze_dedup_evidence(records)
+    dup = report.duplicates[0]
+    assert dup.classification == IDENTITY_PAYLOAD_CONFLICT
+    assert set(dup.different_fields) == {"canonical_quantity", "canonical_side", "exchange_event_ts"}
+
+
+def test_same_identity_identical_payload_fields_stays_exact_duplicate_with_hash_provenance():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "dup-3", 1000, raw_payload_sha256="a", exchange_event_ts=900),
+               _rec("BINANCE", "linear_perpetual", "trades", "dup-3", 1010, raw_payload_sha256="a", exchange_event_ts=900)]
+    report = analyze_dedup_evidence(records)
+    dup = report.duplicates[0]
+    assert dup.classification == EXACT_DUPLICATE
+    assert dup.first_payload_sha256 == "a"
+    assert dup.duplicate_payload_sha256 == "a"
+
+
+# ---------------------------------------------------------------------------
+# Timestamp hardening / missing-id semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_local_receive_timestamps_are_reported_not_silently_used():
+    records = [
+        _rec("BINANCE", "linear_perpetual", "trades", "1", None),
+        _rec("BINANCE", "linear_perpetual", "trades", "1", True),
+        _rec("BINANCE", "linear_perpetual", "trades", "1", "1000"),
+        _rec("BINANCE", "linear_perpetual", "trades", "1", -1),
+    ]
+    report = analyze_dedup_evidence(records)
+    assert report.invalid_local_receive_ts_count == 4
+    assert report.duplicate_count == 0
+
+
+def test_negative_receive_timestamp_is_rejected_not_clamped_into_delay_math():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "n", -5),
+               _rec("BINANCE", "linear_perpetual", "trades", "n", 10)]
+    report = analyze_dedup_evidence(records)
+    assert report.invalid_local_receive_ts_count == 1
+    assert report.duplicate_count == 0
+
+
+def test_empty_trade_id_is_a_real_identity_but_none_is_missing():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "", 1000),
+               _rec("BINANCE", "linear_perpetual", "trades", "", 1010),
+               _rec("BINANCE", "linear_perpetual", "trades", None, 1020)]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicate_count == 1
+    assert report.missing_id_count == 1
+
+
+def test_numeric_string_and_uuid_ids_supported_for_identity_grouping():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "12345", 1000),
+               _rec("BINANCE", "linear_perpetual", "trades", "12345", 1010),
+               _rec("BYBIT", "linear_perpetual", "trades",
+                    "20f43950-d8dd-5b31-9112-a178eb6023af", 2000,
+                    instrument_key="BYBIT|linear_perpetual|BTC-USDT|BTCUSDT"),
+               _rec("BYBIT", "linear_perpetual", "trades",
+                    "20f43950-d8dd-5b31-9112-a178eb6023af", 2010,
+                    instrument_key="BYBIT|linear_perpetual|BTC-USDT|BTCUSDT")]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicate_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Raw-wire converter tests: valid + malformed evidence classification.
+# ---------------------------------------------------------------------------
+
+
+def test_raw_converter_hashes_exact_payload_bytes_and_preserves_trade_fields():
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":7,"p":"100","q":"0.1","m":false}}'
+    conversion = convert_raw_wire_to_dedup_evidence([{
+        "venue": "BINANCE",
+        "market_type": "linear_perpetual",
+        "stream": "btcusdt@aggTrade",
+        "connection_id": "c1",
+        "local_receive_ts": 1000,
+        "payload": payload,
+    }])
+    assert len(conversion.records) == 1
+    record = conversion.records[0]
+    assert record.trade_id == "7"
+    assert record.canonical_price == 100.0
+    assert record.canonical_quantity == 0.1
+    assert record.canonical_side == "BUY"
+    assert record.raw_payload_sha256 == hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_raw_converter_classifies_missing_empty_truncated_and_malformed_payloads():
+    conversion = convert_raw_wire_to_dedup_evidence([
+        {"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 1, "payload": None},
+        {"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 2, "payload": ""},
+        {"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 3, "payload": "{", "truncated": True},
+        {"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 4, "payload": "{"},
+    ])
+    reasons = [issue.reason for issue in conversion.invalid_records]
+    assert reasons == ["MISSING_PAYLOAD", "EMPTY_PAYLOAD", "TRUNCATED_PAYLOAD", "MALFORMED_JSON"]
+
+
+def test_raw_converter_keeps_okx_trades_and_trades_all_isolated():
+    trades = '{"arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},"data":[{"ts":"1000","tradeId":"1","px":"100","sz":"0.1","side":"buy","seqId":"1"}]}'
+    trades_all = '{"arg":{"channel":"trades-all","instId":"BTC-USDT-SWAP"},"data":[{"ts":"1001","tradeId":"1","px":"100","sz":"0.1","side":"buy","seqId":"1","source":"0"}]}'
+    conversion = convert_raw_wire_to_dedup_evidence([
+        {"venue": "OKX", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": trades},
+        {"venue": "OKX", "market_type": "linear_perpetual", "local_receive_ts": 1001, "payload": trades_all},
+    ])
+    streams = sorted(record.stream for record in conversion.records)
+    assert streams == ["trades", "trades-all"]
+    report = analyze_dedup_evidence(conversion.records)
+    assert report.duplicate_count == 0
+
+
+def test_raw_forensic_analysis_uses_raw_rows_not_deduplicated_replay_output():
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":11,"p":"100","q":"0.1","m":false}}'
+    result = analyze_dedup_evidence_from_raw_wire([
+        {"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": payload},
+        {"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 1010, "payload": payload},
+    ])
+    assert len(result.conversion.records) == 2
+    assert result.analysis.duplicate_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Mutation-style invariants (tests fail when common hostile mutations applied).
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_removing_instrument_from_identity_would_be_caught():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "x", 1000,
+                    instrument_key="BINANCE|linear_perpetual|BTC-USDT|BTCUSDT"),
+               _rec("BINANCE", "linear_perpetual", "trades", "x", 1010,
+                    instrument_key="BINANCE|linear_perpetual|BTC-USDT|ETHUSDT")]
+    assert analyze_dedup_evidence(records).duplicate_count == 0
+
+
+def test_mutation_ignoring_payload_comparison_fields_would_be_caught():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "m1", 1000, canonical_price=100, canonical_quantity=1, canonical_side="BUY"),
+               _rec("BINANCE", "linear_perpetual", "trades", "m1", 1010, canonical_price=101, canonical_quantity=2, canonical_side="SELL")]
+    dup = analyze_dedup_evidence(records).duplicates[0]
+    assert dup.classification == IDENTITY_PAYLOAD_CONFLICT
+    assert {"canonical_price", "canonical_quantity", "canonical_side"} <= set(dup.different_fields)
+
+
+def test_mutation_inverting_reconnect_association_would_be_caught():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "m2", 1000, reconnect_marker="same"),
+               _rec("BINANCE", "linear_perpetual", "trades", "m2", 1010, reconnect_marker="same")]
+    assert analyze_dedup_evidence(records).duplicates[0].reconnect_associated is False
 
 # ---------------------------------------------------------------------------
 # Ordering analysis: numeric IDs vs Bybit's UUID exclusion.
