@@ -175,3 +175,15 @@ high-water-mark structure is safe, versus an LRU or time-windowed
 eviction policy if not. Deliberately not attempted in this session as its
 own bounded task, per the same one-architectural-change-at-a-time
 discipline this task itself required.
+
+---
+
+**Addendum — bounded-memory design phase, resolved as Outcome B (not
+provable safe, exact set kept intact):** see
+`test_trade_dedup_memory_audit.py` for the full design record, official
+documentation citations (Binance Spot/USD-M field shapes, and the
+decisive finding that Bybit's `i` field is a UUID string, not numeric --
+ruling out any universal high-water-mark design), and the memory
+benchmark (~160-195 bytes/entry; ~150-185 MiB per million remembered
+trade identities). No source change was made; `_seen_trade_ids` remains
+the exact unbounded reference set, pinned by a regression test.
