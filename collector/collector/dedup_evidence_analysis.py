@@ -150,6 +150,14 @@ class DedupEvidenceReport:
     identity_payload_conflict_count: int = 0
     invalid_local_receive_ts_count: int = 0
     invalid_local_receive_ts_examples: list[dict[str, Any]] = field(default_factory=list)
+    #: Identities where an occurrence with an invalid local_receive_ts
+    #: collides with another occurrence of that same identity (valid or
+    #: also invalid). Counted per IDENTITY, not per pairing -- distinct
+    #: from duplicate_count, which only counts pairs whose timing could
+    #: actually be classified using two valid timestamps. duplicate_count
+    #: == 0 must never be read as "no identity collision" when this is > 0.
+    invalid_timestamp_identity_collisions: int = 0
+    invalid_timestamp_identity_collision_examples: list[dict[str, Any]] = field(default_factory=list)
     duplicates: list = field(default_factory=list)          # list[DuplicateDelayReport]
     delay_min: ObservedStatistic = None
     delay_median: ObservedStatistic = None
@@ -259,6 +267,51 @@ def _adapter_for(venue: Any, market_type: Any):
     return None
 
 
+class DedupBypassUnavailableError(RuntimeError):
+    """Raised when an adapter's normalize() cannot be safely called with
+    production duplicate suppression bypassed. Never caught silently --
+    see _dedup_bypassed_normalize's docstring."""
+
+
+def _dedup_bypassed_normalize(adapter, raw_json, *, local_receive_ts):
+    """Parse one raw message through the venue adapter's real parser
+    while bypassing `_dedupe_trades` -- the entire point of this module
+    is to preserve evidence that path would otherwise silently destroy.
+
+    `adapter.normalize` is `ExchangeAdapter.__init_subclass__`'s wrapper
+    (adapters/base.py): it always stamps instrument identity AND always
+    suppresses a trade whose identity this adapter instance has already
+    produced. This function must keep the first behavior and skip only
+    the second -- so it calls the wrapper's own `__wrapped__` (set by
+    `functools.wraps`), which is the concrete, unwrapped parser with
+    neither stamping nor dedup applied, then re-applies
+    `_stamp_instrument` itself. `_dedupe_trades` is never invoked.
+
+    Verified empirically, not merely assumed from reading
+    `functools.wraps`'s documentation: a raw OKX `trades` frame carrying
+    the same `tradeId` twice returns 1 event through `adapter.normalize()`
+    (the second silently suppressed) and 2 events through this function
+    -- see `test_raw_converter_preserves_a_same_frame_duplicate_trade`.
+
+    Fails loudly (`DedupBypassUnavailableError`) if `__wrapped__` is
+    absent, rather than silently falling back to the dedup-active
+    `adapter.normalize()` -- a future adapter whose `normalize` is not
+    wrapped the expected way must break this tool's caller visibly, not
+    quietly start losing duplicate evidence again.
+    """
+    unwrapped = getattr(adapter.normalize, "__wrapped__", None)
+    if unwrapped is None:
+        raise DedupBypassUnavailableError(
+            f"{type(adapter).__name__}.normalize has no __wrapped__ attribute -- "
+            "cannot safely bypass production duplicate suppression for forensic "
+            "evidence capture. Refusing to fall back to adapter.normalize(), which "
+            "would silently apply _dedupe_trades and destroy the same-frame "
+            "duplicate evidence this tool exists to preserve."
+        )
+    events = unwrapped(adapter, raw_json, local_receive_ts=local_receive_ts)
+    return adapter._stamp_instrument(events)
+
+
 def convert_raw_wire_to_dedup_evidence(
     raw_wire_rows: Sequence[Mapping[str, Any]],
     *,
@@ -266,10 +319,14 @@ def convert_raw_wire_to_dedup_evidence(
 ) -> RawTradeEvidenceConversion:
     """Convert raw wire rows into forensic records without production dedup.
 
-    This path uses each venue adapter's `normalize()` parser directly and does
-    not call `normalize_message()`, so `_dedupe_trades()` semantics are never
-    involved. Empty/missing/malformed/truncated/unroutable frames are returned
-    as invalid evidence issues instead of disappearing silently.
+    Uses `_dedup_bypassed_normalize` (this venue adapter's raw parser via
+    `__wrapped__`, re-stamped with instrument identity), never
+    `adapter.normalize()` directly -- the latter is the production-wrapped
+    method and always applies `_dedupe_trades`, which would silently
+    suppress a second same-frame occurrence of an identical trade before
+    this function ever saw it. Empty/missing/malformed/truncated/
+    unroutable frames are returned as invalid evidence issues instead of
+    disappearing silently.
     """
     records: list[DedupEvidenceRecord] = []
     invalid_records: list[RawTradeEvidenceIssue] = []
@@ -316,8 +373,21 @@ def convert_raw_wire_to_dedup_evidence(
             continue
 
         adapter_local_receive_ts = local_receive_ts if isinstance(local_receive_ts, int) and not isinstance(local_receive_ts, bool) else 0
+        # `adapter_local_receive_ts` exists ONLY to satisfy the parser's
+        # positional requirement when the raw row's own value is invalid
+        # (None/bool/string/negative) -- it is never read back out. The
+        # DedupEvidenceRecord built below always uses the ORIGINAL
+        # `local_receive_ts` (line ~), preserving whatever invalid value
+        # was actually captured, so the fabricated 0 can never become
+        # claimed evidence. Confirmed safe by reading every adapter: none
+        # reads back `event.local_receive_ts` for a trade event, and
+        # `event.local_process_ts` is never set by any trade parser
+        # (always None regardless of what was passed) -- see
+        # test_fabricated_receive_ts_placeholder_never_leaks_into_evidence.
         try:
-            events = adapter.normalize(raw_json, local_receive_ts=adapter_local_receive_ts)
+            events = _dedup_bypassed_normalize(adapter, raw_json, local_receive_ts=adapter_local_receive_ts)
+        except DedupBypassUnavailableError:
+            raise
         except Exception:  # noqa: BLE001 - evidence path must classify malformed rows, not crash.
             invalid_records.append(RawTradeEvidenceIssue("MALFORMED_PAYLOAD", locator))
             continue
@@ -378,8 +448,14 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
     """
     total = len(records)
 
-    # --- Duplicate detection: group by identity, matching _dedupe_trades's
-    # own None-id exemption exactly (design doc section C).
+    # --- Classification pass: missing-ID and invalid-timestamp are
+    # independent dimensions of one record (task's Critical Issue #5) --
+    # a record with both is counted in both, never hidden behind an early
+    # `continue` that only checks one. Identity grouping (for duplicate /
+    # invalid-timestamp-collision detection) includes every record with a
+    # real trade_id, valid timestamp or not -- only the delay/ordering
+    # arithmetic below excludes invalid-timestamp records, since that
+    # arithmetic (not grouping) is what actually requires a real number.
     by_identity: dict = {}
     valid_local_receive_ts: dict[int, int] = {}
     missing_id_count = 0
@@ -394,22 +470,45 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
                 invalid_local_receive_ts_examples.append(
                     {"reason": invalid_reason, **_record_locator(r)}
                 )
-            continue
         if r.trade_id is None:
             missing_id_count += 1
             if len(missing_id_examples) < 10:
                 missing_id_examples.append(_record_locator(r))
-            continue
+            continue   # only trade_id=None is exempt from identity grouping -- see production _dedupe_trades's own exemption
         by_identity.setdefault(r.identity(), []).append(r)
-        valid_local_receive_ts[id(r)] = receive_ts
+        if invalid_reason is None:
+            valid_local_receive_ts[id(r)] = receive_ts
 
     duplicates: list = []
     exact_duplicate_count = 0
     identity_payload_conflict_count = 0
+    invalid_timestamp_identity_collisions = 0
+    invalid_timestamp_identity_collision_examples: list[dict[str, Any]] = []
     for identity, group in by_identity.items():
         if len(group) < 2:
             continue
-        ordered = sorted(group, key=lambda r: _sort_key(r, valid_local_receive_ts[id(r)]))
+        valid_members = [r for r in group if id(r) in valid_local_receive_ts]
+        invalid_members = [r for r in group if id(r) not in valid_local_receive_ts]
+
+        if invalid_members:
+            # This identity occurred more than once and at least one
+            # occurrence has no trustworthy timing -- a real collision,
+            # even if it cannot be timed. Reported separately from
+            # duplicate_count, which only covers pairs both of whose
+            # timestamps are valid (task's Critical Issue #4).
+            invalid_timestamp_identity_collisions += 1
+            if len(invalid_timestamp_identity_collision_examples) < 10:
+                invalid_timestamp_identity_collision_examples.append({
+                    "identity": identity, "group_size": len(group),
+                    "valid_member_count": len(valid_members),
+                    "invalid_member_count": len(invalid_members),
+                    **_record_locator(invalid_members[0]),
+                })
+
+        if len(valid_members) < 2:
+            continue   # nothing left that can be timed/paired as a duplicate
+
+        ordered = sorted(valid_members, key=lambda r: _sort_key(r, valid_local_receive_ts[id(r)]))
         first = ordered[0]
         first_receive_ts = valid_local_receive_ts[id(first)]
         for dup in ordered[1:]:
@@ -515,6 +614,8 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
         identity_payload_conflict_count=identity_payload_conflict_count,
         invalid_local_receive_ts_count=invalid_local_receive_ts_count,
         invalid_local_receive_ts_examples=invalid_local_receive_ts_examples,
+        invalid_timestamp_identity_collisions=invalid_timestamp_identity_collisions,
+        invalid_timestamp_identity_collision_examples=invalid_timestamp_identity_collision_examples,
         duplicates=duplicates,
         delay_min=delay_min, delay_median=delay_median, delay_p95=delay_p95,
         delay_p99=delay_p99, delay_max=delay_max, ordering_by_stream=ordering_by_stream,

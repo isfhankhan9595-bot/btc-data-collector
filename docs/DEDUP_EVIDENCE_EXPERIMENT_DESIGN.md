@@ -177,3 +177,67 @@ therefore does not create empirical exchange evidence by itself.
   sufficient ordering/uniqueness guarantee for a bounded strategy) remain
   exactly as unresolved as PR #50/#51 left them. This session did not
   attempt to resolve them without evidence, and does not claim to.
+
+## Hostile-audit fixes to this PR's own converter (this session)
+
+The prior commit's `convert_raw_wire_to_dedup_evidence` called
+`adapter.normalize()` directly -- the production-wrapped method, which
+always applies `_dedupe_trades`. This defeated the converter's stated
+purpose: a single raw frame carrying the same trade identity twice (a
+real, producible case -- confirmed for OKX's `trades` channel, which
+returns one event per array element) would have its second occurrence
+silently suppressed before this module ever saw it, exactly the evidence
+this tool exists to preserve. Verified empirically (not merely reasoned
+from `functools.wraps`'s documentation): `adapter.normalize()` on such a
+frame returns 1 event; the fix (`_dedup_bypassed_normalize`, using
+`adapter.normalize.__wrapped__` + a manual `_stamp_instrument` call)
+returns 2. Fails loudly (`DedupBypassUnavailableError`) rather than
+silently falling back to the dedup-active path if a future adapter's
+`normalize` is not wrapped the expected way.
+
+Also fixed: `analyze_dedup_evidence` previously skipped any record with
+an invalid `local_receive_ts` before checking `trade_id`, via an early
+`continue` -- meaning such a record was invisible to both identity-
+collision detection AND `missing_id_count` accounting when both problems
+applied to the same record. `invalid_timestamp_identity_collisions` (and
+its `_examples` counterpart) is now a real, computed, tested field:
+an identity that occurs more than once, at least one occurrence with an
+invalid timestamp, counted per identity, kept explicitly separate from
+`duplicate_count` (which only covers pairs whose timing could actually
+be classified with two valid timestamps).
+
+**New finding, documented rather than silently worked around:** this
+module reads `row.get("reconnect_marker")` throughout, but
+`RawWireRecord`/`RAW_WIRE_SCHEMA` (`collector/collector/raw_capture.py`)
+has no `reconnect_marker` field at all -- only `connection_generation`.
+On real captured production data, `reconnect_marker` will always be
+`None`, so `reconnect_associated` can only ever be established via a
+`connection_generation` transition today, never via a marker transition.
+This is not a bug in this module (the field is correctly optional and
+"not enough evidence" is the correct behavior for a missing marker), but
+it does mean the marker-based code path is currently untestable against
+real data and only exercised by synthetic fixtures. If reconnect-marker
+correlation is wanted from real captures, `RawWireRecord` would need a
+new field -- a production schema change, explicitly out of this PR's
+forensic-only scope, not made here.
+
+Fabricated-timestamp isolation (`local_receive_ts=0` passed to the
+parser when the raw value is invalid) was audited and confirmed safe by
+reading every adapter directly: no trade parser reads back
+`event.local_receive_ts`, and `event.local_process_ts` is never set by
+any trade parser (always `None` regardless of what was passed) -- so the
+placeholder cannot leak into any evidence field. The `DedupEvidenceRecord`
+itself always uses the row's ORIGINAL value. Proven with a dedicated test
+(`test_fabricated_receive_ts_placeholder_never_leaks_into_evidence`)
+rather than left as an audit claim only.
+
+10 new tests added (`test_dedup_evidence_analysis.py`, 35 -> 45): same-
+frame duplicate preservation (identical payload, conflicting payload,
+and distinct-ID cases), a direct production-vs-bypass event-count diff,
+the fail-loud-without-`__wrapped__` guard, the fabricated-timestamp
+isolation proof, the four invalid-timestamp/identity-collision
+combinations Critical Issue #4 called out, and `keep_raw_payload=False`
+coverage. Full suite: 1264 passed (1254 baseline + 10 new). `compileall`
+clean, `git diff --check` clean. Scope unchanged: exactly
+`dedup_evidence_analysis.py`, its test file, and this doc -- no
+production dedup, replay, CVD, or orderbook code touched.
