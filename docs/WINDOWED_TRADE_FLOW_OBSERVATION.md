@@ -79,16 +79,42 @@ Exchange timestamps never establish eligibility at either layer — proven
 adversarially (a payload claiming an exchange timestamp inside the window
 while its causal `timestamp_ms` is after `observation_ts`).
 
-## Missingness — four distinguished cases
+## Missingness — corrected to a genuine three-way split (this phase)
 
-- **No trades fell in the window, but older data exists**: `NEVER_OBSERVED`,
-  `cvd=None`. Not `0.0` — absence of flow in the window is not proof of
-  zero net flow, only proof nothing causally-known landed there.
-- **Zero causal frames at all**: `NEVER_OBSERVED`, `frames_considered=0`.
-- **Frames existed but were malformed / produced no trade**: `NEVER_OBSERVED`,
-  `frames_considered > 0` — distinguishable from the case above.
-- **Last trade in the window is older than `staleness_ms`**: `STALE`,
-  `cvd` retained (not discarded, not reset to `0.0`).
+An earlier version of this module treated every empty window as
+`NEVER_OBSERVED`, whether or not causal evidence for the venue existed
+elsewhere. That conflates "we know nothing about this venue" with "we
+know this venue was quiet" — wrong for research use, since it hides a
+genuinely confirmable zero as an unknown. Corrected here to:
+
+- **Zero causal trade evidence for the venue at all** (`frames_considered=0`,
+  or frames existed but were malformed/produced no trade): `NEVER_OBSERVED`,
+  `cvd=None`, `buy_volume=None`, `sell_volume=None`. The only case this
+  status is reserved for.
+- **Evidence exists, none of it falls in this window, and the nearest
+  evidence is within `staleness_ms` of `observation_ts`**: `AVAILABLE`
+  with `cvd == buy_volume == sell_volume == 0.0`, `trade_count == 0`. A
+  genuine, confirmed zero — real information, not an unknown.
+- **Evidence exists, none of it falls in this window, and the nearest
+  evidence is older than `staleness_ms`**: `STALE`, same numeric zero as
+  above but flagged — nothing heard from this venue recently enough to
+  distinguish "quiet market" from "silent reception gap", mirroring how
+  the cumulative observation retains a numeric CVD under `STALE` rather
+  than discarding it.
+- **Last trade *inside* a non-empty window is older than `staleness_ms`**:
+  `STALE`, `cvd` retained from the real trades in the window (not
+  discarded, not reset to `0.0`).
+
+`instrument`/`exchange` are populated from the nearest evidence in the
+first three cases below `NEVER_OBSERVED` (never fabricated, never left
+as the bare venue string when a real instrument is actually known).
+
+See `trade_flow_observation.py`'s `WindowedTradeFlowObservation`
+docstring for the full reasoning, and
+`test_genuinely_no_evidence_at_all_is_never_observed_with_none_fields`,
+`test_empty_window_with_stale_older_evidence_is_stale_not_never_observed`,
+and `test_empty_window_with_fresh_nearby_evidence_is_available_with_genuine_zero`
+in the test file for the three cases exercised directly.
 
 ## Side normalization
 

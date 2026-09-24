@@ -68,8 +68,14 @@ def test_windowed_unknown_side_also_excluded_from_both_sums():
 def test_trade_at_window_start_is_excluded():
     frame = _binance_trade_at(T - W, agg_id=1)
     obs = observe_windowed_trade_flow_at([frame], T, W, venue="BINANCE")
-    assert obs.status is AlignmentStatus.NEVER_OBSERVED
-    assert obs.trade_count == 0
+    assert obs.trade_count == 0                        # boundary contract: excluded from the window
+    # Corrected semantics (see module docstring's "three situations"): a
+    # trade exists causally (just outside the window), so this is NOT
+    # NEVER_OBSERVED. Its age relative to T is exactly W (60s) here, which
+    # exceeds the default 5s staleness_ms, so the empty window is reported
+    # as a numeric zero flagged STALE, not as an unknown.
+    assert obs.status is AlignmentStatus.STALE
+    assert obs.cvd == obs.buy_volume == obs.sell_volume == 0.0
 
 
 def test_trade_at_window_start_plus_one_is_included():
@@ -159,15 +165,25 @@ def test_exchange_timestamp_cannot_grant_early_window_eligibility():
 
 
 # ---------------------------------------------------------------------------
-# Gate F / Case B, C, D (missingness and completeness distinctions).
+# Missingness and completeness distinctions (corrected in this phase -- see
+# trade_flow_observation.py's WindowedTradeFlowObservation docstring for the
+# three-way split this section tests directly). An earlier version of this
+# module treated every empty window as NEVER_OBSERVED regardless of whether
+# older evidence for the venue existed; that conflated "we know nothing
+# about this venue" with "we know this venue was quiet", which is wrong for
+# research use -- a downstream consumer must be able to trust a reported
+# zero exactly when one is warranted, not have it hidden as None.
 # ---------------------------------------------------------------------------
 
 
-def test_case_a_no_trades_in_a_window_that_has_older_data_is_never_observed_not_zero():
-    old = _binance_trade_at(T - W - 1_000, agg_id=1)
-    obs = observe_windowed_trade_flow_at([old], T, W, venue="BINANCE")
+def test_genuinely_no_evidence_at_all_is_never_observed_with_none_fields():
+    """True Case A: zero causal trade evidence for this venue, full stop --
+    not merely none inside this window. The only situation this dataclass's
+    NEVER_OBSERVED is reserved for."""
+    obs = observe_windowed_trade_flow_at([], T, W, venue="BINANCE")
     assert obs.status is AlignmentStatus.NEVER_OBSERVED
-    assert obs.cvd is None   # not 0.0 -- no trades fell in this window, not "zero net flow"
+    assert obs.cvd is None and obs.buy_volume is None and obs.sell_volume is None
+    assert obs.trade_count == 0
 
 
 def test_case_d_malformed_frames_only_is_never_observed_not_a_complete_zero_window():
@@ -177,6 +193,42 @@ def test_case_d_malformed_frames_only_is_never_observed_not_a_complete_zero_wind
     assert obs.status is AlignmentStatus.NEVER_OBSERVED
     assert obs.frames_considered == 1
     assert obs.cvd is None
+
+
+def test_empty_window_with_stale_older_evidence_is_stale_not_never_observed():
+    """Corrected from this phase's audit: a window with no trades, but
+    with older causal evidence for the venue that is itself too old to
+    trust (age > staleness_ms), reports a genuine numeric zero flagged
+    STALE -- never None (evidence exists) and never a silent AVAILABLE
+    zero (the evidence is too old to vouch for "nothing happened
+    recently" vs. "we stopped hearing from this venue")."""
+    old = _binance_trade_at(T - W - 1_000, agg_id=1)
+    obs = observe_windowed_trade_flow_at([old], T, W, venue="BINANCE")
+    assert obs.trade_count == 0
+    assert obs.status is AlignmentStatus.STALE
+    assert obs.cvd == obs.buy_volume == obs.sell_volume == 0.0   # a real, confirmed zero -- not unknown
+    assert obs.age_ms == W + 1_000
+
+
+def test_empty_window_with_fresh_nearby_evidence_is_available_with_genuine_zero():
+    """The other half of the correction: when the nearest evidence is
+    recent enough to trust, an empty window is a confirmed AVAILABLE
+    zero, not NEVER_OBSERVED. A quiet 30 seconds in an actively-observed
+    market is real information, not an unknown."""
+    just_outside_window = _binance_trade_at(T - W - 1, agg_id=1)   # 1ms before window_start
+    # staleness_ms deliberately wider than the window itself here: this
+    # test isolates "evidence is fresh enough to trust" from "evidence
+    # happens to be inside the window" -- they are different questions,
+    # and a real deployment may reasonably use a staleness threshold wider
+    # than any one window (e.g. one staleness policy shared across the
+    # 30s/1m/3m/5m/15m windows this feature is required to support).
+    obs = observe_windowed_trade_flow_at([just_outside_window], T, W, venue="BINANCE",
+                                          staleness_ms=W + 1_000)
+    assert obs.trade_count == 0
+    assert obs.status is AlignmentStatus.AVAILABLE
+    assert obs.cvd == obs.buy_volume == obs.sell_volume == 0.0
+    assert obs.age_ms == W + 1
+    assert obs.instrument == BINANCE_USDM_BTCUSDT   # known from the older evidence, not fabricated
 
 
 def test_case_c_stale_last_trade_retains_cvd_marked_stale():
@@ -378,7 +430,7 @@ def test_mutation_2_changing_open_to_closed_lower_bound_would_admit_the_boundary
     frame = _binance_trade_at(T - W, agg_id=1)   # exactly at window_start
 
     real = observe_windowed_trade_flow_at([frame], T, W, venue="BINANCE")
-    assert real.status is AlignmentStatus.NEVER_OBSERVED   # real: excluded
+    assert real.trade_count == 0   # real: excluded from the window (boundary contract, see test above)
 
     # Mutated: >= instead of > for the lower bound.
     trades, _ = _causal_trades([frame], T, "BINANCE")
