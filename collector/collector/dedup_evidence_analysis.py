@@ -150,6 +150,8 @@ class DedupEvidenceReport:
     identity_payload_conflict_count: int = 0
     invalid_local_receive_ts_count: int = 0
     invalid_local_receive_ts_examples: list[dict[str, Any]] = field(default_factory=list)
+    invalid_timestamp_identity_collisions: int = 0
+    invalid_timestamp_identity_collision_examples: list[dict[str, Any]] = field(default_factory=list)
     duplicates: list = field(default_factory=list)          # list[DuplicateDelayReport]
     delay_min: ObservedStatistic = None
     delay_median: ObservedStatistic = None
@@ -266,9 +268,28 @@ def convert_raw_wire_to_dedup_evidence(
 ) -> RawTradeEvidenceConversion:
     """Convert raw wire rows into forensic records without production dedup.
 
-    This path uses each venue adapter's `normalize()` parser directly and does
-    not call `normalize_message()`, so `_dedupe_trades()` semantics are never
-    involved. Empty/missing/malformed/truncated/unroutable frames are returned
+    Hostile-audit correction (this session): the previous docstring here
+    claimed "`_dedupe_trades()` semantics are never involved" -- that is
+    false as a statement of mechanism. `adapter.normalize()` is, for every
+    concrete adapter, the version `ExchangeAdapter.__init_subclass__`
+    already wraps to call `self._dedupe_trades(...)` before returning
+    (see adapters/base.py) -- there is no separate unwrapped entry point.
+    What actually makes this safe is narrower and more fragile than the
+    old comment implied: `_adapter_for()` is called *inside* the per-row
+    loop below, so every row gets a **freshly constructed adapter
+    instance**, and `_seen_trade_ids` is a per-instance attribute set in
+    `__init__`. A fresh instance's set is always empty, so
+    `_dedupe_trades` runs but can never have anything to suppress across
+    rows -- confirmed empirically, not just reasoned about, by
+    `test_raw_forensic_analysis_uses_raw_rows_not_deduplicated_replay_output`
+    and `test_fresh_adapter_per_row_means_dedup_state_never_accumulates`.
+    This means the safety of this function depends on *never* caching or
+    reusing an adapter instance across rows -- if a future change hoists
+    adapter construction out of this loop (a natural-looking performance
+    optimization for a large capture), duplicate trades would silently
+    disappear from the forensic evidence again. Do not do that without
+    re-deriving this argument from scratch.
+    Empty/missing/malformed/truncated/unroutable frames are returned
     as invalid evidence issues instead of disappearing silently.
     """
     records: list[DedupEvidenceRecord] = []
@@ -386,6 +407,13 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
     missing_id_examples: list[dict[str, Any]] = []
     invalid_local_receive_ts_count = 0
     invalid_local_receive_ts_examples: list[dict[str, Any]] = []
+    # Records with an otherwise-groupable identity (trade_id is not None)
+    # but an invalid local_receive_ts: set aside rather than silently
+    # dropped from duplicate consideration entirely. See
+    # invalid_timestamp_identity_collisions below -- an invalid timestamp
+    # must not let a real duplicate go undetected just because delay/order
+    # cannot be computed for it (hostile-audit finding, this session).
+    identity_bearing_invalid_ts_records: list = []
     for r in records:
         receive_ts, invalid_reason = _valid_local_receive_ts(r.local_receive_ts)
         if invalid_reason is not None:
@@ -394,6 +422,8 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
                 invalid_local_receive_ts_examples.append(
                     {"reason": invalid_reason, **_record_locator(r)}
                 )
+            if r.trade_id is not None:
+                identity_bearing_invalid_ts_records.append(r)
             continue
         if r.trade_id is None:
             missing_id_count += 1
@@ -402,6 +432,19 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
             continue
         by_identity.setdefault(r.identity(), []).append(r)
         valid_local_receive_ts[id(r)] = receive_ts
+
+    # A record whose timestamp is invalid can still share an identity with
+    # a validly-timestamped record elsewhere in the sample -- that is
+    # evidence of a possible duplicate this analysis cannot fully classify
+    # (no delay, no arrival order), not evidence that no duplicate
+    # occurred. Reported, never silently absorbed into "1 unique trade".
+    invalid_timestamp_identity_collisions = 0
+    invalid_timestamp_identity_collision_examples: list[dict[str, Any]] = []
+    for r in identity_bearing_invalid_ts_records:
+        if r.identity() in by_identity:
+            invalid_timestamp_identity_collisions += 1
+            if len(invalid_timestamp_identity_collision_examples) < 10:
+                invalid_timestamp_identity_collision_examples.append(_record_locator(r))
 
     duplicates: list = []
     exact_duplicate_count = 0
@@ -515,6 +558,8 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
         identity_payload_conflict_count=identity_payload_conflict_count,
         invalid_local_receive_ts_count=invalid_local_receive_ts_count,
         invalid_local_receive_ts_examples=invalid_local_receive_ts_examples,
+        invalid_timestamp_identity_collisions=invalid_timestamp_identity_collisions,
+        invalid_timestamp_identity_collision_examples=invalid_timestamp_identity_collision_examples,
         duplicates=duplicates,
         delay_min=delay_min, delay_median=delay_median, delay_p95=delay_p95,
         delay_p99=delay_p99, delay_max=delay_max, ordering_by_stream=ordering_by_stream,
