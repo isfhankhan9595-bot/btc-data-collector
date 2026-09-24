@@ -176,14 +176,50 @@ class WindowedTradeFlowObservation:
     the instant the window opens, not inside it).
 
     ``status`` distinguishes what the cumulative observation's two-state
-    NEVER_OBSERVED/AVAILABLE/STALE already covers, applied to the window:
-    NEVER_OBSERVED here means no trade fell inside this specific window,
-    which is different from no trade existing at all up to observation_ts
-    (there may be plenty of older trades, just none in the last W) --
-    ``frames_considered`` is still the *cumulative* count up to
-    observation_ts (matching what ``_causal_trades`` actually computed),
-    not a window-scoped frame count, since frames don't have a lower
-    causal bound the way trades' window membership does.
+    NEVER_OBSERVED/AVAILABLE/STALE already covers, applied to the window,
+    with one addition the cumulative case does not need: an *empty*
+    window is not automatically NEVER_OBSERVED.
+
+    Three genuinely different situations collapse to "trade_count == 0"
+    if not distinguished, and this dataclass distinguishes them by
+    ``status`` (audit finding, corrected here -- an earlier version of
+    this module conflated the first two):
+
+    * **NEVER_OBSERVED** (``cvd``/``buy_volume``/``sell_volume`` all
+      ``None``): no causal trade evidence exists for this venue at all,
+      up to ``observation_ts`` -- not merely none *in this window*. There
+      is no basis to say anything about the window, empty or otherwise.
+    * **AVAILABLE with a genuine zero** (``cvd == buy_volume ==
+      sell_volume == 0.0``, ``trade_count == 0``): causal trade evidence
+      for this venue exists, it is simply outside this specific window,
+      and the nearest such evidence is recent enough (within
+      ``staleness_ms`` of ``observation_ts``) to trust that "nothing fell
+      in this window" reflects a genuinely quiet period rather than a
+      gap in what was received. This is real information, not an
+      unknown, and must not be reported as ``None``.
+    * **STALE with a numeric zero** (same fields as AVAILABLE, ``status``
+      differs): evidence exists somewhere for this venue, the window is
+      empty, but the nearest evidence is *older* than ``staleness_ms`` --
+      i.e. nothing at all has been heard from this venue recently, window
+      or not. A confident "zero" cannot be claimed here (a silent gap in
+      reception would look identical to a quiet market), so the window's
+      zero is reported but flagged STALE, exactly mirroring how the
+      cumulative observation retains a numeric CVD under STALE rather
+      than discarding it.
+
+    A non-empty window's own STALE/AVAILABLE split is unchanged from
+    before this distinction was added: it is governed by the age of the
+    most recent trade *inside* the window, which -- because
+    ``_causal_trades`` returns trades in ascending causal order and the
+    window is the suffix ``(observation_ts - window_ms, observation_ts]``
+    -- is always also the most recent causally-known trade overall
+    whenever the window is non-empty. See
+    ``observe_windowed_trade_flow_at``'s body for the one-line proof.
+
+    ``frames_considered`` is always the *cumulative* frame count up to
+    ``observation_ts`` (matching what ``_causal_trades`` computed), not a
+    window-scoped count -- frames have no lower causal bound the way a
+    trade's window membership does.
     """
     exchange: str
     instrument: Optional[InstrumentId]
@@ -231,16 +267,10 @@ def observe_windowed_trade_flow_at(
     window_end = observation_ts
 
     all_causal_trades, frames_considered = _causal_trades(frames, observation_ts, venue)
-    windowed = [t for t in all_causal_trades if window_start < t.local_receive_ts <= window_end]
 
-    if not windowed:
-        # Deliberately NOT distinguishing "zero frames at all" from "trades
-        # exist but none fall in this window" with a different status: both
-        # are "nothing observable in this window", and the task's own
-        # completeness warning (Case B) is why this status is NEVER_OBSERVED
-        # rather than a fabricated AVAILABLE-with-cvd=0 -- a window with no
-        # trades is not proof the window was complete, only that nothing
-        # causally-known landed in it.
+    if not all_causal_trades:
+        # Genuinely NEVER_OBSERVED: no trade evidence exists for this venue
+        # at all, up to observation_ts. Nothing to say about the window.
         return WindowedTradeFlowObservation(
             exchange=venue, instrument=None, observation_ts=observation_ts,
             window_start=window_start, window_end=window_end, window_ms=window_ms,
@@ -249,8 +279,47 @@ def observe_windowed_trade_flow_at(
             last_trade_local_receive_ts=None, age_ms=None, frames_considered=frames_considered,
         )
 
+    windowed = [t for t in all_causal_trades if window_start < t.local_receive_ts <= window_end]
+    # `all_causal_trades` is in ascending causal order (ReplaySource's own
+    # deterministic order), and the window is the suffix
+    # `(window_start, observation_ts]`; every trade in `all_causal_trades`
+    # already satisfies `local_receive_ts <= observation_ts`, so the
+    # window filter above keeps exactly a trailing run of it. That means
+    # `all_causal_trades[-1]` -- the most recent causally-known trade,
+    # whether or not it happens to fall inside this window -- is the
+    # right "how fresh is our knowledge of this venue" reference in every
+    # case: when the window is non-empty it IS `windowed[-1]` (the suffix
+    # includes the last element or the window would be empty), and when
+    # the window is empty it is still the best available evidence of when
+    # this venue was last actually heard from.
+    latest_known = all_causal_trades[-1]
+    overall_age_ms = observation_ts - latest_known.local_receive_ts
+
+    if not windowed:
+        # Evidence for this venue exists, just not inside this specific
+        # window -- NOT the same as never having observed the venue at
+        # all (the case handled above). Whether the empty window can be
+        # trusted as a genuine, confirmed zero depends on how fresh the
+        # nearest evidence is: fresh enough (AVAILABLE) means we can
+        # trust "nothing happened in the last W"; not fresh (STALE) means
+        # we have not heard from this venue recently at all, so an empty
+        # window cannot be distinguished from a silent reception gap --
+        # the zero is still reported (never fabricated as `None` when we
+        # do have a concrete count of zero), but flagged accordingly,
+        # exactly mirroring how the cumulative observation keeps a
+        # numeric CVD under STALE rather than discarding it.
+        status = AlignmentStatus.STALE if overall_age_ms > staleness_ms else AlignmentStatus.AVAILABLE
+        return WindowedTradeFlowObservation(
+            exchange=latest_known.exchange, instrument=latest_known.instrument,
+            observation_ts=observation_ts, window_start=window_start, window_end=window_end,
+            window_ms=window_ms, status=status, cvd=0.0, buy_volume=0.0, sell_volume=0.0,
+            trade_count=0, first_trade_local_receive_ts=None, last_trade_local_receive_ts=None,
+            age_ms=overall_age_ms, frames_considered=frames_considered,
+        )
+
     buy_volume, sell_volume = _side_volumes(windowed)
     first_trade, last_trade = windowed[0], windowed[-1]
+    assert last_trade is latest_known    # the suffix property claimed above, made explicit
     age_ms = observation_ts - last_trade.local_receive_ts
     status = AlignmentStatus.STALE if age_ms > staleness_ms else AlignmentStatus.AVAILABLE
     return WindowedTradeFlowObservation(
