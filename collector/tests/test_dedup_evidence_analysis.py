@@ -9,6 +9,9 @@ being useful once real evidence exists, not a substitute for that evidence.
 from __future__ import annotations
 
 import hashlib
+import json
+
+import pytest
 
 from collector.collector.dedup_evidence_analysis import (
     DedupEvidenceRecord,
@@ -353,7 +356,190 @@ def test_raw_forensic_analysis_uses_raw_rows_not_deduplicated_replay_output():
 # ---------------------------------------------------------------------------
 
 
-def test_mutation_removing_instrument_from_identity_would_be_caught():
+def test_raw_converter_preserves_a_same_frame_duplicate_trade():
+    """Critical Issue #2's mandatory test: a SINGLE raw frame containing
+    two identical trade entries must produce TWO DedupEvidenceRecord
+    objects, not one. This is the one case a fresh-adapter-per-row
+    architecture does NOT protect against on its own -- production
+    _dedupe_trades operates on the list normalize() returns for one
+    message, so if this converter called adapter.normalize() (the
+    dedup-active, wrapped method) instead of bypassing it via
+    __wrapped__, the second identical trade in this single OKX push
+    would be silently suppressed before ever reaching this module.
+    Verified empirically in this test, not merely asserted from reading
+    functools.wraps's documentation."""
+    payload = json.dumps({"arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"}, "data": [
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+    ]})
+    conversion = convert_raw_wire_to_dedup_evidence([{
+        "venue": "OKX", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": payload,
+    }])
+    assert len(conversion.records) == 2, \
+        "a same-frame duplicate must survive the forensic converter -- production dedup must be bypassed"
+    assert conversion.records[0].trade_id == conversion.records[1].trade_id == "1"
+    # And the analyzer, given these two preserved records, correctly
+    # reports them as a duplicate pair -- proving the two ends connect.
+    report = analyze_dedup_evidence(conversion.records)
+    assert report.duplicate_count == 1
+
+
+def test_raw_converter_preserves_same_frame_duplicates_with_conflicting_payloads():
+    """Same-frame duplicate identity with different canonical fields:
+    must still both survive conversion, and the analyzer must classify
+    the pair as IDENTITY_PAYLOAD_CONFLICT, not silently pick one."""
+    payload = json.dumps({"arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"}, "data": [
+        {"instId": "BTC-USDT-SWAP", "tradeId": "9", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+        {"instId": "BTC-USDT-SWAP", "tradeId": "9", "px": "101", "sz": "2", "side": "sell", "ts": "1000"},
+    ]})
+    conversion = convert_raw_wire_to_dedup_evidence([{
+        "venue": "OKX", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": payload,
+    }])
+    assert len(conversion.records) == 2
+    report = analyze_dedup_evidence(conversion.records)
+    assert report.duplicate_count == 1
+    assert report.duplicates[0].classification == IDENTITY_PAYLOAD_CONFLICT
+
+
+def test_raw_converter_preserves_same_frame_distinct_trade_ids():
+    """Same-frame, different trade IDs -- both survive, neither is
+    treated as a duplicate of the other."""
+    payload = json.dumps({"arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"}, "data": [
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+        {"instId": "BTC-USDT-SWAP", "tradeId": "2", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+    ]})
+    conversion = convert_raw_wire_to_dedup_evidence([{
+        "venue": "OKX", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": payload,
+    }])
+    assert len(conversion.records) == 2
+    assert analyze_dedup_evidence(conversion.records).duplicate_count == 0
+
+
+def test_dedup_bypass_helper_produces_more_events_than_production_normalize():
+    """Direct proof of the architectural boundary itself: calling the
+    real adapter.normalize() (production, dedup-active) on this same
+    payload returns fewer events than the forensic bypass path -- the
+    exact defect this module exists to avoid, demonstrated by diffing
+    against the thing being bypassed rather than only testing the
+    bypass path in isolation."""
+    from collector.collector.adapters.okx import OKXAdapter
+    from collector.collector.dedup_evidence_analysis import _dedup_bypassed_normalize
+
+    raw = {"arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"}, "data": [
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+    ]}
+    production = OKXAdapter().normalize(dict(raw), local_receive_ts=1000)
+    bypassed = _dedup_bypassed_normalize(OKXAdapter(), dict(raw), local_receive_ts=1000)
+    assert len(production) == 1, "sanity check: production dedup IS active on this path"
+    assert len(bypassed) == 2, "the forensic bypass must not be subject to the same suppression"
+
+
+def test_dedup_bypass_helper_fails_loudly_without_wrapped_rather_than_falling_back():
+    """Critical Issue #1's explicit requirement: a future/mock adapter
+    lacking __wrapped__ must raise, never silently fall back to the
+    dedup-active adapter.normalize()."""
+    import pytest as _pytest
+    from collector.collector.dedup_evidence_analysis import DedupBypassUnavailableError, _dedup_bypassed_normalize
+
+    class _FakeAdapterWithoutWrapped:
+        def normalize(self, raw, *, local_receive_ts=None):
+            return []
+
+    with _pytest.raises(DedupBypassUnavailableError):
+        _dedup_bypassed_normalize(_FakeAdapterWithoutWrapped(), {}, local_receive_ts=0)
+
+
+def test_fabricated_receive_ts_placeholder_never_leaks_into_evidence():
+    """Critical Issue #3: when local_receive_ts is invalid, the converter
+    must pass a placeholder to the parser (a type it requires) but the
+    record's own local_receive_ts must retain the ORIGINAL invalid value,
+    never the placeholder -- proven for every invalid-type case, not just
+    asserted in a comment."""
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":1,"p":"100","q":"0.1","m":false}}'
+    for bad_value in (None, True, "not-an-int", -5):
+        conversion = convert_raw_wire_to_dedup_evidence([{
+            "venue": "BINANCE", "market_type": "linear_perpetual",
+            "local_receive_ts": bad_value, "payload": payload,
+        }])
+        assert len(conversion.records) == 1
+        record = conversion.records[0]
+        assert record.local_receive_ts == bad_value, \
+            f"expected the original invalid value {bad_value!r} preserved, got {record.local_receive_ts!r}"
+        assert record.local_receive_ts != 0 or bad_value == 0
+        # And it correctly flows through to the analyzer as invalid, not
+        # as a silently-accepted timestamp of 0.
+        report = analyze_dedup_evidence(conversion.records)
+        assert report.invalid_local_receive_ts_count == 1
+
+
+def test_invalid_timestamp_record_still_participates_in_identity_collision_detection():
+    """Critical Issue #4: an invalid-timestamp record must not be invisible
+    to identity-collision detection just because its timing can't be used.
+    Covers combination 1 (invalid+valid) and 2 (invalid+invalid)."""
+    invalid_plus_valid = [
+        _rec("BINANCE", "linear_perpetual", "trades", "1", None),    # invalid timestamp
+        _rec("BINANCE", "linear_perpetual", "trades", "1", 1000),    # valid, same identity
+    ]
+    report = analyze_dedup_evidence(invalid_plus_valid)
+    assert report.invalid_timestamp_identity_collisions == 1
+    assert report.duplicate_count == 0, "cannot be timed (only one valid timestamp exists) -- not a scored duplicate"
+
+    invalid_plus_invalid = [
+        _rec("BINANCE", "linear_perpetual", "trades", "2", None),
+        _rec("BINANCE", "linear_perpetual", "trades", "2", True),
+    ]
+    report2 = analyze_dedup_evidence(invalid_plus_invalid)
+    assert report2.invalid_timestamp_identity_collisions == 1
+    assert report2.duplicate_count == 0
+
+
+def test_invalid_timestamp_unique_identity_is_not_a_collision():
+    """Combination 3: a single invalid-timestamp record with no other
+    occurrence of its identity is not a collision of any kind."""
+    report = analyze_dedup_evidence([_rec("BINANCE", "linear_perpetual", "trades", "solo", None)])
+    assert report.invalid_timestamp_identity_collisions == 0
+    assert report.duplicate_count == 0
+    assert report.invalid_local_receive_ts_count == 1
+
+
+def test_valid_and_invalid_records_with_same_id_but_missing_id_are_independent_dimensions():
+    """Critical Issue #5: missing_id and invalid_local_receive_ts are
+    independent dimensions of one record -- both counted when both apply,
+    never hidden behind an early continue that only checks one."""
+    both_wrong = _rec("BINANCE", "linear_perpetual", "trades", None, None)
+    report = analyze_dedup_evidence([both_wrong])
+    assert report.missing_id_count == 1
+    assert report.invalid_local_receive_ts_count == 1
+
+
+def test_three_valid_plus_one_invalid_same_identity_reports_both_dimensions():
+    """Combination 8: multiple valid + invalid records sharing an
+    identity -- duplicate_count from the valid pair AND
+    invalid_timestamp_identity_collisions from the invalid one, not
+    mutually exclusive."""
+    records = [
+        _rec("BINANCE", "linear_perpetual", "trades", "z", 1000),
+        _rec("BINANCE", "linear_perpetual", "trades", "z", 1010),
+        _rec("BINANCE", "linear_perpetual", "trades", "z", None),
+    ]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicate_count == 1
+    assert report.invalid_timestamp_identity_collisions == 1
+
+
+def test_keep_raw_payload_false_drops_payload_but_keeps_hash():
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":3,"p":"100","q":"0.1","m":false}}'
+    conversion = convert_raw_wire_to_dedup_evidence(
+        [{"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": payload}],
+        keep_raw_payload=False,
+    )
+    record = conversion.records[0]
+    assert record.raw_payload is None
+    assert record.raw_payload_sha256 == hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+
     records = [_rec("BINANCE", "linear_perpetual", "trades", "x", 1000,
                     instrument_key="BINANCE|linear_perpetual|BTC-USDT|BTCUSDT"),
                _rec("BINANCE", "linear_perpetual", "trades", "x", 1010,
