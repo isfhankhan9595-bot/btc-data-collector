@@ -48,6 +48,8 @@ import json
 import math
 
 from collector.pipeline.label_generator import (
+    LabelDiscoveryError,
+    LabelSchemaError,
     max_label_horizon_s as observed_max_label_horizon_s,
 )
 import os
@@ -317,6 +319,23 @@ def generate_splits(
     leakage-safe, which is the precise failure this module exists to prevent.
     The origin of the number is recorded in ``max_label_horizon_source`` so a
     researcher can see whether the purge was measured or assumed.
+
+    Fail-closed on label discovery/schema failures. When ``max_label_horizon_s``
+    is derived, ``label_generator.max_label_horizon_s`` can raise
+    :class:`LabelDiscoveryError` (the labeled directory could not be listed)
+    or :class:`LabelSchemaError` (a participating file's schema could not be
+    read). Neither is caught here: they propagate to the caller, and nothing
+    is written -- no ``split_manifest.json``, no ``train``/``val``/``test``
+    parquet. A run that cannot prove the label horizon must not produce an
+    artifact that looks like it did.
+
+    Atomic publish. All output files are written into ``<out_dir>/.pending``
+    first; only once every file has been written successfully are they
+    published into ``out_dir`` one at a time, with ``split_manifest.json``
+    -- the "this is leakage-safe" claim -- published **last**. If generation
+    fails at any point before that final publish, any previously-existing
+    valid manifest and parquet in ``out_dir`` are untouched: a failed
+    regeneration can never destroy or shadow the last known-good split.
     """
     labeled_dir = os.path.join(data_dir, "aligned", "labeled")
     files = glob.glob(os.path.join(labeled_dir, "*.parquet"))
@@ -358,18 +377,10 @@ def generate_splits(
 
     out_dir = os.path.join(data_dir, "splits")
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "split_manifest.json"), "w") as handle:
-        json.dump(manifest.to_dict(), handle, indent=2)
+    pending_dir = os.path.join(out_dir, ".pending")
+    os.makedirs(pending_dir, exist_ok=True)
 
-    print(f"Saved split_manifest.json (leakage_safe={manifest.leakage_safe})")
-    print(f"purge={manifest.purge_days}d embargo={manifest.embargo_days}d "
-          f"requested_gap={manifest.requested_gap_days}d "
-          f"achieved train->val={manifest.achieved_gap_train_val} "
-          f"val->test={manifest.achieved_gap_val_test}")
-    print(f"Train: {len(manifest.train)} days, Val: {len(manifest.val)} days, "
-          f"Test: {len(manifest.test)} days")
-    for warning in manifest.warnings:
-        print(f"WARNING: {warning}")
+    pending_files: list[tuple[str, str]] = []  # (pending_path, final_path)
 
     if write_parquet:
         import pandas as pd
@@ -381,9 +392,41 @@ def generate_splits(
             frames = [pd.read_parquet(os.path.join(labeled_dir, f"{d}.parquet"))
                       for d in split_dates]
             combined = pd.concat(frames, ignore_index=True)
-            combined.to_parquet(os.path.join(out_dir, f"{split_name}.parquet"),
-                                compression="snappy")
-            print(f"Saved {split_name}.parquet")
+            pending_path = os.path.join(pending_dir, f"{split_name}.parquet")
+            combined.to_parquet(pending_path, compression="snappy")
+            pending_files.append((pending_path, os.path.join(out_dir, f"{split_name}.parquet")))
+
+    # Manifest last: everything else above must already be fully written and
+    # on disk (in .pending) before the artifact that claims leakage_safe is
+    # even created, let alone published.
+    manifest_pending_path = os.path.join(pending_dir, "split_manifest.json")
+    with open(manifest_pending_path, "w") as handle:
+        json.dump(manifest.to_dict(), handle, indent=2)
+    pending_files.append((manifest_pending_path, os.path.join(out_dir, "split_manifest.json")))
+
+    # Publish. Each os.replace is individually atomic (POSIX and Windows both
+    # guarantee the destination is either the old file or the new one, never
+    # a partial write); doing the manifest last means a reader can never
+    # observe a published manifest whose parquet files are not also already
+    # the new ones.
+    for pending_path, final_path in pending_files:
+        os.replace(pending_path, final_path)
+    if os.path.isdir(pending_dir) and not os.listdir(pending_dir):
+        os.rmdir(pending_dir)
+
+    print(f"Saved split_manifest.json (leakage_safe={manifest.leakage_safe})")
+    print(f"purge={manifest.purge_days}d embargo={manifest.embargo_days}d "
+          f"requested_gap={manifest.requested_gap_days}d "
+          f"achieved train->val={manifest.achieved_gap_train_val} "
+          f"val->test={manifest.achieved_gap_val_test}")
+    print(f"Train: {len(manifest.train)} days, Val: {len(manifest.val)} days, "
+          f"Test: {len(manifest.test)} days")
+    for warning in manifest.warnings:
+        print(f"WARNING: {warning}")
+    if write_parquet:
+        for split_name in ("train", "val", "test"):
+            if getattr(manifest, split_name):
+                print(f"Saved {split_name}.parquet")
 
     return manifest
 

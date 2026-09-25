@@ -29,9 +29,33 @@ Two further silent misnamings are closed:
 """
 from __future__ import annotations
 
-import glob
 import os
 from typing import Any, List, Optional, Tuple
+
+
+class LabelDiscoveryError(RuntimeError):
+    """Label file discovery could not be completed reliably.
+
+    Distinct from the labeled-data directory existing and legitimately
+    containing zero files (a fresh pipeline with nothing labeled yet, which
+    genuinely needs no purge). A directory that cannot be listed --
+    permission denied, a transient filesystem error -- must not be silently
+    read as "no files found": ``glob.glob`` swallows most listing errors and
+    simply returns no matches, which is exactly the ambiguity this class
+    exists to remove.
+    """
+
+
+class LabelSchemaError(RuntimeError):
+    """A label file that was expected to participate in horizon discovery
+    could not be read or its schema could not be inspected.
+
+    Raised rather than warned-past. ``max_label_horizon_s`` exists to prove
+    the *maximum* horizon across every labeled file; a file it could not
+    inspect might carry a longer horizon than every file it could read, so
+    continuing past it does not produce a smaller-but-still-valid answer --
+    it produces an unproven one that looks proven.
+    """
 
 import numpy as np
 import pandas as pd
@@ -183,8 +207,36 @@ def max_label_horizon_s(data_dir: str = "data") -> int:
     The split generator needs this to size its purge. Deriving it from the
     data rather than from a constant keeps the two in step if the label set
     changes.
+
+    Fail-closed contract: if the labeled directory cannot be listed
+    (:class:`LabelDiscoveryError`) or any participating file's schema
+    cannot be read (:class:`LabelSchemaError`), this function raises rather
+    than computing a horizon from whatever it could read. A caller that
+    needs a leakage-safe split must not treat either exception as "purge
+    with what we have" -- see split_generator.py, which lets both propagate
+    uncaught so no manifest is written.
     """
-    files = sorted(glob.glob(os.path.join(data_dir, "aligned", "labeled", "*.parquet")))
+    labeled_dir = os.path.join(data_dir, "aligned", "labeled")
+    if not os.path.isdir(labeled_dir):
+        # No labeled directory at all: a fresh pipeline with nothing
+        # labeled yet, not a discovery failure. If this path exists but is
+        # not a directory, or exists but cannot be listed, that is a
+        # discovery failure and falls through to the os.listdir call below,
+        # which raises.
+        return 0
+
+    try:
+        entries = os.listdir(labeled_dir)
+    except OSError as exc:
+        # os.listdir raises on permission errors and similar; glob.glob
+        # does not, and would have silently returned no matches for the
+        # exact same failure. Listing explicitly first is what makes
+        # "permission denied" distinguishable from "genuinely empty".
+        raise LabelDiscoveryError(
+            f"could not list labeled-data directory: path={labeled_dir} reason={exc}"
+        ) from exc
+
+    files = sorted(os.path.join(labeled_dir, name) for name in entries if name.endswith(".parquet"))
     if not files:
         return 0
 
@@ -202,10 +254,14 @@ def max_label_horizon_s(data_dir: str = "data") -> int:
     for path in files:
         try:
             names = pq.read_schema(path).names
-        except Exception:  # noqa: BLE001 - an unreadable day must not be silent
-            print(f"WARNING: could not read label schema from {path}; "
-                  "its horizons are not represented in the purge")
-            continue
+        except Exception as exc:  # noqa: BLE001 - any read/schema failure must abort, not degrade
+            raise LabelSchemaError(
+                f"cannot determine label horizon: file={path} "
+                f"reason=parquet schema read failed ({exc}); split generation "
+                "must abort rather than compute a purge horizon from the "
+                "remaining files, since this file's own horizon is unknown "
+                "and may exceed every file that was readable"
+            ) from exc
         for name in names:
             if name.startswith("return_") and name.endswith("s"):
                 digits = name[len("return_"):-1]
