@@ -629,3 +629,46 @@ def test_analyze_does_not_mutate_or_reorder_the_input_list():
     original_order = list(records)
     analyze_dedup_evidence(records)
     assert records == original_order   # same objects, same order, untouched
+
+
+# ---------------------------------------------------------------------------
+# Hostile-audit findings, this session (fresh-adapter-per-row invariant;
+# invalid-timestamp records must not silently hide a real duplicate).
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_adapter_per_row_means_dedup_state_never_accumulates():
+    """Pins the safety mechanism explicitly, beyond the pre-existing
+    2-row test: three separate identical frames across three rows must
+    all survive as forensic records. If adapter construction were ever
+    hoisted out of the per-row loop (a natural-looking performance
+    'optimization'), this would immediately regress to 1 record."""
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":42,"p":"100","q":"0.1","m":false}}'
+    rows = [{"venue": "BINANCE", "market_type": "linear_perpetual", "local_receive_ts": 1000 + i,
+            "payload": payload} for i in range(3)]
+    conversion = convert_raw_wire_to_dedup_evidence(rows)
+    assert len(conversion.records) == 3
+    report = analyze_dedup_evidence(conversion.records)
+    assert report.duplicate_count == 2   # 2 duplicates of the 1 original, not "already deduped to 1"
+
+
+def test_invalid_timestamp_record_sharing_an_identity_is_flagged_not_silently_hidden():
+    """Hostile-audit finding: excluding an invalid-timestamp record from
+    duplicate grouping entirely would let a real duplicate go completely
+    unreported if the FIRST delivery happened to have a corrupted
+    timestamp. This must surface as invalid_timestamp_identity_collisions,
+    never silently absorbed into '1 unique trade, 0 duplicates'."""
+    records = [
+        _rec("BINANCE", "linear_perpetual", "trades", "x1", None),      # invalid ts, same identity
+        _rec("BINANCE", "linear_perpetual", "trades", "x1", 1000),      # valid ts, same identity
+    ]
+    report = analyze_dedup_evidence(records)
+    assert report.invalid_timestamp_identity_collisions == 1
+    assert report.invalid_timestamp_identity_collision_examples[0]["trade_id"] == "x1"
+
+
+def test_invalid_timestamp_record_with_a_unique_identity_is_not_flagged_as_a_collision():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "unique-1", None)]
+    report = analyze_dedup_evidence(records)
+    assert report.invalid_timestamp_identity_collisions == 0
+    assert report.invalid_local_receive_ts_count == 1
