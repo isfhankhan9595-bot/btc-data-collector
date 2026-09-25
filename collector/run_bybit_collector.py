@@ -53,6 +53,7 @@ import signal
 import time
 
 from collector.collector.adapters.bybit import BybitAdapter
+from collector.collector.instrument import instrument_key
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import (
     CanonicalLiquidationEvent,
@@ -211,6 +212,7 @@ class BybitCollectorApp:
             "timestamp": event.local_receive_ts,
             "exchange_timestamp": event.exchange_event_ts,
             "local_timestamp": event.local_receive_ts,
+            "instrument_key": instrument_key(event),
         }
         if isinstance(event, CanonicalOrderBookEvent):
             self._apply_orderbook(event, base)

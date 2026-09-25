@@ -90,6 +90,7 @@ def _trade_record(timestamp_ms=1770000000000):
         "timestamp": timestamp_ms,
         "exchange_timestamp": timestamp_ms + 1,
         "local_timestamp": timestamp_ms + 2,
+        "instrument_key": "BINANCE|linear_perpetual|BTC-USDT|BTCUSDT",
         "trade_id": 123,
         "price": 50000.0,
         "quantity": 0.25,
@@ -138,6 +139,7 @@ def _openinterest_record(timestamp_ms=1770000000000):
         "timestamp": timestamp_ms,
         "exchange_timestamp": timestamp_ms + 1,
         "local_timestamp": timestamp_ms + 2,
+        "instrument_key": "BINANCE|linear_perpetual|BTC-USDT|BTCUSDT",
         "open_interest": 123.45,
     }
 
@@ -147,6 +149,7 @@ def _liquidation_record(timestamp_ms=1770000000000):
         "timestamp": timestamp_ms,
         "exchange_timestamp": timestamp_ms + 1,
         "local_timestamp": timestamp_ms + 2,
+        "instrument_key": "BINANCE|linear_perpetual|BTC-USDT|BTCUSDT",
         "side": 1,
         "price": 50000.0,
         "quantity": 0.5,

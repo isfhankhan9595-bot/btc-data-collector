@@ -1377,3 +1377,79 @@ Base `main` @ `3be06f7`, 781 tests. New: `collector/collector/instrument.py`,
 **Not claimed:** canonical derived streams have no explicit instrument column (raw layer does);
 namespaces are single-instrument and replay does not cross-check a row's `symbol` against the
 adapter; Bybit spot / COIN-M / inverse unregistered; no live verification.
+
+### Instrument identity — Phase 2 (canonical derived stream storage) — **PARTIAL, VERIFIED**
+
+PR #34 (merged, `00dabd6`) built `InstrumentId` itself: `.key` is the
+deterministic serialization, `.from_key()` the strict inverse, adapters
+auto-stamp `.instrument` via `_stamp_instrument`, OKX's `_instrument_scoped`
+override already excludes `index-tickers` and cross-instrument liquidations,
+and P6's `alignment_key()` was already updated to key on
+`(exchange, market_type, instrument_key, stream)`. What PR #34 did **not**
+do: persist any of this into canonical derived storage. This phase closes
+that gap.
+
+**Done, tested:**
+- `instrument.py`: added `instrument_key(event)` (write-side: `None` for an
+  unidentified event, never fabricated) and `resolve_instrument_key(key)`
+  (read-side: `None`/`""` -> `None`; a non-empty malformed value raises
+  `InstrumentIdError` rather than silently resolving to `None` -- those two
+  situations must stay distinguishable).
+- Added `instrument_key` (nullable string) to all 19 instrument-scoped
+  Parquet schemas in `config.py` (Binance futures x7, Bybit x5, OKX x5,
+  Spot x2), each schema version bumped with a migration note. Deliberately
+  excluded: `OKX_INDEXTICKERS_SCHEMA` (index-tickers represents the index,
+  not the swap instrument -- the task's own flagged exception) and
+  `QUALITY_EVENTS_SCHEMA` (stream/venue-level, not instrument-level).
+- Wired every live writer across all four runners
+  (`run_collector.py`, `run_bybit_collector.py`, `run_okx_collector.py`,
+  `run_binance_spot_collector.py`) to populate `instrument_key`. Found
+  `run_collector.py` has two parallel Binance-futures code paths: the
+  adapter-based one (`_handle_binance_trade`) uses `instrument_key(event)`;
+  several live-wired handlers (`_handle_markprice`, `_handle_liquidation`,
+  the OI poller, the reconstructed-orderbook path) call
+  `compute_*_features(data)` on raw dicts with no adapter object in scope,
+  so those use the module-level `BINANCE_USDM_INSTRUMENT_KEY` constant
+  directly -- correct since this file is single-instrument by construction
+  (`OI_URL`/`BINANCE_DEPTH_SNAPSHOT_URL` are hardcoded to `symbol=BTCUSDT`).
+  Noted, not fixed (out of this phase's scope): `_handle_orderbook`/
+  `_handle_trades` (the raw-dict duplicates of the orderbook/trade handlers)
+  are dead code -- never called by the live dispatcher (`_route_stream`
+  routes to the adapter-based/reconstructed-book paths instead) -- so they
+  were left unwired rather than spending scope on unreachable code.
+- `tests/test_instrument_identity_storage.py` (22 tests): determinism,
+  round-trip through `from_key`, `None`-for-unidentified, malformed-key
+  rejection (three distinct malformed shapes), spot/perp and 4-way
+  cross-venue collision resistance, real adapter-produced events for all
+  four venues (not just hand-built `InstrumentId` fixtures) including both
+  OKX exceptions (`index-tickers` unidentified, cross-instrument liquidation
+  unidentified, same-instrument liquidation correctly identified),
+  parametrized storage round-trip per venue via `ParquetWriter` directly,
+  a legacy-row test (column entirely absent from an old file's own schema,
+  not merely null -- confirms the safe `"col" in df.columns` read pattern),
+  and an adversarial test that corrupts a stored key (breaking the
+  delimiter, not just trailing characters -- a naive corruption can still
+  pass the native-symbol regex) and confirms `resolve_instrument_key`
+  raises rather than silently accepting a bogus identity.
+- Full suite: **874 passed** (was 852 after PR #34).
+
+**Not done in this pass:**
+- `ReplayEngine`/`replay.py` non-book-event digest: not verified whether
+  `instrument`/`instrument_key` already contributes to
+  `ReplayResult.non_book_events`'/`digest`'s hash (PR #23's non-book-event
+  serialization predates PR #34's `InstrumentId`). If it does not, two
+  replays that differ only in stamped instrument would compare equal,
+  which is exactly the kind of silent collision this phase exists to
+  prevent -- needs a follow-up check before this can be called done for
+  Phase 7/10 (replay identity) of the source task.
+- No test proving `original.instrument == replayed.instrument` end-to-end
+  through `ReplayEngine` specifically (as opposed to the adapter-level
+  determinism already covered elsewhere).
+- Legacy behavior is demonstrated (the safe read pattern) but not wired
+  into any actual reader/dataset-assembly code, since no such code
+  currently reads `instrument_key` yet.
+- `docs/DATA_SUFFICIENCY.md` and other cross-referenced docs not updated.
+
+Nothing in this phase should be read as satisfying acceptance criteria
+around replay identity or research-dataset consumption -- those remain
+open, listed above rather than silently claimed.

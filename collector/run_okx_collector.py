@@ -47,6 +47,7 @@ from collector.collector.canonical import (
     CanonicalOrderBookEvent,
     CanonicalTradeEvent,
 )
+from collector.collector.instrument import instrument_key
 from collector.collector.config import (
     OKX_FUNDINGRATE_SCHEMA,
     OKX_INDEXTICKERS_SCHEMA,
@@ -203,6 +204,12 @@ class OKXCollectorApp:
             "timestamp": event.local_receive_ts,
             "exchange_timestamp": event.exchange_event_ts,
             "local_timestamp": event.local_receive_ts,
+            # instrument-identity: None for index-tickers (index, not the
+            # swap -- OKXAdapter._instrument_scoped already refuses to stamp
+            # it) and for a liquidation belonging to another instrument
+            # (instType-scoped subscription); the adapter's own scoping
+            # decides this, not this writer.
+            "instrument_key": instrument_key(event),
         }
         if isinstance(event, CanonicalTradeEvent):
             writer = self.trades_all_writer if event.stream == "trades-all" else self.trades_writer

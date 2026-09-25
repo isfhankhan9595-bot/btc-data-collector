@@ -39,6 +39,7 @@ ORDERBOOK_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("bids_price", pa.list_(pa.float64())),
     ("bids_qty", pa.list_(pa.float64())),
     ("asks_price", pa.list_(pa.float64())),
@@ -55,55 +56,66 @@ ORDERBOOK_SCHEMA = pa.schema([
     ("obi_level_1", pa.float64()),
     ("obi_level_3", pa.float64()),
     ("obi_level_5", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "orderbook", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "orderbook", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("trade_id", pa.int64()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
     ("is_buyer_maker", pa.bool_()),
     ("side_sign", pa.int8()),
     ("signed_qty", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "trades", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "trades", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 BINANCE_TRADES_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")), ("local_receive_ts", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")), ("trade_id", pa.int64()),
     ("native_trade_id", pa.string()), ("price", pa.float64()), ("quantity", pa.float64()),
-], metadata={"schema_version": "2.0", "migration": "v2: native_trade_id is authoritative; legacy trade_id is nullable", "stream_name": "binance_trades_raw", "symbol": SYMBOL})
+], metadata={"schema_version": "2.1", "migration": "v2: native_trade_id is authoritative; legacy trade_id is nullable", "stream_name": "binance_trades_raw", "symbol": SYMBOL,
+             "note": "instrument-identity: 2.1 adds instrument_key (InstrumentId.key)"})
 
 MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("mark_price", pa.float64()),
     ("funding_rate", pa.float64()),
     ("next_funding_time", pa.int64()),
     ("funding_rate_bps", pa.float64()),
     ("hours_to_funding", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "markprice", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "markprice", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 OPENINTEREST_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("open_interest", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "openinterest", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "openinterest", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("side", pa.int8()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
     ("signed_qty", pa.float64()),
     ("order_status", pa.string()),
     ("time_in_force", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "liquidation", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "liquidation", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 # Bybit canonical schemas (Phase 8).
 #
@@ -141,6 +153,7 @@ BYBIT_ORDERBOOK_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("bids_price", pa.list_(pa.float64())),
     ("bids_qty", pa.list_(pa.float64())),
     ("asks_price", pa.list_(pa.float64())),
@@ -148,12 +161,14 @@ BYBIT_ORDERBOOK_SCHEMA = pa.schema([
     ("update_id", pa.int64()),
     ("sequence", pa.int64()),
     ("is_snapshot", pa.bool_()),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_orderbook", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "bybit_orderbook", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 BYBIT_TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("trade_id", pa.string()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
@@ -161,47 +176,55 @@ BYBIT_TRADES_SCHEMA = pa.schema([
     ("venue_sequence", pa.int64()),
     ("block_trade", pa.bool_()),
     ("rpi", pa.bool_()),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_trades", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "bybit_trades", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 BYBIT_MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("mark_price", pa.float64()),
     ("index_price", pa.float64()),
     ("funding_rate", pa.float64()),
     ("next_funding_time", pa.int64()),
     ("carried_forward", pa.list_(pa.string())),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_markprice", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "bybit_markprice", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 BYBIT_OPENINTEREST_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("open_interest", pa.float64()),
     # Unit of open_interest (OIUnit value). UNKNOWN for Bybit: see the adapter.
     ("oi_unit", pa.string()),
     ("carried_forward", pa.list_(pa.string())),
-], metadata={"schema_version": "1.1", "stream_name": "bybit_openinterest", "symbol": SYMBOL,
-             "note": "1.1 adds oi_unit; open_interest unit is UNKNOWN and must not be compared across venues"})
+], metadata={"schema_version": "1.2", "stream_name": "bybit_openinterest", "symbol": SYMBOL,
+             "note": "1.1 adds oi_unit; open_interest unit is UNKNOWN and must not be compared across venues; instrument-identity: 1.2 adds instrument_key (InstrumentId.key)"})
 
 BYBIT_LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("side", pa.string()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "bybit_liquidation", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "bybit_liquidation", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 BINANCE_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),  # Canonical local processing timestamp.
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_receive_ts", pa.timestamp("ms", tz="UTC")), ("local_process_ts", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("bids", pa.list_(pa.list_(pa.string()))), ("asks", pa.list_(pa.list_(pa.string()))),
     ("update_id", pa.int64()), ("first_update_id", pa.int64()), ("previous_update_id", pa.int64()),
     ("book_source", pa.string()), ("event_kind", pa.string()), ("recovery_generation", pa.int64()), ("quality_state", pa.string()),
-], metadata={"schema_version": "2.0", "migration": "v2: book levels are canonical decimal strings; timestamp is canonical local event processing timestamp", "stream_name": "binance_orderbook_raw", "symbol": SYMBOL})
+], metadata={"schema_version": "2.1", "migration": "v2: book levels are canonical decimal strings; timestamp is canonical local event processing timestamp", "stream_name": "binance_orderbook_raw", "symbol": SYMBOL,
+             "note": "instrument-identity: 2.1 adds instrument_key (InstrumentId.key)"})
 
 QUALITY_EVENTS_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -236,33 +259,37 @@ OKX_TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("trade_id", pa.string()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
     ("side", pa.string()),
     ("venue_sequence", pa.int64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_trades", "symbol": SYMBOL})
+], metadata={"schema_version": "1.1", "stream_name": "okx_trades", "symbol": SYMBOL,
+             "note": "instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 OKX_TRADES_ALL_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("trade_id", pa.string()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
     ("side", pa.string()),
     ("venue_sequence", pa.int64()),
     ("source", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_trades_all", "symbol": SYMBOL,
-             "note": "Distinct channel from okx_trades -- see docs/OKX_D11_CHANNEL_SCHEMAS.md"})
+], metadata={"schema_version": "1.1", "stream_name": "okx_trades_all", "symbol": SYMBOL,
+             "note": "Distinct channel from okx_trades -- see docs/OKX_D11_CHANNEL_SCHEMAS.md; instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 OKX_MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("mark_price", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_markprice", "symbol": SYMBOL,
-             "note": "mark-price channel only; never populated from index-tickers or funding-rate"})
+], metadata={"schema_version": "1.1", "stream_name": "okx_markprice", "symbol": SYMBOL,
+             "note": "mark-price channel only; never populated from index-tickers or funding-rate; instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 OKX_INDEXTICKERS_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -295,18 +322,20 @@ OKX_OPENINTEREST_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("open_interest", pa.float64()),
     ("oi_ccy", pa.float64()),
     ("oi_usd", pa.float64()),
     # Unit of open_interest (OIUnit value): CONTRACTS for OKX.
     ("oi_unit", pa.string()),
-], metadata={"schema_version": "1.1", "stream_name": "okx_openinterest", "symbol": SYMBOL,
-             "note": "open_interest is contracts (oi field); oi_ccy (base currency)/oi_usd preserved alongside, not merged; 1.1 adds oi_unit"})
+], metadata={"schema_version": "1.2", "stream_name": "okx_openinterest", "symbol": SYMBOL,
+             "note": "open_interest is contracts (oi field); oi_ccy (base currency)/oi_usd preserved alongside, not merged; 1.1 adds oi_unit; instrument-identity: 1.2 adds instrument_key (InstrumentId.key)"})
 
 OKX_LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("inst_id", pa.string()),
     ("side", pa.string()),
     ("price", pa.float64()),
@@ -316,8 +345,8 @@ OKX_LIQUIDATION_SCHEMA = pa.schema([
     ("pos_side", pa.string()),
     ("inst_family", pa.string()),
     ("uly", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "okx_liquidation", "symbol": SYMBOL,
-             "note": "subscription is instType-scoped; inst_id column lets downstream filter to BTC-USDT-SWAP"})
+], metadata={"schema_version": "1.1", "stream_name": "okx_liquidation", "symbol": SYMBOL,
+             "note": "subscription is instType-scoped; inst_id column lets downstream filter to BTC-USDT-SWAP; instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 
 # Binance Spot canonical schemas (P5). Own spot_-prefixed streams via
@@ -330,6 +359,7 @@ SPOT_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_receive_ts", pa.timestamp("ms", tz="UTC")), ("local_process_ts", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("bids", pa.list_(pa.list_(pa.string()))), ("asks", pa.list_(pa.list_(pa.string()))),
     ("update_id", pa.int64()), ("first_update_id", pa.int64()),
     # Always NULL for Spot -- the official depthUpdate payload has no `pu`
@@ -338,16 +368,17 @@ SPOT_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("previous_update_id", pa.int64()),
     ("book_source", pa.string()), ("event_kind", pa.string()),
     ("recovery_generation", pa.int64()), ("quality_state", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "spot_orderbook_raw", "symbol": SYMBOL,
-             "note": "previous_update_id always NULL: Spot depthUpdate has no pu field"})
+], metadata={"schema_version": "1.1", "stream_name": "spot_orderbook_raw", "symbol": SYMBOL,
+             "note": "previous_update_id always NULL: Spot depthUpdate has no pu field; instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})
 
 SPOT_TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("instrument_key", pa.string()),  # InstrumentId.key; None for an unidentified event (legacy row or unregistered instrument)
     ("trade_id", pa.string()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
     ("side", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "spot_trades", "symbol": SYMBOL,
-             "note": "trade_id is the raw per-execution `t`, never aggTrade's `a` -- see adapters/binance_spot.py"})
+], metadata={"schema_version": "1.1", "stream_name": "spot_trades", "symbol": SYMBOL,
+             "note": "trade_id is the raw per-execution `t`, never aggTrade's `a` -- see adapters/binance_spot.py; instrument-identity: 1.1 adds instrument_key (InstrumentId.key)"})

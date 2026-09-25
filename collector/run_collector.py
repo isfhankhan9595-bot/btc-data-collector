@@ -23,6 +23,7 @@ from collector.collector.config import (
     SYMBOL,
 )
 from collector.collector.adapters.binance import BinanceAdapter
+from collector.collector.instrument import BINANCE_USDM_BTCUSDT, instrument_key
 from collector.collector.raw_capture import RawCapture, RawRestRecord, RawWireRecord
 from collector.collector.backoff import ExponentialBackoff, rate_limit_penalty
 from collector.collector.recovery_control import RecoveryController
@@ -49,6 +50,19 @@ RAW_LOG_LIMIT = 20
 OI_POLL_INTERVAL_S = 3.0
 OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
 BINANCE_DEPTH_SNAPSHOT_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
+
+#: instrument-identity: this file is single-instrument (BTCUSDT USD-M perp)
+#: by construction (see OI_URL/BINANCE_DEPTH_SNAPSHOT_URL above, both
+#: hardcoded to symbol=BTCUSDT). The feature-computer handlers below
+#: (_handle_orderbook/_handle_trades/_handle_liquidation/_handle_markprice)
+#: work on raw dicts via compute_*_features(), not through BinanceAdapter,
+#: so there is no per-event InstrumentId to read -- this constant is used
+#: directly rather than routing every raw-dict handler through the adapter
+#: just to obtain it. _handle_binance_trade (the one handler that already
+#: goes through the adapter) uses instrument_key(event) instead, which
+#: resolves to the identical value; both are asserted equal in
+#: test_instrument_identity_storage.py.
+BINANCE_USDM_INSTRUMENT_KEY = BINANCE_USDM_BTCUSDT.key
 
 class CollectorApp:
     def __init__(self):
@@ -504,6 +518,7 @@ class CollectorApp:
             features=compute_orderbook_features(data)
             if not features: self.stream_counters["orderbook"]["empty_features"] += 1; return
             features["timestamp"]=applied.local_process_ts; features["local_timestamp"]=applied.local_receive_ts; features["exchange_timestamp"]=applied.exchange_event_ts
+            features["instrument_key"]=instrument_key(applied)
             self._write_orderbook_features(features)
 
     def _persist_reconstructed_books(self, rows):
@@ -513,6 +528,7 @@ class CollectorApp:
         for applied, event_kind, generation in rows:
             raw_writer.write({"timestamp":applied.local_process_ts,"exchange_timestamp":applied.exchange_event_ts,
                 "local_receive_ts":applied.local_receive_ts,"local_process_ts":applied.local_process_ts,
+                "instrument_key":instrument_key(applied),
                 "bids":[[str(p),str(q)] for p,q in applied.bids],"asks":[[str(p),str(q)] for p,q in applied.asks],"update_id":applied.update_id,
                 "first_update_id":applied.first_update_id,"previous_update_id":applied.previous_update_id,
                 "book_source":applied.book_source,"event_kind":event_kind,"recovery_generation":generation,"quality_state":applied.quality_state})
@@ -552,7 +568,8 @@ class CollectorApp:
             raw_trade_writer=getattr(self, "raw_trades_writer", None)
             if raw_trade_writer is not None:
                 raw_trade_writer.write({"timestamp":process_ts, "local_receive_ts":event.local_receive_ts,
-                    "exchange_timestamp":event.exchange_transaction_ts or event.exchange_event_ts, "trade_id":trade_id,
+                    "exchange_timestamp":event.exchange_transaction_ts or event.exchange_event_ts,
+                    "instrument_key":instrument_key(event), "trade_id":trade_id,
                     "native_trade_id":event.trade_id, "price":event.price, "quantity":event.quantity})
             if trade_id is None:
                 self.stream_counters["trades"]["rejected"] += 1
@@ -562,6 +579,7 @@ class CollectorApp:
             features = {
                 "timestamp": process_ts, "local_timestamp": event.local_receive_ts,
                 "exchange_timestamp": event.exchange_transaction_ts or event.exchange_event_ts,
+                "instrument_key": instrument_key(event),
                 "trade_id": trade_id, "price": event.price, "quantity": event.quantity,
                 "is_buyer_maker": event.side == "SELL",
                 "side_sign": -1 if event.side == "SELL" else 1,
@@ -637,6 +655,7 @@ class CollectorApp:
                 logger.warning("Feature extraction returned empty", stream="liquidation", raw_stream=stream, keys=sorted(data.keys()))
                 return
             self.stream_counters["liquidation"]["computed"] += 1
+            features["instrument_key"] = BINANCE_USDM_INSTRUMENT_KEY
             valid, reason = self.validator.validate_liquidation(features)
             self._drain_integrity_quality_events()
             if not valid:
@@ -662,6 +681,7 @@ class CollectorApp:
             logger.warning("Feature extraction returned empty", stream="markprice", raw_stream=stream, keys=sorted(data.keys()))
             return
         self.stream_counters["markprice"]["computed"] += 1
+        features["instrument_key"] = BINANCE_USDM_INSTRUMENT_KEY
         valid, reason = self.validator.validate_markprice(features)
         self._drain_integrity_quality_events()
         if not valid:
@@ -774,6 +794,7 @@ class CollectorApp:
                         "timestamp": event.local_receive_ts,
                         "exchange_timestamp": event.exchange_event_ts,
                         "local_timestamp": event.local_receive_ts,
+                        "instrument_key": BINANCE_USDM_INSTRUMENT_KEY,
                         "open_interest": event.open_interest,
                     }
                     self.stream_counters["openinterest"]["computed"] += 1

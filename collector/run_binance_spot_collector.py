@@ -79,6 +79,7 @@ import signal
 import time
 
 from collector.collector.adapters.binance_spot import BinanceSpotAdapter
+from collector.collector.instrument import instrument_key
 from collector.collector.backoff import ExponentialBackoff
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent, CanonicalTradeEvent
@@ -261,6 +262,7 @@ class BinanceSpotCollectorApp:
                 "timestamp": event.local_receive_ts,
                 "exchange_timestamp": event.exchange_event_ts,
                 "local_timestamp": event.local_receive_ts,
+                "instrument_key": instrument_key(event),
                 "trade_id": event.trade_id, "price": event.price,
                 "quantity": event.quantity, "side": event.side,
             })
@@ -288,6 +290,7 @@ class BinanceSpotCollectorApp:
                             "exchange_timestamp": pending_applied.exchange_event_ts,
                             "local_receive_ts": pending_applied.local_receive_ts,
                             "local_process_ts": int(time.time() * 1000),
+                            "instrument_key": instrument_key(pending_applied),
                             "bids": [[str(p), str(q)] for p, q in pending_applied.bids],
                             "asks": [[str(p), str(q)] for p, q in pending_applied.asks],
                             "update_id": pending_applied.update_id,
@@ -318,6 +321,7 @@ class BinanceSpotCollectorApp:
                 "exchange_timestamp": applied.exchange_event_ts,
                 "local_receive_ts": applied.local_receive_ts,
                 "local_process_ts": int(time.time() * 1000),
+                "instrument_key": instrument_key(applied),
                 "bids": [[str(p), str(q)] for p, q in applied.bids],
                 "asks": [[str(p), str(q)] for p, q in applied.asks],
                 "update_id": applied.update_id, "first_update_id": applied.first_update_id,
@@ -412,6 +416,7 @@ class BinanceSpotCollectorApp:
                     "exchange_timestamp": applied.exchange_event_ts,
                     "local_receive_ts": applied.local_receive_ts,
                     "local_process_ts": int(time.time() * 1000),
+                    "instrument_key": instrument_key(applied),
                     "bids": [[str(p), str(q)] for p, q in applied.bids],
                     "asks": [[str(p), str(q)] for p, q in applied.asks],
                     "update_id": applied.update_id, "first_update_id": applied.first_update_id,

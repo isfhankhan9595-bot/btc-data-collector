@@ -30,13 +30,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 __all__ = [
     "InstrumentId", "InstrumentIdError", "MARKET_SPOT", "MARKET_LINEAR_PERPETUAL",
     "KNOWN_MARKET_TYPES", "BINANCE_SPOT_BTCUSDT", "BINANCE_USDM_BTCUSDT",
     "BYBIT_LINEAR_BTCUSDT", "OKX_SWAP_BTCUSDT", "SUPPORTED_INSTRUMENTS",
-    "resolve_instrument", "resolve_raw_record",
+    "resolve_instrument", "resolve_raw_record", "instrument_key", "resolve_instrument_key",
 ]
 
 MARKET_SPOT = "spot"
@@ -149,3 +149,37 @@ def resolve_raw_record(venue: Optional[str], market_type: Optional[str],
     if required_market is not None and market_type != required_market:
         return None
     return resolve_instrument(exchange, market_type, symbol)
+
+
+def instrument_key(event: Any) -> Optional[str]:
+    """The deterministic storage form of ``event.instrument`` -- what every
+    instrument-scoped canonical derived stream persists as its
+    ``instrument_key`` column.
+
+    ``None`` when the event has no identified instrument. This is never a
+    placeholder or a fabricated value: an unidentified event (an OKX
+    ``index-tickers`` observation, a liquidation for an instrument this
+    collector doesn't track, any event from before instrument stamping
+    existed) stores ``None``, and ``None`` is exactly what a reader must see
+    -- never a guessed identity dressed up as a real one.
+    """
+    instrument = getattr(event, "instrument", None)
+    return instrument.key if instrument is not None else None
+
+
+def resolve_instrument_key(key: Optional[str]) -> Optional[InstrumentId]:
+    """Inverse of :func:`instrument_key`, for reconstructing identity from a
+    stored row's ``instrument_key`` column.
+
+    ``None``/empty-string input (a legacy row predating this column, or a
+    genuinely unidentified event) resolves to ``None`` -- the normal,
+    expected case, not an error. A non-empty value that fails to parse
+    (truncated, corrupted, hand-edited) raises :class:`InstrumentIdError`
+    rather than silently resolving to ``None``: those two situations must
+    stay distinguishable, because "we never identified this event" and "we
+    identified it and something then corrupted the record" call for
+    different responses from whatever is reading the data.
+    """
+    if key is None or key == "":
+        return None
+    return InstrumentId.from_key(key)
