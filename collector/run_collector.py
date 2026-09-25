@@ -31,6 +31,7 @@ from collector.collector.binance_oi import normalize_binance_oi, BinanceOIParseE
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent
 from collector.collector.quality_events import BookQuality, QualityEvent, QualityEventType
+from collector.collector.quality_wal import QualityEventWAL, QualityWALCorruption
 from collector.collector.feature_computer import (
     compute_liquidation_features,
     compute_markprice_features,
@@ -88,11 +89,43 @@ class CollectorApp:
         self._quality_overflow = 0
 
         self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, segment_rows=1, segment_seconds=1)
-        self._quality_journal_path = self.quality_writer.stream_dir / "quality_queue.pending.json"
-        if self._quality_journal_path.exists():
-            self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,
-                "reason":"quality_queue_unfinished_on_previous_process", "rows_lost":None})
-            self._quality_journal_path.unlink(missing_ok=True)
+        # P0-2: the durable quality-event WAL replaces the old
+        # quality_queue.pending.json marker, which only ever recorded a
+        # queue depth -- never the events themselves. This is the sole
+        # loss window the WAL closes: _websocket_quality_event's queue,
+        # not every _persist_quality_event call site (most of those write
+        # straight to Parquet, already fsync'd per event since
+        # segment_rows=1 above -- see quality_wal.py's own docstring for
+        # why that makes a *second* durability layer unnecessary there).
+        wal_dir = self.quality_writer.stream_dir / "wal"
+        self._quality_wal_recovery_error = None
+        resume_seq = QualityEventWAL.highest_recovered_seq(wal_dir)
+        try:
+            recovered_events = QualityEventWAL.recover(wal_dir)
+        except QualityWALCorruption as exc:
+            # A corrupted WAL must be loud, never silently treated as
+            # healthy -- but it must also not prevent the collector from
+            # starting, since market-data capture is the primary mission
+            # and the corrupted file is preserved on disk for forensic
+            # inspection (never deleted here). Reported as a durable
+            # quality event as soon as quality_writer exists, below.
+            recovered_events = []
+            self._quality_wal_recovery_error = str(exc)
+        self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
+        if self._quality_wal_recovery_error is not None:
+            self._persist_quality_event({
+                "stream": "quality_events", "event_type": QualityEventType.ERROR,
+                "reason": f"quality_wal_corruption_on_startup:{self._quality_wal_recovery_error}",
+                "rows_lost": None})
+        for recovered in recovered_events:
+            # Exact prior content, not a "something was pending" marker --
+            # this is the entire point of P0-2. quality_event_id flows
+            # through so a WAL-recovered row and any row that (impossibly,
+            # given checkpoint-then-delete ordering, but defensively)
+            # duplicates it can be reconciled by ID at research time.
+            self._persist_quality_event(recovered)
+        if recovered_events:
+            self._quality_wal.checkpoint(up_to_seq=max(r["seq"] for r in recovered_events))
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_book_writer = ParquetWriter("binance_orderbook_raw", BINANCE_ORDERBOOK_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
@@ -282,28 +315,52 @@ class CollectorApp:
             send_telegram_alert("Validation spike detected: >0.1% failures in 60s window")
 
     def _websocket_quality_event(self, event_type, reason, connection_id=None, stream_group="websocket"):
-        """Websocket hot path: bounded non-blocking enqueue only, never parquet I/O."""
+        """Websocket hot path: bounded non-blocking enqueue only, never parquet I/O.
+
+        The WAL append IS a synchronous file write -- not "never I/O" in
+        the literal sense -- but it is the same lightweight, already-
+        proven-cheap-enough operation the marker file this replaces was
+        already doing on this exact call site (open+write+flush+fsync+
+        replace, every single event); only the payload written grew from
+        a queue-depth integer to the actual event. See quality_wal.py's
+        own docstring for why this remains appropriate for a low-volume
+        stream. Parquet I/O itself still only ever happens later, off
+        this path, in _quality_persistence_loop.
+        """
         event={"exchange":"BINANCE", "stream":stream_group, "event_type":event_type, "reason":reason,
                "connection_id":connection_id, "local_ts":int(time.time()*1000)}
         if not hasattr(self, "_quality_queue"):
             self._persist_quality_event(event)
             return
+        wal = getattr(self, "_quality_wal", None)
+        if wal is not None:
+            try:
+                event_type_value = event_type.value if isinstance(event_type, QualityEventType) else event_type
+                event_id = wal.append({**event, "event_type": event_type_value})
+                event["quality_event_id"] = event_id
+                event["_wal_seq"] = int(event_id.rsplit("-", 1)[-1])
+            except OSError:
+                # The WAL itself could not durably record this event.
+                # Queueing it now would only reintroduce the very loss
+                # window this mechanism exists to close, so it is
+                # persisted directly and synchronously instead (still
+                # fsync'd, via quality_writer's segment_rows=1) rather
+                # than silently dropped.
+                logger.error("quality_wal_append_failed", reason=reason)
+                self._persist_quality_event(event)
+                return
         try:
             self._quality_queue.put_nowait(event)
-            self._write_quality_pending_marker()
         except asyncio.QueueFull:
+            # The event is already durable in the WAL above -- a full
+            # queue only delays its Parquet persistence, it does not lose
+            # it. Recovery on restart (or the persistence loop catching
+            # up) still finds it. Counted for observability only.
             self._quality_overflow += 1
             logger.error("quality_event_queue_overflow", dropped=self._quality_overflow)
 
-    def _write_quality_pending_marker(self):
-        path = self._quality_journal_path
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({"pending": self._quality_queue.qsize(), "updated_ms": int(time.time() * 1000)}, handle)
-            handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary, path)
-
     async def _quality_persistence_loop(self):
+        wal = getattr(self, "_quality_wal", None)
         while self.running or not self._quality_queue.empty():
             try:
                 event=await asyncio.wait_for(self._quality_queue.get(), timeout=0.1)
@@ -311,8 +368,10 @@ class CollectorApp:
                 continue
             self._persist_quality_event(event)
             self._quality_queue.task_done()
-            if self._quality_queue.empty():
-                self._quality_journal_path.unlink(missing_ok=True)
+            wal_seq = event.get("_wal_seq")
+            if wal is not None and wal_seq is not None:
+                wal.checkpoint(up_to_seq=wal_seq)
+                wal.maybe_rotate_for_size()
         if self._quality_overflow:
             self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,
                 "reason":"quality_queue_overflow", "rows_lost":self._quality_overflow})
@@ -321,7 +380,7 @@ class CollectorApp:
         """Persist versioned lineage. Missing values remain null rather than fabricated."""
         rows_lost = event.get("rows_lost"); event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType): event_type = event_type.value
-        local_ts = event.get("local_ts", int(time.time() * 1000))
+        local_ts = event.get("local_ts", event.get("timestamp", int(time.time() * 1000)))
         self.quality_writer.write({"timestamp": local_ts, "exchange": event.get("exchange", "BINANCE"),
             "stream": event.get("stream", "orderbook"), "event_type": event_type, "reason": event.get("reason", ""),
             "gap_size_ms": event.get("gap_size_ms"), "rows_lost": None if rows_lost is None else str(rows_lost),
@@ -330,7 +389,8 @@ class CollectorApp:
             "new_state": event.get("new_state"), "expected_previous_update_id": event.get("expected_previous_update_id"),
             "actual_previous_update_id": event.get("actual_previous_update_id"), "update_id": event.get("update_id"), "first_update_id": event.get("first_update_id"),
             "previous_update_id": event.get("previous_update_id"),
-            "local_receive_ts": event.get("local_receive_ts"), "local_process_ts": event.get("local_process_ts", local_ts)})
+            "local_receive_ts": event.get("local_receive_ts"), "local_process_ts": event.get("local_process_ts", local_ts),
+            "quality_event_id": event.get("quality_event_id")})
 
     def _record_book_quality(self, kind, reason, transition=None, event=None):
         transition=transition or self.binance_book.last_transition
