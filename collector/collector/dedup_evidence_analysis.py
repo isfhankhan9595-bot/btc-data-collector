@@ -324,9 +324,31 @@ def convert_raw_wire_to_dedup_evidence(
     `adapter.normalize()` directly -- the latter is the production-wrapped
     method and always applies `_dedupe_trades`, which would silently
     suppress a second same-frame occurrence of an identical trade before
-    this function ever saw it. Empty/missing/malformed/truncated/
-    unroutable frames are returned as invalid evidence issues instead of
-    disappearing silently.
+    this function ever saw it.
+
+    Reconciling two independent hostile audits of this exact question
+    (this session merged a parallel branch that reached a different,
+    incomplete conclusion here): `_adapter_for()` IS called fresh inside
+    the per-row loop below, and that fresh-instance-per-row property is
+    real and does make `_dedupe_trades` a structural no-op *across rows*
+    (each instance's `_seen_trade_ids` starts empty). But that alone is
+    NOT sufficient, and relying on it as the only protection is exactly
+    the gap Critical Issue #2 warned about: `_dedupe_trades` operates on
+    the full list `normalize()` returns for ONE call -- so a single raw
+    frame whose payload contains multiple trade entries sharing one
+    identity (real and producible: OKX's `trades`/`trades-all` channels
+    return one event per `data` array element) would still have its
+    second occurrence suppressed *within that one row*, fresh instance or
+    not. Proven empirically, not just reasoned about:
+    `test_raw_converter_preserves_a_same_frame_duplicate_trade` shows
+    `adapter.normalize()` returns 1 event for such a frame while this
+    function's `__wrapped__` bypass returns 2. The per-row freshness
+    property remains true and worth keeping as defense-in-depth against
+    a future change that hoists adapter construction out of this loop,
+    but it was never the whole story.
+
+    Empty/missing/malformed/truncated/unroutable frames are returned
+    as invalid evidence issues instead of disappearing silently.
     """
     records: list[DedupEvidenceRecord] = []
     invalid_records: list[RawTradeEvidenceIssue] = []
