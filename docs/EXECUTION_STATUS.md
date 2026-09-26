@@ -1496,3 +1496,79 @@ windowed-side new tests, consistent with that prior finding.
 
 **Not done:** no source change to `trade_flow_observation.py` (none was
 needed); no live verification; AWS VPS/live collectors untouched.
+
+### P0-6 — Research dataset causal time contract — **COMPLETE, VERIFIED**
+
+**Root cause confirmed exactly as scoped:** the live Binance USD-M orderbook
+and trades handlers (`_handle_binance_orderbook`, `_handle_binance_trade` in
+`run_collector.py`) write `features["timestamp"] = applied.local_process_ts`
+(processing time) and `features["local_timestamp"] = applied.local_receive_ts`
+(true receive time), while `dataset_assembler.py` aligned on
+`frame["timestamp"]` — i.e. on processing time, not receive time. A second,
+previously undocumented instance of the same class of defect was found in
+markprice: its handler never captured a receive time at all —
+`local_timestamp` was a second copy of the same processing-time value, so no
+genuine availability clock existed for that stream. `replay.py` and
+`pipeline/cross_exchange_alignment.py` were confirmed to already implement
+the correct contract (`local_receive_ts <= observation_ts`) at the raw-wire
+and canonical-event layers respectively; this P0 brings the flattened-feature
+assembler into parity with both.
+
+**Fixed:**
+- `dataset_assembler.py`: causal joins (orderbook/markprice `merge_asof`,
+  trade-to-grid binning) now use each stream's `local_timestamp` (receive
+  time) instead of `timestamp` (processing time). `exchange_timestamp` and
+  `timestamp` are retained as descriptive/diagnostic columns
+  (`<prefix>_exchange_ts`, `<prefix>_process_ts`) — never used for
+  eligibility. Segments lacking `local_timestamp` (legacy data / minimal
+  fixtures) fall back to `timestamp`, flagged via `<stream>_time_unknown`,
+  never silently trusted as causally safe. Sorting is stable
+  (`kind="stable"`) so tied availability timestamps resolve deterministically
+  (matching `causally_align()`'s documented tie rule).
+- `run_collector.py`: `_handle_markprice` now receives and stamps
+  `local_timestamp` from the real `local_receive_ts` captured at frame
+  arrival (`handle_message` entry), instead of duplicating the processing
+  timestamp — mirroring the existing orderbook/trades pattern.
+
+**Adversarial causality tests added** (`test_dataset_assembler_causal_contract.py`,
+9 tests): future-receive-does-not-leak-early despite an old exchange
+timestamp; a future/claimed-later exchange timestamp does not delay an
+already-received event; processing delay does not delay availability;
+cross-stream consistency (orderbook/trades/markprice all keyed on receive
+time); missing-`local_timestamp` legacy fallback is flagged, never fabricated;
+assembly is deterministic across repeated runs; equal receive timestamps
+resolve deterministically; **and one gap found via mutation testing**:
+`direction="nearest"` (rather than `"backward"`) was not initially caught by
+the first 8 tests — a single row received 300ms *after* an observation point,
+with no earlier candidate, would leak into that earlier row under "nearest"
+matching. Added `test_future_information_never_becomes_available_before_it_was_received`
+to close it; confirmed the mutation is now caught.
+
+**Mutation testing** (dataset_assembler.py and run_collector.py, each applied
+to real source, restored to exact byte-equivalence via `md5sum` after every
+mutation): use `exchange_timestamp` instead of receive time for the orderbook
+join — **caught** (8/9 failed); use processing time instead of receive time
+for the markprice join — **caught** (1/9); `direction="backward"` →
+`"nearest"` (future admission) — **initially not caught**, closed by the new
+test above, then **caught** (1/9); ignore `local_timestamp` entirely and
+always use processing time — **caught** (5/9); fabricate a missing receive
+time from wall-clock time instead of flagging it — **caught** (2/9); revert
+the markprice source fix (duplicate processing time into `local_timestamp`
+again) — **caught** by
+`test_markprice_local_timestamp_is_receive_time_not_processing_time` (1/1).
+
+**Full validation:** 1251 tests passed (1250 pre-existing/updated + this P0's
+new/extended tests), `compileall` clean, `git diff --check` clean, working
+tree byte-identical to pre-mutation state after every restore.
+
+**Out of scope, not touched (per instruction):** P0-1 through P0-5, the
+legacy dead-code `_handle_orderbook`/`_handle_trades` paths (unreachable from
+live `handle_message` routing — confirmed by repo-wide call-site search),
+`health_monitor.record_message`'s use of processing timestamp for liveness
+heartbeats (a staleness/liveness concern, not causal research alignment),
+Binance OI's REST response-receive contract (already correct: `_poll_openinterest`
+already stamps `"timestamp": event.local_receive_ts`), and any nanosecond
+timestamp architecture (P0-11 territory).
+
+Branch: `p0-6-research-time-contract`. Base: `main` @ `790df62ddadb347abf7cd5cd6cae16d9250d44b6`.
+No PR opened (not requested). Nothing merged.
