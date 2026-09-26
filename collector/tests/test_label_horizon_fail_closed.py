@@ -23,7 +23,7 @@ from collector.pipeline.label_generator import (
     discover_labeled_files,
     max_label_horizon_s,
 )
-from collector.pipeline.split_generator import LeakageError, generate_splits
+from collector.pipeline.split_generator import LeakageError, build_manifest, generate_splits, verify_manifest
 
 
 def _write_labeled_day(data_dir, date_str, columns):
@@ -135,6 +135,66 @@ def test_discover_labeled_files_distinguishes_absent_from_not_a_directory(tmp_pa
         f.write("x")
     with pytest.raises(LabelDiscoveryError):
         discover_labeled_files(str(tmp_path))
+
+
+def test_stat_failure_on_an_existing_path_is_not_silently_absent(tmp_path, monkeypatch):
+    """The audit target from this session: os.path.exists()/os.path.isdir()
+    both catch OSError broadly (CPython's genericpath module: 'except
+    (OSError, ValueError): return False'), so a PermissionError from
+    statting a labeled directory that genuinely exists -- e.g. because a
+    parent directory's permissions were changed, or a transient I/O/mount
+    error -- would be indistinguishable from the directory never having
+    existed at all, if either boolean API were used for the initial check.
+    This is exactly the forbidden 'cannot inspect -> pretend absent'
+    transition. discover_labeled_files() calls os.stat() directly instead
+    and only treats FileNotFoundError specifically as genuine absence;
+    every other OSError must raise LabelDiscoveryError.
+
+    This sandbox runs as root, so a real chmod-based reproduction is not
+    possible (root bypasses permission bits entirely -- verified this
+    session: os.path.exists()/os.path.isdir() both still returned True
+    under a real os.chmod(0o000) on the parent). A precise monkeypatch of
+    os.stat itself, raising PermissionError only for the exact labeled-dir
+    path, exercises the identical code path a real permission failure
+    would reach without depending on enforcement this environment cannot
+    provide."""
+    _write_labeled_day(tmp_path, "2026-01-01", ["mid_price", "return_60s"])
+    labeled_dir = os.path.join(tmp_path, "aligned", "labeled")
+
+    real_stat = os.stat
+
+    def flaky_stat(path, *a, **kw):
+        if os.fspath(path) == labeled_dir:
+            raise PermissionError(13, "Permission denied", labeled_dir)
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+
+    with pytest.raises(LabelDiscoveryError, match="could not inspect"):
+        discover_labeled_files(str(tmp_path))
+    with pytest.raises(LabelDiscoveryError):
+        max_label_horizon_s(str(tmp_path))
+
+
+def test_stat_failure_end_to_end_through_generate_splits_is_not_none_or_empty(tmp_path, monkeypatch):
+    """The same simulated failure, exercised through the actual
+    generate_splits() call site -- must not be converted into 'No labeled
+    files found' / None anywhere along that path."""
+    _write_labeled_day(tmp_path, "2026-01-01", ["mid_price", "return_60s"])
+    labeled_dir = os.path.join(tmp_path, "aligned", "labeled")
+
+    real_stat = os.stat
+
+    def flaky_stat(path, *a, **kw):
+        if os.fspath(path) == labeled_dir:
+            raise PermissionError(13, "Permission denied", labeled_dir)
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+
+    with pytest.raises(LabelDiscoveryError):
+        generate_splits(str(tmp_path), strict=False)
+    assert not os.path.exists(os.path.join(tmp_path, "splits", "split_manifest.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +325,50 @@ def test_strict_mode_leakage_violation_raises_before_any_publication(tmp_path):
 
     assert not os.path.exists(os.path.join(tmp_path, "splits", "split_manifest.json"))
     assert not os.path.exists(os.path.join(tmp_path, "splits", "train.parquet"))
+
+
+def test_verify_manifest_has_no_independent_effect_on_the_p0_5_failure_class():
+    """Investigated per this session's audit instruction rather than
+    mutated blindly: build_manifest()'s train/val/test slices are always
+    taken from a single sorted, deduplicated date list with monotonically
+    non-decreasing slice boundaries (parsed[:a], parsed[a:b], parsed[b:]),
+    so they are structurally incapable of overlapping or being
+    out-of-order regardless of purge/embargo/horizon values -- there is no
+    label-horizon-discovery failure that reaches build_manifest() (since
+    discover_labeled_files/max_label_horizon_s already raised earlier) and
+    no horizon value that can make build_manifest()'s own slicing produce
+    an overlap. Confirmed empirically: build_manifest() cannot be driven
+    into producing a manifest verify_manifest() would flag differently
+    than build_manifest()'s own strict checks already did, for any input
+    tried. For the specific failure class P0-5 addresses (unreadable/
+    corrupt label files under-proving the horizon), verify_manifest() is
+    therefore genuinely redundant with build_manifest(strict=True)'s own
+    checks -- not a gap, just an honestly-documented fact about where the
+    real protection lives for this failure class."""
+    manifest = build_manifest(
+        [f"2026-01-{d:02d}" for d in range(1, 21)],
+        max_label_horizon_s=60, strict=True,
+    )
+    assert verify_manifest(manifest) == []  # nothing left for it to catch here
+
+
+def test_verify_manifest_does_independently_catch_a_hand_crafted_bad_manifest():
+    """verify_manifest() is not dead code / not vacuous in general -- it
+    genuinely re-derives overlap/ordering from the raw date lists rather
+    than trusting them, and catches a manifest that never went through
+    build_manifest()'s own construction at all. This is what makes it a
+    real independent check -- just not one reachable via the P0-5 failure
+    class, per the test above."""
+    from collector.pipeline.split_generator import SplitManifest
+
+    bad = SplitManifest(
+        train=["2026-01-01", "2026-01-05"], val=["2026-01-03", "2026-01-06"],  # overlaps train's range and is unordered relative to it
+        test=["2026-01-07"], purge_days=0, embargo_days=0, requested_gap_days=0,
+        achieved_gap_train_val=0, achieved_gap_val_test=0, max_label_horizon_s=0,
+        leakage_safe=True, rationale="hand-crafted for this test", warnings=[],
+    )
+    problems = verify_manifest(bad)
+    assert problems  # verify_manifest independently detects this, nothing upstream did
 
 
 # ---------------------------------------------------------------------------

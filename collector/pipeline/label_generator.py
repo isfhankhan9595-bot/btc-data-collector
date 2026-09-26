@@ -30,6 +30,7 @@ Two further silent misnamings are closed:
 from __future__ import annotations
 
 import os
+import stat as stat_module
 from typing import Any, List, Optional, Tuple
 
 
@@ -230,14 +231,41 @@ def discover_labeled_files(data_dir: str = "data") -> List[str]:
 
     Returns:
         Sorted full paths to every ``*.parquet`` file directly in the
-        labeled directory. An empty list means states 1 or "directory
+        labeled directory. An empty list means state 1 or "directory
         exists, genuinely has no parquet files in it" -- both legitimate,
         neither an error.
+
+    Correctness note (audited): ``os.path.exists``/``os.path.isdir`` are
+    deliberately NOT used for the initial check, because both catch
+    ``OSError`` broadly and return ``False`` for *any* stat failure, not
+    only "does not exist" (this is CPython's own implementation --
+    ``genericpath.exists``/``isdir`` wrap ``os.stat`` in
+    ``except (OSError, ValueError): return False``). A ``PermissionError``
+    raised by a parent-directory access failure while statting a labeled
+    directory that genuinely exists would therefore be indistinguishable
+    from the directory never having existed at all -- silently converting
+    "cannot inspect" into "empty", exactly the forbidden transition this
+    function exists to prevent. Verified directly: monkeypatching
+    ``os.stat`` to raise ``PermissionError`` for an existing directory's
+    path previously made this function return ``[]``; see
+    ``tests/test_label_horizon_fail_closed.py``'s
+    ``test_stat_failure_on_an_existing_path_is_not_silently_absent`` for the
+    regression test. ``os.stat`` is called directly instead, and only
+    ``FileNotFoundError`` specifically resolves to "does not exist".
     """
     labeled_dir = os.path.join(data_dir, "aligned", "labeled")
-    if not os.path.exists(labeled_dir):
+    try:
+        st = os.stat(labeled_dir)
+    except FileNotFoundError:
         return []
-    if not os.path.isdir(labeled_dir):
+    except OSError as exc:
+        # Any other stat failure -- permission denied on this path or a
+        # parent directory, a transient I/O error, a mount problem -- is
+        # "cannot inspect", never "does not exist".
+        raise LabelDiscoveryError(
+            f"could not inspect labeled-data path: path={labeled_dir} reason={exc}"
+        ) from exc
+    if not stat_module.S_ISDIR(st.st_mode):
         raise LabelDiscoveryError(
             f"labeled-data path exists but is not a directory: path={labeled_dir}"
         )
