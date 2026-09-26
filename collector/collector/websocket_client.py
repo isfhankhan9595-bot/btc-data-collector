@@ -36,12 +36,18 @@ class Keepalive:
             raise ValueError("keepalive interval_s and timeout_s must be positive")
 
 class WebSocketClient:
+    #: Sentinel enqueued to make the processing worker exit after it has
+    #: drained every message already in the queue -- never used as a
+    #: signal to discard anything, only to know when to stop pulling.
+    _WORKER_SHUTDOWN = object()
+
     def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None, stream_group: str = "websocket",
                  on_raw_frame: Optional[Callable[..., None]] = None,
                  backoff: Optional[ExponentialBackoff] = None,
                  on_open: Optional[Callable[..., Awaitable[None]]] = None,
                  keepalive: Optional[Keepalive] = None,
-                 control_frames: FrozenSet[str] = frozenset()):
+                 control_frames: FrozenSet[str] = frozenset(),
+                 processing_queue_maxsize: int = 2000):
         self.url = url
         self.stream_group = stream_group
         self.on_message = on_message
@@ -78,6 +84,28 @@ class WebSocketClient:
         self.control_frames = frozenset(control_frames)
         self.control_frames_received = 0
         self.keepalive_timeouts = 0
+        # P0-1: bounded receive/processing separation. `_consume` (the raw
+        # read loop below) must never block on `on_message` -- a slow
+        # handler (e.g. a REST snapshot-bridge fetch awaited inside it)
+        # would otherwise stall the next `async for msg in ws` read,
+        # risking exchange-side backpressure or disconnection for being a
+        # slow reader. Raw capture (`on_raw_frame`) already happens before
+        # this point, synchronously, on the fast path -- unaffected by any
+        # of this. A queue-overflow here therefore drops a message from
+        # *live processing* only, never from the durable raw record: the
+        # exact bytes remain replayable later even if live book state
+        # falls behind under sustained overload. `processing_queue_maxsize`
+        # of 2000: chosen for a single-symbol, single-venue collector where
+        # combined orderbook+trade traffic realistically peaks in the low
+        # hundreds of messages/sec even during high volatility, and the
+        # slowest realistic per-message stall (a REST snapshot-bridge
+        # fetch) resolves in low single-digit seconds even under a poor
+        # network -- 2000 buffers roughly that worst case at a materially
+        # higher rate than observed traffic, without holding an unbounded
+        # amount of memory.
+        self._processing_queue: asyncio.Queue = asyncio.Queue(maxsize=processing_queue_maxsize)
+        self.processing_queue_overflow = 0
+        self._processing_worker_task = None
         self._ws = None
         self._last_inbound_monotonic = 0.0
         self._awaiting_reply_since = None
@@ -105,93 +133,104 @@ class WebSocketClient:
     async def start(self):
         self.running = True
         logger.info("Starting WebSocket client", url=self.url)
+        self._processing_worker_task = asyncio.ensure_future(self._processing_worker())
 
-        while self.running:
-            try:
-                connection = websockets.connect(self.url)
-                if hasattr(connection, "__await__"):
-                    connection = await connection
-
-                async with connection as ws:
-                    self.connected = True
-                    self._connection_serial += 1
-                    self.connection_id = f"{self.stream_group}-{self._connection_serial}"
-                    self.backoff.reset()
-                    self.retry_delay = self.backoff.peek_cap()
-                    self.attempt = 0
-                    logger.info("WebSocket connected")
-
-                    if self.on_quality_event:
-                        self.on_quality_event("CONNECT", "websocket_connected", self.connection_id, self.stream_group)
-
-                    if self.on_reconnect:
-                        self.on_reconnect()
-
-                    self._ws = ws
-                    self._last_inbound_monotonic = self._monotonic()
-                    self._awaiting_reply_since = None
-
-                    if self.on_open is not None:
-                        # A failed subscribe must be visible: it is the
-                        # difference between "quiet market" and "we are not
-                        # subscribed to anything".
-                        try:
-                            await self.on_open(self._send)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.error("websocket_on_open_failed", error=str(exc))
-                            if self.on_quality_event:
-                                self.on_quality_event(
-                                    "ERROR", f"subscribe_failed:{type(exc).__name__}",
-                                    self.connection_id, self.stream_group)
-                            raise
-
-                    keepalive_task = None
-                    if self.keepalive is not None:
-                        keepalive_task = asyncio.ensure_future(self._keepalive_loop())
-
-                    try:
-                        await self._consume(ws)
-                    finally:
-                        if keepalive_task is not None:
-                            keepalive_task.cancel()
-                            # Awaiting the cancellation stops a pending task
-                            # from outliving its connection across reconnects.
-                            try:
-                                await keepalive_task
-                            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                                pass
-                        self._ws = None
-
-            except websockets.ConnectionClosed as e:
-                self.connected = False
-                logger.warning("WebSocket connection closed", error=str(e))
-                if self.on_quality_event:
-                    self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
-            except Exception as e:
-                self.connected = False
-                logger.error("WebSocket error", error=str(e))
-                if self.on_quality_event:
-                    self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
-
-            if self.running:
-                self.attempt += 1
+        try:
+            while self.running:
                 try:
-                    delay = self.backoff.next_delay()
-                except BackoffExhausted:
-                    # A permanently broken endpoint must stop being hammered,
-                    # and that must be visible in the data, not just in logs.
-                    self.reconnect_budget_exhausted = True
-                    self.running = False
-                    logger.error("reconnect_budget_exhausted",
-                                 url=self.url, attempts=self.attempt)
+                    connection = websockets.connect(self.url)
+                    if hasattr(connection, "__await__"):
+                        connection = await connection
+
+                    async with connection as ws:
+                        self.connected = True
+                        self._connection_serial += 1
+                        self.connection_id = f"{self.stream_group}-{self._connection_serial}"
+                        self.backoff.reset()
+                        self.retry_delay = self.backoff.peek_cap()
+                        self.attempt = 0
+                        logger.info("WebSocket connected")
+
+                        if self.on_quality_event:
+                            self.on_quality_event("CONNECT", "websocket_connected", self.connection_id, self.stream_group)
+
+                        if self.on_reconnect:
+                            self.on_reconnect()
+
+                        self._ws = ws
+                        self._last_inbound_monotonic = self._monotonic()
+                        self._awaiting_reply_since = None
+
+                        if self.on_open is not None:
+                            # A failed subscribe must be visible: it is the
+                            # difference between "quiet market" and "we are not
+                            # subscribed to anything".
+                            try:
+                                await self.on_open(self._send)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.error("websocket_on_open_failed", error=str(exc))
+                                if self.on_quality_event:
+                                    self.on_quality_event(
+                                        "ERROR", f"subscribe_failed:{type(exc).__name__}",
+                                        self.connection_id, self.stream_group)
+                                raise
+
+                        keepalive_task = None
+                        if self.keepalive is not None:
+                            keepalive_task = asyncio.ensure_future(self._keepalive_loop())
+
+                        try:
+                            await self._consume(ws)
+                        finally:
+                            if keepalive_task is not None:
+                                keepalive_task.cancel()
+                                # Awaiting the cancellation stops a pending task
+                                # from outliving its connection across reconnects.
+                                try:
+                                    await keepalive_task
+                                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                                    pass
+                            self._ws = None
+
+                except websockets.ConnectionClosed as e:
+                    self.connected = False
+                    logger.warning("WebSocket connection closed", error=str(e))
                     if self.on_quality_event:
-                        self.on_quality_event(
-                            "ERROR", f"reconnect_budget_exhausted:{self.attempt}",
-                            self.connection_id, self.stream_group)
-                    break
-                self.retry_delay = delay
-                logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=delay)
-                await asyncio.sleep(delay)
+                        self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
+                except Exception as e:
+                    self.connected = False
+                    logger.error("WebSocket error", error=str(e))
+                    if self.on_quality_event:
+                        self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
+
+                if self.running:
+                    self.attempt += 1
+                    try:
+                        delay = self.backoff.next_delay()
+                    except BackoffExhausted:
+                        # A permanently broken endpoint must stop being hammered,
+                        # and that must be visible in the data, not just in logs.
+                        self.reconnect_budget_exhausted = True
+                        self.running = False
+                        logger.error("reconnect_budget_exhausted",
+                                     url=self.url, attempts=self.attempt)
+                        if self.on_quality_event:
+                            self.on_quality_event(
+                                "ERROR", f"reconnect_budget_exhausted:{self.attempt}",
+                                self.connection_id, self.stream_group)
+                        break
+                    self.retry_delay = delay
+                    logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=delay)
+                    await asyncio.sleep(delay)
+
+        finally:
+            # Graceful drain (P0-1): let the worker finish whatever is
+            # already queued before start() itself returns, so a
+            # caller that awaits this coroutine after calling stop()
+            # observes every already-accepted message actually
+            # processed -- not merely the connection closed.
+            await self._processing_queue.put(self._WORKER_SHUTDOWN)
+            await self._processing_worker_task
 
     @staticmethod
     def _monotonic() -> float:
@@ -207,6 +246,29 @@ class WebSocketClient:
             raise RuntimeError("websocket is not connected")
         payload = message if isinstance(message, str) else json.dumps(message)
         await self._ws.send(payload)
+
+    async def _processing_worker(self) -> None:
+        """Drains the processing queue in strict FIFO order, one item at a
+        time, calling on_message exactly as _consume used to call it
+        inline. Runs for the whole lifetime of start() (across
+        reconnects), not per-connection, so a message queued just before a
+        disconnect is still processed afterward rather than lost."""
+        while True:
+            item = await self._processing_queue.get()
+            if item is self._WORKER_SHUTDOWN:
+                self._processing_queue.task_done()
+                return
+            data, local_receive_ts, connection_id = item
+            try:
+                if connection_id is not None:
+                    await self.on_message(data, local_receive_ts, connection_id=connection_id)
+                else:
+                    await self.on_message(data, local_receive_ts)
+            except Exception as exc:  # noqa: BLE001 - one bad message must not stop the worker,
+                # matching on_raw_frame's own established fail-open policy above.
+                logger.error("processing_worker_message_failed", error=str(exc), stream_group=self.stream_group)
+            finally:
+                self._processing_queue.task_done()
 
     async def _consume(self, ws) -> None:
         async for msg in ws:
@@ -264,10 +326,23 @@ class WebSocketClient:
                     )
                 continue
 
-            if self._on_message_takes_connection:
-                await self.on_message(data, local_receive_ts, connection_id=self.connection_id)
-            else:
-                await self.on_message(data, local_receive_ts)
+            item = (data, local_receive_ts, self.connection_id if self._on_message_takes_connection else None)
+            try:
+                self._processing_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                # The raw bytes are already durably captured above (before
+                # this point) -- only *live processing* of this message is
+                # dropped, and it remains replayable from raw capture
+                # later. Never block here: blocking would reintroduce the
+                # exact receive/processing coupling this queue exists to
+                # remove, and risk exchange-side backpressure.
+                self.processing_queue_overflow += 1
+                logger.error("processing_queue_overflow", dropped=self.processing_queue_overflow,
+                             stream_group=self.stream_group)
+                if self.on_quality_event:
+                    self.on_quality_event(
+                        "DATA_DROP", f"processing_queue_overflow:{self.processing_queue_overflow}",
+                        self.connection_id, self.stream_group)
 
     async def _keepalive_loop(self) -> None:
         """Heartbeat only when the link has gone quiet.
