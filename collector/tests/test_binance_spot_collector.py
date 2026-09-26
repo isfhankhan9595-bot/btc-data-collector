@@ -644,10 +644,14 @@ def test_capture_raw_frame_survives_the_shared_client_contract(tmp_path):
             return gen()
 
     app.client.running = True
-    asyncio.run(app.client._consume(_FakeSocket([
-        '{"stream":"btcusdt@trade","data":{}}',
-        "{not valid json",
-    ])))
+    async def _run():
+        await app.client._consume(_FakeSocket([
+            '{"stream":"btcusdt@trade","data":{}}',
+            "{not valid json",
+        ]))
+        app.client.running = False
+        await app.client._process_queue()
+    asyncio.run(_run())
 
     assert len(captured) == 2, (
         "every inbound frame must reach durable raw capture; "

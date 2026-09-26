@@ -62,7 +62,12 @@ def _drive_bybit(app, frames):
             return gen()
 
     app.client.running = True
-    asyncio.run(app.client._consume(_FakeSocket(frames)))
+
+    async def _run():
+        await app.client._consume(_FakeSocket(frames))
+        app.client.running = False
+        await app.client._process_queue()
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

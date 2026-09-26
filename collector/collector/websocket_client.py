@@ -35,13 +35,30 @@ class Keepalive:
         if self.interval_s <= 0 or self.timeout_s <= 0:
             raise ValueError("keepalive interval_s and timeout_s must be positive")
 
+@dataclass(frozen=True)
+class IngestItem:
+    """One received frame, captured but not yet decoded or processed.
+
+    This is the entire boundary between the fast receive loop and the
+    processing worker (P0-1): everything the receive loop needs to record
+    about a frame *before* any JSON decoding, raw-wire persistence, or
+    adapter/book-reconstruction work happens. Nothing expensive is done to
+    produce one of these -- that is the whole point.
+    """
+    msg: Any
+    local_receive_ts: int
+    connection_id: Optional[str]
+    connection_generation: int
+
+
 class WebSocketClient:
     def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None, stream_group: str = "websocket",
                  on_raw_frame: Optional[Callable[..., None]] = None,
                  backoff: Optional[ExponentialBackoff] = None,
                  on_open: Optional[Callable[..., Awaitable[None]]] = None,
                  keepalive: Optional[Keepalive] = None,
-                 control_frames: FrozenSet[str] = frozenset()):
+                 control_frames: FrozenSet[str] = frozenset(),
+                 ingest_queue_maxsize: int = 2000):
         self.url = url
         self.stream_group = stream_group
         self.on_message = on_message
@@ -81,6 +98,43 @@ class WebSocketClient:
         self._ws = None
         self._last_inbound_monotonic = 0.0
         self._awaiting_reply_since = None
+
+        # --- P0-1: receive/processing decoupling ----------------------
+        # The receive loop (_consume) only ever captures a frame and its
+        # arrival metadata into an IngestItem and enqueues it. All expensive
+        # work -- JSON decoding, raw-wire persistence, on_message (adapter,
+        # sequence validation, book reconstruction, canonical events) --
+        # happens in _process_queue, a single long-lived worker that drains
+        # the queue in strict FIFO order. One worker, not a pool: this
+        # collector has streams (an order book, in particular) where
+        # processing order must match arrival order, and a worker pool
+        # would have to solve stream-partitioned ordering to be safe. A
+        # single worker preserves ordering trivially, at the cost of not
+        # parallelizing CPU-bound processing -- an acceptable trade for a
+        # single-symbol collector; revisit only if profiling ever shows
+        # this worker is the actual bottleneck, not a guess now.
+        self.ingest_queue_maxsize = ingest_queue_maxsize
+        self._ingest_queue: asyncio.Queue = asyncio.Queue(maxsize=ingest_queue_maxsize)
+        self._worker_task: Optional[asyncio.Task] = None
+        #: Frames pulled off the socket by _consume, whether or not they
+        #: were ever successfully enqueued (see frames_enqueued).
+        self.frames_received = 0
+        #: Frames that made it into the queue. frames_received -
+        #: frames_enqueued is only ever nonzero during the brief window a
+        #: backpressured put() is in flight -- there is no code path that
+        #: drops a frame between these two counters (see _consume).
+        self.frames_enqueued = 0
+        self.frames_processed = 0
+        self.processing_errors = 0
+        self.queue_high_watermark = 0
+        #: Count of times the receive loop found the queue already full
+        #: and had to wait for the worker to make room -- i.e. genuine,
+        #: observable backpressure, distinct from routine operation. Never
+        #: a dropped frame: put() is always awaited to completion, never
+        #: put_nowait()-and-discard, because silently discarding a market
+        #: data frame is unacceptable (unlike the quality-event queue,
+        #: which is diagnostic and may drop under extreme load).
+        self.queue_backpressure_events = 0
 
     @staticmethod
     def _accepts_connection_id(callback) -> bool:
@@ -149,6 +203,13 @@ class WebSocketClient:
                     if self.keepalive is not None:
                         keepalive_task = asyncio.ensure_future(self._keepalive_loop())
 
+                    if self._worker_task is None or self._worker_task.done():
+                        # One worker for the client's whole lifetime, not
+                        # per-connection: it must keep draining across
+                        # reconnects so ordering and backlog survive a
+                        # reconnect exactly as they would without one.
+                        self._worker_task = asyncio.ensure_future(self._process_queue())
+
                     try:
                         await self._consume(ws)
                     finally:
@@ -193,6 +254,26 @@ class WebSocketClient:
                 logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=delay)
                 await asyncio.sleep(delay)
 
+        # STOP RECEIVING -> DRAIN PROCESSING QUEUE -> STOP WORKER -> EXIT.
+        # By this point self.running is False and no more frames can be
+        # enqueued (the receive loop has exited), so draining here is
+        # bounded, not a race against new arrivals. An explicit timeout
+        # keeps a stuck worker (e.g. a wedged downstream write) from
+        # hanging shutdown forever -- the timeout firing is itself an
+        # observable, logged condition, not a silent hang.
+        if self._worker_task is not None:
+            try:
+                await asyncio.wait_for(self._ingest_queue.join(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error("ingest_queue_drain_timeout",
+                             remaining=self._ingest_queue.qsize())
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._worker_task = None
+
     @staticmethod
     def _monotonic() -> float:
         return time.monotonic()
@@ -209,65 +290,151 @@ class WebSocketClient:
         await self._ws.send(payload)
 
     async def _consume(self, ws) -> None:
+        """Fast receive loop: capture and enqueue only.
+
+        P0-1: this used to also decode JSON, persist the raw frame, and
+        await the full on_message pipeline (adapter -> sequence validation
+        -> book reconstruction -> canonical events) inline, per frame,
+        before looping back to read the next one. Any slowness in that
+        chain -- a Parquet segment rollover doing real file I/O, a burst
+        of messages, a slow disk -- directly delayed reading the next
+        frame off the socket. Now this loop does only the minimum needed
+        to preserve the frame and its arrival metadata, then immediately
+        loops back for the next one; _process_queue does everything else.
+        """
         async for msg in ws:
             if not self.running:
                 break
-            # Capture arrival time before decoding so downstream research can
-            # distinguish network arrival from work performed after parsing.
+            # Capture arrival time before anything else -- including
+            # before the enqueue, which can itself take time under
+            # backpressure -- so downstream research can distinguish
+            # network arrival from any work performed after it, including
+            # queueing delay.
             local_receive_ts = int(time.time() * 1000)
             self._last_inbound_monotonic = self._monotonic()
+            self.frames_received += 1
 
-            text = msg if isinstance(msg, str) else None
-            is_control = text is not None and text in self.control_frames
-            if is_control:
-                self._awaiting_reply_since = None
+            item = IngestItem(
+                msg=msg, local_receive_ts=local_receive_ts,
+                connection_id=self.connection_id,
+                connection_generation=self._connection_serial,
+            )
 
-            decode_error = None
-            data = None
-            if not is_control:
-                try:
-                    data = json.loads(msg)
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    decode_error = str(exc)
-
-            # Raw capture precedes every lossy step, including a failed decode
-            # and including control frames: a frame that did not parse, or that
-            # carried no market data, is still a frame that arrived.
-            if self.on_raw_frame is not None:
-                try:
-                    self.on_raw_frame(
-                        msg,
-                        local_receive_ts=local_receive_ts,
-                        connection_id=self.connection_id,
-                        connection_generation=self._connection_serial,
-                        decode_ok=decode_error is None,
-                        decode_error=decode_error,
-                        parsed=data,
-                        control_frame=is_control,
-                    )
-                except Exception as exc:  # noqa: BLE001 - capture fails open
-                    logger.warning("raw_frame_capture_failed", error=str(exc))
-
-            if is_control:
-                # Healthy protocol traffic. Counted, never reported as
-                # malformed, and not forwarded to the market-data handler.
-                self.control_frames_received += 1
-                continue
-
-            if decode_error is not None:
-                self.malformed_frames += 1
-                logger.error("Failed to parse JSON from WebSocket", error=decode_error)
+            # Bounded queue, blocking put, never a dropped frame: silently
+            # discarding an exchange frame is unacceptable for research-
+            # grade market data (unlike the diagnostic quality-event queue
+            # elsewhere in this codebase, which may drop under extreme
+            # load). A full queue means the receive loop now waits for the
+            # worker to make room -- real, visible backpressure -- rather
+            # than either losing data or (the old behaviour) blocking on
+            # processing work that had nothing to do with the socket.
+            if self._ingest_queue.full():
+                self.queue_backpressure_events += 1
+                logger.warning("ingest_queue_backpressure",
+                                stream_group=self.stream_group,
+                                queue_maxsize=self.ingest_queue_maxsize)
                 if self.on_quality_event:
                     self.on_quality_event(
-                        "ERROR", f"malformed_frame:{decode_error}",
-                        self.connection_id, self.stream_group,
-                    )
-                continue
+                        "BACKPRESSURE", f"ingest_queue_full:{self.ingest_queue_maxsize}",
+                        self.connection_id, self.stream_group)
+            await self._ingest_queue.put(item)
+            self.frames_enqueued += 1
+            depth = self._ingest_queue.qsize()
+            if depth > self.queue_high_watermark:
+                self.queue_high_watermark = depth
 
-            if self._on_message_takes_connection:
-                await self.on_message(data, local_receive_ts, connection_id=self.connection_id)
-            else:
-                await self.on_message(data, local_receive_ts)
+    async def _process_queue(self) -> None:
+        """Processing worker: everything _consume used to do inline.
+
+        A single long-lived worker per client, started once in ``start()``
+        and persisting across reconnects, draining ``_ingest_queue`` in
+        strict FIFO order -- this is what keeps stream ordering intact
+        (see the architectural note in ``__init__``) without needing any
+        per-stream partitioning. One failing item is isolated (Test 5):
+        an exception here is logged and counted, never allowed to kill the
+        worker loop, because a single malformed or unexpected message must
+        not stop every subsequent frame from being processed.
+        """
+        while self.running or not self._ingest_queue.empty():
+            try:
+                item = await asyncio.wait_for(self._ingest_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                await self._process_item(item)
+                self.frames_processed += 1
+            except Exception as exc:  # noqa: BLE001 - isolate one bad item
+                self.processing_errors += 1
+                logger.error("ingest_item_processing_failed",
+                             error=str(exc), stream_group=self.stream_group)
+                if self.on_quality_event:
+                    self.on_quality_event(
+                        "ERROR", f"processing_failed:{type(exc).__name__}",
+                        item.connection_id, self.stream_group)
+            finally:
+                self._ingest_queue.task_done()
+
+    async def _process_item(self, item: "IngestItem") -> None:
+        """The exact per-frame work _consume used to do inline, unchanged
+        in substance: control-frame handling, JSON decode, raw-frame
+        capture (still ordered before every lossy step, including a
+        failed decode and including control frames -- a frame that did
+        not parse, or carried no market data, is still a frame that
+        arrived), then on_message. Only *when* this runs changed -- from
+        inline in the receive loop to here, in the worker -- not what it
+        does or in what order.
+        """
+        msg = item.msg
+        local_receive_ts = item.local_receive_ts
+
+        text = msg if isinstance(msg, str) else None
+        is_control = text is not None and text in self.control_frames
+        if is_control:
+            self._awaiting_reply_since = None
+
+        decode_error = None
+        data = None
+        if not is_control:
+            try:
+                data = json.loads(msg)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                decode_error = str(exc)
+
+        if self.on_raw_frame is not None:
+            try:
+                self.on_raw_frame(
+                    msg,
+                    local_receive_ts=local_receive_ts,
+                    connection_id=item.connection_id,
+                    connection_generation=item.connection_generation,
+                    decode_ok=decode_error is None,
+                    decode_error=decode_error,
+                    parsed=data,
+                    control_frame=is_control,
+                )
+            except Exception as exc:  # noqa: BLE001 - capture fails open
+                logger.warning("raw_frame_capture_failed", error=str(exc))
+
+        if is_control:
+            # Healthy protocol traffic. Counted, never reported as
+            # malformed, and not forwarded to the market-data handler.
+            self.control_frames_received += 1
+            return
+
+        if decode_error is not None:
+            self.malformed_frames += 1
+            logger.error("Failed to parse JSON from WebSocket", error=decode_error)
+            if self.on_quality_event:
+                self.on_quality_event(
+                    "ERROR", f"malformed_frame:{decode_error}",
+                    item.connection_id, self.stream_group,
+                )
+            return
+
+        if self._on_message_takes_connection:
+            await self.on_message(data, local_receive_ts, connection_id=item.connection_id)
+        else:
+            await self.on_message(data, local_receive_ts)
 
     async def _keepalive_loop(self) -> None:
         """Heartbeat only when the link has gone quiet.

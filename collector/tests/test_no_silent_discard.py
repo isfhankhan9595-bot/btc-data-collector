@@ -220,10 +220,14 @@ def test_production_capture_raw_frame_survives_every_on_raw_frame_call_shape():
     client.running = True  # _consume gates its loop on this; start() sets it,
                            # but this test drives _consume directly.
 
-    asyncio.run(client._consume(_FakeSocket([
-        '{"stream":"btcusdt@depth","data":{"u":1}}',
-        "{not valid json",
-    ])))
+    async def _run():
+        await client._consume(_FakeSocket([
+            '{"stream":"btcusdt@depth","data":{"u":1}}',
+            "{not valid json",
+        ]))
+        client.running = False
+        await client._process_queue()
+    asyncio.run(_run())
 
     assert len(captured) == 2, (
         "every inbound frame must reach durable raw capture; "
