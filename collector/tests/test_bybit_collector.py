@@ -45,9 +45,18 @@ class _FakeSocket:
 
 
 def _drive(app, frames):
-    """Run frames through the real WebSocketClient._consume() coroutine."""
-    app.client.running = True
-    asyncio.run(app.client._consume(_FakeSocket(frames)))
+    """Run frames through the real WebSocketClient._consume() coroutine,
+    then drain the P0-1 processing queue on the same event loop before
+    returning -- _consume() now only enqueues; on_message runs on a
+    separate worker task, so a caller must wait for it explicitly."""
+    async def run():
+        app.client.running = True
+        worker = asyncio.ensure_future(app.client._processing_worker())
+        await app.client._consume(_FakeSocket(frames))
+        await app.client._processing_queue.join()
+        app.client._processing_queue.put_nowait(app.client._WORKER_SHUTDOWN)
+        await worker
+    asyncio.run(run())
 
 
 def test_topics_use_configured_depth_and_all_four_declared_channels():
