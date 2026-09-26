@@ -177,16 +177,30 @@ def generate_labels(
     return meta
 
 
-def max_label_horizon_s(data_dir: str = "data") -> int:
-    """Longest horizon present in the labeled set, read from the columns.
+def _max_label_horizon_s_detailed(
+    data_dir: str, strict: bool
+) -> tuple[int, list[str]]:
+    """Return ``(max_horizon_s, unreadable_files)``.
 
-    The split generator needs this to size its purge. Deriving it from the
-    data rather than from a constant keeps the two in step if the label set
-    changes.
+    ``strict=True`` (the safe default) raises :class:`LabelHorizonError`
+    immediately on the first file whose schema cannot be read, rather than
+    returning a horizon silently derived from only the readable files --
+    the original defect this function exists to close: a partial horizon
+    computed from *some* of the label files is not a fact about the label
+    set, it is a fact about which files happened to be readable, and using
+    it to size a purge can under-purge a split while the manifest still
+    claims ``leakage_safe: true``.
+
+    ``strict=False`` preserves the previous warn-and-continue behaviour
+    for exploratory/informational use, but now also returns the list of
+    files that were skipped, so a caller (``generate_splits``) can record
+    the incompleteness explicitly rather than silently trusting the
+    number. No caller in this codebase may use ``strict=False`` to justify
+    ``leakage_safe: true``; ``generate_splits`` never does.
     """
     files = sorted(glob.glob(os.path.join(data_dir, "aligned", "labeled", "*.parquet")))
     if not files:
-        return 0
+        return 0, []
 
     # Every file, not just the newest. If the label set changed part-way
     # through a run, sizing the purge from whichever day happens to be last
@@ -199,16 +213,44 @@ def max_label_horizon_s(data_dir: str = "data") -> int:
     import pyarrow.parquet as pq
 
     horizons: list[int] = []
+    unreadable: list[str] = []
     for path in files:
         try:
             names = pq.read_schema(path).names
-        except Exception:  # noqa: BLE001 - an unreadable day must not be silent
+        except Exception as exc:  # noqa: BLE001 - an unreadable schema must never be silently skipped
+            if strict:
+                raise LabelHorizonError(
+                    f"cannot read label schema from {path!r}: {exc!r}; refusing to "
+                    "compute max_label_horizon_s from a partial file set -- a split "
+                    "sized from only the readable files could under-purge and still "
+                    "report leakage_safe=true. Pass strict=False only for "
+                    "non-leakage-relevant, informational use."
+                ) from exc
             print(f"WARNING: could not read label schema from {path}; "
                   "its horizons are not represented in the purge")
+            unreadable.append(path)
             continue
         for name in names:
             if name.startswith("return_") and name.endswith("s"):
                 digits = name[len("return_"):-1]
                 if digits.isdigit():
                     horizons.append(int(digits))
-    return max(horizons) if horizons else 0
+    return (max(horizons) if horizons else 0), unreadable
+
+
+def max_label_horizon_s(data_dir: str = "data", *, strict: bool = True) -> int:
+    """Longest horizon present in the labeled set, read from the columns.
+
+    The split generator needs this to size its purge. Deriving it from the
+    data rather than from a constant keeps the two in step if the label set
+    changes.
+
+    Fails closed by default (``strict=True``): if any label file's schema
+    cannot be read, this raises rather than silently returning a horizon
+    computed from only the files that happened to be readable. See
+    :func:`_max_label_horizon_s_detailed` for the full rationale and the
+    ``strict=False`` escape hatch, which ``split_generator.py`` never uses
+    to justify ``leakage_safe: true``.
+    """
+    horizon, _unreadable = _max_label_horizon_s_detailed(data_dir, strict)
+    return horizon

@@ -48,14 +48,46 @@ import json
 import math
 
 from collector.pipeline.label_generator import (
+    _max_label_horizon_s_detailed,
     max_label_horizon_s as observed_max_label_horizon_s,
 )
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 SECONDS_PER_DAY = 86_400
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """Write ``data`` to ``path`` so a crash mid-write can never leave a
+    truncated/corrupt file in place of a previously-valid one.
+
+    Writes to a temp file in the same directory (so the final
+    ``os.replace`` is a same-filesystem rename, atomic on POSIX and on
+    Windows via ``os.replace``'s own guarantee) and only then replaces the
+    target. If this process is killed before the temp file is fully
+    written and closed, the original file at ``path`` is untouched -- the
+    "generate -> validate -> atomically publish" order this module's
+    module docstring already requires for the manifest as a whole applies
+    at the single-file level too: a previously-valid split_manifest.json
+    or split parquet must survive a failed/interrupted regeneration.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=os.path.basename(path))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 #: Longest label horizon produced by ``label_generator`` today.
 
@@ -325,8 +357,19 @@ def generate_splits(
         return None
 
     if max_label_horizon_s is None:
-        derived = observed_max_label_horizon_s(data_dir)
-        if derived > 0:
+        derived, unreadable_label_files = _max_label_horizon_s_detailed(data_dir, strict)
+        if unreadable_label_files:
+            # Only reachable when the caller explicitly passed strict=False
+            # -- in strict mode (the default), an unreadable schema already
+            # raised inside _max_label_horizon_s_detailed and this line is
+            # never reached. This branch exists so the non-strict escape
+            # hatch can never silently produce a manifest claiming safety
+            # it did not establish: the incompleteness is recorded as a
+            # warning and leakage_safe is forced False below, exactly like
+            # every other incomplete-evidence case this module already
+            # refuses to hide.
+            horizon_source = "partial_derivation_unreadable_files_present"
+        elif derived > 0:
             horizon_source = "derived_from_labeled_columns"
         else:
             # Files exist but carry no recognisable ``return_<N>s`` column. A
@@ -335,6 +378,7 @@ def generate_splits(
             horizon_source = "no_return_columns_found:purge_0"
         max_label_horizon_s = derived
     else:
+        unreadable_label_files = []
         horizon_source = "caller_supplied"
     print(f"max_label_horizon_s={max_label_horizon_s} ({horizon_source})")
 
@@ -347,6 +391,15 @@ def generate_splits(
         strict=strict,
     )
     manifest.max_label_horizon_source = horizon_source
+    if unreadable_label_files:
+        message = (
+            f"max_label_horizon_s was derived from only {len(files) - len(unreadable_label_files)} "
+            f"of {len(files)} label file(s); {len(unreadable_label_files)} file(s) could not be "
+            f"read and are NOT represented in the purge: {sorted(unreadable_label_files)[:10]}. "
+            "The reported horizon is a lower bound, not a fact about the label set."
+        )
+        manifest.warnings.append(message)
+        manifest.leakage_safe = False
 
     problems = verify_manifest(manifest)
     if problems:
@@ -358,8 +411,42 @@ def generate_splits(
 
     out_dir = os.path.join(data_dir, "splits")
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "split_manifest.json"), "w") as handle:
-        json.dump(manifest.to_dict(), handle, indent=2)
+
+    # Read (and, on failure, warn about) every split's frames BEFORE
+    # writing anything to disk -- "generate -> validate -> atomically
+    # publish" applies to the manifest's warnings list too: a warning
+    # discovered while writing the parquet files must already be present
+    # in the manifest.json this function is about to save, not appended
+    # to an in-memory object after the file has already been written.
+    split_frames: dict[str, list] = {}
+    if write_parquet:
+        import pandas as pd
+
+        for split_name in ("train", "val", "test"):
+            split_dates = getattr(manifest, split_name)
+            if not split_dates:
+                continue
+            frames = []
+            for d in split_dates:
+                file_path = os.path.join(labeled_dir, f"{d}.parquet")
+                try:
+                    frames.append(pd.read_parquet(file_path))
+                except Exception as exc:  # noqa: BLE001 - must never crash uncontrolled; must never be silent either
+                    message = (
+                        f"{split_name}.parquet: {d} could not be read while writing the "
+                        f"split ({exc!r}) -- excluded from this split's data. This can only "
+                        "happen in strict=False runs (strict=True already refused to reach "
+                        "this point); the manifest's leakage_safe is already False and this "
+                        "warning names the exact day dropped."
+                    )
+                    print(f"WARNING: {message}")
+                    manifest.warnings.append(message)
+            split_frames[split_name] = frames
+
+    _atomic_write_bytes(
+        os.path.join(out_dir, "split_manifest.json"),
+        json.dumps(manifest.to_dict(), indent=2).encode("utf-8"),
+    )
 
     print(f"Saved split_manifest.json (leakage_safe={manifest.leakage_safe})")
     print(f"purge={manifest.purge_days}d embargo={manifest.embargo_days}d "
@@ -372,17 +459,16 @@ def generate_splits(
         print(f"WARNING: {warning}")
 
     if write_parquet:
-        import pandas as pd
+        import io
 
-        for split_name in ("train", "val", "test"):
-            split_dates = getattr(manifest, split_name)
-            if not split_dates:
+        for split_name, frames in split_frames.items():
+            if not frames:
+                print(f"WARNING: {split_name}.parquet has no readable days -- skipped entirely")
                 continue
-            frames = [pd.read_parquet(os.path.join(labeled_dir, f"{d}.parquet"))
-                      for d in split_dates]
             combined = pd.concat(frames, ignore_index=True)
-            combined.to_parquet(os.path.join(out_dir, f"{split_name}.parquet"),
-                                compression="snappy")
+            buffer = io.BytesIO()
+            combined.to_parquet(buffer, compression="snappy")
+            _atomic_write_bytes(os.path.join(out_dir, f"{split_name}.parquet"), buffer.getvalue())
             print(f"Saved {split_name}.parquet")
 
     return manifest
