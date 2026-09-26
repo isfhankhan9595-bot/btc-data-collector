@@ -21,6 +21,7 @@ from collector.collector.dedup_evidence_analysis import (
     analyze_dedup_evidence_from_raw_wire,
     convert_raw_wire_to_dedup_evidence,
 )
+from collector.collector.dedup_evidence_analysis import _payload_sha256 as _payload_sha256_for_test
 
 
 def _rec(exchange, market_type, stream, trade_id, local_receive_ts, *,
@@ -73,6 +74,20 @@ def test_missing_trade_id_is_never_deduplicated_against_anything():
     assert report.duplicate_count == 0
 
 
+def test_two_missing_id_records_with_identical_context_never_become_a_duplicate():
+    """Adversarial case the simpler missing-id tests don't reach: two
+    trade_id=None records that otherwise share every other identity field.
+    Grouping None-id records together (the exact defect production
+    _dedupe_trades exempts None from) must not silently turn into a
+    reported duplicate or collision here either."""
+    records = [_rec("BINANCE", "linear_perpetual", "trades", None, 1000),
+              _rec("BINANCE", "linear_perpetual", "trades", None, 1005)]
+    report = analyze_dedup_evidence(records)
+    assert report.missing_id_count == 2
+    assert report.duplicate_count == 0
+    assert report.invalid_timestamp_identity_collisions == 0
+
+
 def test_missing_trade_id_is_counted_not_silently_dropped():
     """Audit finding: the report must surface how many records had no
     trade_id at all -- required by this task's own Definition of Done
@@ -102,6 +117,22 @@ def test_same_local_receive_ts_duplicate_has_zero_delay_regardless_of_input_orde
     assert forward.duplicates[0].delay_ms == reversed_input.duplicates[0].delay_ms == 0
     assert forward.duplicates[0].arrival_order_ambiguous is True
     assert reversed_input.duplicates[0].arrival_order_ambiguous is True
+
+
+def test_same_trade_id_different_exchange_is_not_a_duplicate():
+    """identity() is (exchange, market_type, instrument_key, stream, trade_id).
+    Deliberately UNCONFOUNDED: instrument_key is identical (None) on both
+    records, since instrument_key's own value already embeds the exchange
+    name for identified events -- exchange would be redundant with it there.
+    The real risk is an UNIDENTIFIED event (instrument_key=None, e.g. OKX
+    index-tickers, or any legacy record), where instrument_key contributes
+    nothing to identity and exchange is the only thing separating two
+    venues' otherwise-identical unidentified trades on one stream/trade_id."""
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000, instrument_key=None),
+              _rec("BYBIT", "linear_perpetual", "trades", "1", 1000, instrument_key=None)]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicate_count == 0
+    assert report.total_records == 2
 
 
 def test_same_trade_id_different_stream_is_not_a_duplicate():
@@ -315,6 +346,24 @@ def test_raw_converter_hashes_exact_payload_bytes_and_preserves_trade_fields():
     assert record.canonical_quantity == 0.1
     assert record.canonical_side == "BUY"
     assert record.raw_payload_sha256 == hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_payload_hash_is_sensitive_to_exact_bytes_not_semantic_json_equality():
+    """Section 10: same semantic content, different formatting (whitespace,
+    key order) must hash differently -- proves the hash is over exact
+    captured bytes, never a reserialized/normalized form."""
+    compact = '{"a":1,"b":2}'
+    reformatted = '{"b": 2, "a": 1}'    # same JSON value, different bytes
+    rows = [{"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "s",
+            "connection_id": "c", "local_receive_ts": 1000, "payload": payload}
+           for payload in (compact, reformatted)]
+    hashes = {hashlib.sha256(p.encode("utf-8")).hexdigest() for p in (compact, reformatted)}
+    assert len(hashes) == 2, "test payloads must actually differ in bytes"
+    for row in rows:
+        assert _payload_sha256_for_test(row["payload"]) == hashlib.sha256(row["payload"].encode("utf-8")).hexdigest()
+    # identical bytes -> identical hash (the other half of the contract)
+    assert _payload_sha256_for_test(compact) == _payload_sha256_for_test(compact)
+    assert _payload_sha256_for_test(compact) != _payload_sha256_for_test(reformatted)
 
 
 def test_raw_converter_classifies_missing_empty_truncated_and_malformed_payloads():
