@@ -241,3 +241,60 @@ coverage. Full suite: 1264 passed (1254 baseline + 10 new). `compileall`
 clean, `git diff --check` clean. Scope unchanged: exactly
 `dedup_evidence_analysis.py`, its test file, and this doc -- no
 production dedup, replay, CVD, or orderbook code touched.
+
+## Hostile-audit fixes to this PR's own converter (rebase + follow-up session)
+
+Two real defects and one doc/code mismatch were found by independently
+verifying every claim against actual source rather than trusting an earlier
+session's report:
+
+1. **Adapter routing for an unsupported `market_type` silently substituted
+   another venue's semantics.** `_adapter_for` used "not spot" as a stand-in
+   for "is linear_perpetual": any unsupported `market_type` for BINANCE
+   (a typo, a future market type, an empty string) fell through to the
+   USD-M futures adapter, parsing the row with the wrong venue semantics
+   instead of rejecting it. Replaced with an explicit, closed
+   `(venue, market_type) -> adapter` mapping; anything not in the mapping is
+   `UNSUPPORTED_VENUE_OR_MARKET_TYPE`, never a silently-substituted adapter.
+2. **`InstrumentIdError` was caught by the same broad `except Exception` that
+   classifies malformed input.** `InstrumentIdError` means `_stamp_instrument`
+   found an event whose own `(exchange, market_type)` contradicts the adapter
+   that produced it -- an internal invariant violation (an adapter/registry
+   bug), never a property of malformed *input*. It was silently relabelled
+   `MALFORMED_PAYLOAD`, hiding a programming defect behind a data-quality
+   classification. Now re-raised, exactly like `DedupBypassUnavailableError`.
+3. **Section E's documented reconnect contract was asymmetric; the code was
+   symmetric-strict.** The doc always said a marker transition is "present on
+   the duplicate, absent-or-different on the first" -- but the code required
+   BOTH markers non-None, silently missing "first had no marker, duplicate
+   arrived with one," which is itself evidence of a connection-generation
+   boundary between the two occurrences. Fixed the code to match the
+   documented contract. Still correlation-only.
+
+Also verified and narrowly documented, not fixed (no defect found):
+
+4. **The `local_receive_ts = row.get("local_receive_ts", row.get("timestamp"))`
+   fallback** is safe only because `RawWireRecord.to_row()` always sets
+   `"timestamp"` to the exact same value as `"local_receive_ts"` (proven by
+   reading `raw_capture.py`, not assumed); `.get(k, default)` only fires on a
+   missing key, never a falsy/invalid value, so an explicit invalid value is
+   never silently overridden. Documented precisely, including the known,
+   currently-unreachable risk that a `raw_rest`-shaped row (whose `"timestamp"`
+   means `response_receive_ts or request_ts` -- a request time, not a receive
+   time) would be misread if ever fed to this function; pinned by a dedicated
+   test rather than left silent.
+5. **Float precision cannot mask a real price/quantity conflict at BTC-USDT's
+   actual scale.** All four adapters parse price/quantity via `float()`.
+   IEEE-754 double has ~15-17 significant decimal digits; a BTC-USDT price
+   plus up to 8 fractional digits (1 satoshi) is ~13 significant digits, well
+   inside that range, so two distinct decimal strings any of these venues
+   could actually send cannot round to one float -- verified with an explicit
+   test at the smallest realistic step (1 satoshi), not merely argued. This is
+   a narrow, evidence-based claim about the precision these four venues
+   transmit today; it is not a resolution of the separate native-precision
+   question (out of scope here) about whether float is the right storage type.
+
+11 new tests. Full suite: 1325 passed (1314 baseline on this branch + 11).
+`compileall` clean, `git diff --check` clean. Scope unchanged: exactly
+`dedup_evidence_analysis.py` and its test file -- no production dedup,
+routing for any P0 task, replay, CVD, or orderbook code touched.

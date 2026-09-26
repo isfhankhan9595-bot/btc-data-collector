@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from collector.collector.instrument import InstrumentIdError
 from collector.collector.dedup_evidence_analysis import (
     DedupEvidenceRecord,
     EXACT_DUPLICATE,
@@ -228,6 +229,41 @@ def test_duplicate_on_the_same_connection_is_not_flagged_associated():
     assert report.duplicates[0].reconnect_associated is False
 
 
+def test_first_marker_absent_duplicate_marker_present_is_flagged_associated():
+    """Doc/code reconciliation (this session): section E's documented
+    contract is asymmetric -- present-on-duplicate + absent-or-different-on-
+    first -- but the code previously required BOTH markers non-None,
+    silently missing exactly this case. Still correlation only."""
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000, reconnect_marker=None),
+              _rec("BINANCE", "linear_perpetual", "trades", "1", 2000, reconnect_marker="conn-B")]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicates[0].reconnect_associated is True
+
+
+def test_first_marker_present_duplicate_marker_absent_is_not_flagged_associated():
+    """The other asymmetric direction: the duplicate itself carries no
+    marker, so there is nothing on the duplicate's own record correlating
+    it with a reconnect -- this direction correctly stays False."""
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000, reconnect_marker="conn-A"),
+              _rec("BINANCE", "linear_perpetual", "trades", "1", 2000, reconnect_marker=None)]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicates[0].reconnect_associated is False
+
+
+def test_generation_change_without_any_marker_is_still_flagged_via_generation_transition():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000, connection_generation=1),
+              _rec("BINANCE", "linear_perpetual", "trades", "1", 2000, connection_generation=2)]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicates[0].reconnect_associated is True
+
+
+def test_neither_marker_nor_generation_available_is_not_flagged_associated():
+    records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000),
+              _rec("BINANCE", "linear_perpetual", "trades", "1", 2000)]
+    report = analyze_dedup_evidence(records)
+    assert report.duplicates[0].reconnect_associated is False
+
+
 def test_no_reconnect_marker_at_all_is_not_flagged_associated():
     records = [_rec("BINANCE", "linear_perpetual", "trades", "1", 1000),
               _rec("BINANCE", "linear_perpetual", "trades", "1", 1050)]
@@ -245,6 +281,22 @@ def test_duplicate_across_connection_generations_is_associated_even_without_mark
 # ---------------------------------------------------------------------------
 # Hostile forensic payload conflict checks.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("a,b", [
+    ("65000.50", "65000.51"), ("65000.12345678", "65000.12345679"),   # 1-satoshi quantity step
+    ("0.00000001", "0.00000002"), ("1.00000000", "1.00000001"), ("99999.99999999", "100000.00000000")])
+def test_duplicate_classification_is_not_masked_by_float_precision_at_btc_usdt_scale(a, b):
+    """Evidence for the claim in _duplicate_classification's docstring: at
+    BTC-USDT's actual price/quantity magnitude and precision (the only
+    scale this PR's four supported venues transmit), two distinct decimal
+    strings a real venue could send never collide to one float, so a
+    genuine conflict is never masked as EXACT_DUPLICATE by float rounding."""
+    assert float(a) != float(b), "chosen values must actually differ as floats for this test to mean anything"
+    first = _rec("BINANCE", "linear_perpetual", "trades", "1", 1000, canonical_price=float(a))
+    dup = _rec("BINANCE", "linear_perpetual", "trades", "1", 1010, canonical_price=float(b))
+    report = analyze_dedup_evidence([first, dup])
+    assert report.duplicates[0].classification == IDENTITY_PAYLOAD_CONFLICT
 
 
 def test_same_identity_different_price_is_identity_payload_conflict():
@@ -364,6 +416,51 @@ def test_payload_hash_is_sensitive_to_exact_bytes_not_semantic_json_equality():
     # identical bytes -> identical hash (the other half of the contract)
     assert _payload_sha256_for_test(compact) == _payload_sha256_for_test(compact)
     assert _payload_sha256_for_test(compact) != _payload_sha256_for_test(reformatted)
+
+
+def test_timestamp_fallback_recovers_receive_time_for_a_row_lacking_the_key():
+    """`row.get("local_receive_ts", row.get("timestamp"))`: the fallback fires
+    only when `local_receive_ts` is entirely ABSENT (not merely None/invalid),
+    exactly matching a genuine RawWireRecord.to_row() row that always sets
+    both keys to the identical value."""
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":9,"p":"100","q":"0.1","m":false}}'
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@aggTrade",
+          "connection_id": "c1", "timestamp": 4242, "payload": payload}   # no "local_receive_ts" key at all
+    assert "local_receive_ts" not in row
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert len(conversion.records) == 1
+    assert conversion.records[0].local_receive_ts == 4242
+
+
+def test_local_receive_ts_key_present_but_invalid_is_never_overridden_by_the_timestamp_fallback():
+    """The fallback must not activate merely because the value is falsy/invalid
+    -- only because the KEY is missing. A row that explicitly carries an
+    invalid local_receive_ts (e.g. None) must keep that invalid value, not
+    silently recover a different number from "timestamp"."""
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":9,"p":"100","q":"0.1","m":false}}'
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@aggTrade",
+          "connection_id": "c1", "timestamp": 4242, "local_receive_ts": None, "payload": payload}
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert conversion.records[0].local_receive_ts is None    # not silently replaced with 4242
+
+
+def test_a_rest_shaped_row_would_be_misread_as_receive_time_known_unreachable_limitation():
+    """KNOWN LIMITATION, pinned rather than left undocumented: nothing in this
+    repository calls convert_raw_wire_to_dedup_evidence with raw_rest rows,
+    but if it ever were, RawRestRecord.to_row()'s `"timestamp": response_
+    receive_ts or request_ts` would be silently accepted here as if it were
+    a receive time -- a REST request time is not a receive time. This test
+    exists so the risk stays visible under future refactors; it is not a
+    claim that this happens in the current pipeline."""
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":9,"p":"100","q":"0.1","m":false}}'
+    rest_shaped_row = {
+        "venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@aggTrade",
+        "connection_id": "c1", "request_ts": 5000, "response_receive_ts": 5100,
+        "timestamp": 5100,   # == response_receive_ts or request_ts, per RawRestRecord.to_row()
+        "payload": payload,
+    }
+    conversion = convert_raw_wire_to_dedup_evidence([rest_shaped_row])
+    assert conversion.records[0].local_receive_ts == 5100   # accepted -- the documented, pinned risk
 
 
 def test_raw_converter_classifies_missing_empty_truncated_and_malformed_payloads():
@@ -824,6 +921,70 @@ def test_dedup_bypass_unavailable_error_fires_when_wrapped_is_missing():
         assert False, "must raise, never silently proceed"
     except DedupBypassUnavailableError:
         pass
+
+
+def test_internal_instrument_id_error_is_never_relabeled_as_malformed_payload(monkeypatch):
+    """A real, previously-unaudited defect: `except Exception` also caught
+    InstrumentIdError, which _stamp_instrument raises when an event's own
+    (exchange, market_type) contradicts its adapter -- an internal
+    invariant violation, not a property of the raw input. Triggered here by
+    making BinanceAdapter's real unwrapped parser return an event stamped
+    for the wrong exchange, exactly the contradiction _stamp_instrument
+    exists to catch."""
+    from collector.collector.adapters.binance import BinanceAdapter
+    from collector.collector.canonical import CanonicalTradeEvent
+
+    def _wrong_exchange_parser(self, raw, local_receive_ts=None):
+        return [CanonicalTradeEvent("BYBIT", "trades", local_receive_ts, None, local_receive_ts,
+                                    trade_id="1", price=1.0, quantity=1.0, side="BUY")]
+    monkeypatch.setattr(BinanceAdapter.normalize, "__wrapped__", _wrong_exchange_parser)
+
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@aggTrade",
+          "connection_id": "c1", "local_receive_ts": 1000, "payload": "{}"}
+    with pytest.raises(InstrumentIdError):
+        convert_raw_wire_to_dedup_evidence([row])
+
+
+def test_genuinely_malformed_input_is_still_classified_not_raised(monkeypatch):
+    """The other half of the same fix: an ordinary parsing failure on
+    malformed input (not an identity contradiction) must still be
+    classified as evidence, not turned into an uncaught exception."""
+    from collector.collector.adapters.binance import BinanceAdapter
+
+    def _raises_on_malformed(self, raw, local_receive_ts=None):
+        raise KeyError("data")   # a realistic malformed-frame parser failure
+    monkeypatch.setattr(BinanceAdapter.normalize, "__wrapped__", _raises_on_malformed)
+
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@aggTrade",
+          "connection_id": "c1", "local_receive_ts": 1000, "payload": "{}"}
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert len(conversion.records) == 0
+    assert conversion.invalid_records[0].reason == "MALFORMED_PAYLOAD"
+
+
+@pytest.mark.parametrize("market_type", [
+    "inverse_perpetual", "coin_margined", "futures", "", "Spot", "LINEAR_PERPETUAL", "unknown"])
+def test_binance_with_an_unsupported_market_type_is_rejected_not_routed_to_the_futures_adapter(market_type):
+    """Real defect (this session): the previous routing used "not spot" as a
+    stand-in for "is linear_perpetual", so any unsupported market_type for
+    BINANCE silently fell through to the USD-M futures adapter -- parsing
+    evidence with the wrong venue semantics rather than rejecting it."""
+    row = {"venue": "BINANCE", "market_type": market_type, "stream": "btcusdt@aggTrade",
+          "connection_id": "c1", "local_receive_ts": 1000, "payload": "{}"}
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert len(conversion.records) == 0
+    assert conversion.invalid_records[0].reason == "UNSUPPORTED_VENUE_OR_MARKET_TYPE"
+
+
+def test_bybit_and_okx_reject_a_market_type_other_than_linear_perpetual():
+    """Bybit and OKX have no supported spot instrument in the registry;
+    routing must reject "spot" for them rather than silently accepting it
+    under the linear-perpetual adapter."""
+    for venue in ("BYBIT", "OKX"):
+        row = {"venue": venue, "market_type": "spot", "stream": "trades",
+              "connection_id": "c1", "local_receive_ts": 1000, "payload": "{}"}
+        conversion = convert_raw_wire_to_dedup_evidence([row])
+        assert conversion.invalid_records[0].reason == "UNSUPPORTED_VENUE_OR_MARKET_TYPE", venue
 
 
 def test_dedup_bypass_unavailable_error_is_never_swallowed_by_the_converter():

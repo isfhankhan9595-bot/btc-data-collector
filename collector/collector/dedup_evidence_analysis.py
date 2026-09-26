@@ -27,6 +27,7 @@ from .adapters.binance_spot import BinanceSpotAdapter
 from .adapters.bybit import BybitAdapter
 from .adapters.okx import OKXAdapter
 from .canonical import CanonicalTradeEvent
+from .instrument import MARKET_LINEAR_PERPETUAL, MARKET_SPOT, InstrumentIdError
 
 EXACT_DUPLICATE = "EXACT_DUPLICATE"
 IDENTITY_PAYLOAD_CONFLICT = "IDENTITY_PAYLOAD_CONFLICT"
@@ -239,6 +240,17 @@ def _valid_local_receive_ts(value: Any) -> tuple[Optional[int], Optional[str]]:
 
 
 def _duplicate_classification(first: DedupEvidenceRecord, duplicate: DedupEvidenceRecord) -> tuple[str, tuple[str, ...]]:
+    """See test_duplicate_classification_is_not_masked_by_float_precision_at_btc_usdt_scale
+    for the evidence behind comparing canonical_price/quantity as float here.
+    All four adapters parse them via `float(decimal_string)`. IEEE-754 double
+    has ~15-17 significant decimal digits; a BTC-USDT price (~5 significant
+    digits before the point) with up to 8 fractional digits (1 satoshi) is
+    ~13 significant digits total, well inside that range, so two DISTINCT
+    decimal strings a real venue could actually send cannot round to the
+    same float. This claim is deliberately narrow: it covers the precision
+    these four venues transmit today, not an arbitrary decimal string, and
+    it is not a resolution of the separate native-precision-loss question
+    (out of scope here) about whether float is the right STORAGE type."""
     different_fields = tuple(
         name for name, first_value, duplicate_value in (
             ("canonical_price", first.canonical_price, duplicate.canonical_price),
@@ -253,18 +265,27 @@ def _duplicate_classification(first: DedupEvidenceRecord, duplicate: DedupEviden
     return EXACT_DUPLICATE, ()
 
 
+#: Hostile-audit finding (this session): the previous routing used "not spot"
+#: as an implicit stand-in for "is linear_perpetual" -- any unsupported
+#: market_type for BINANCE (a typo, a future market type, an empty string
+#: paired with a market_type key present-but-blank) silently fell through to
+#: BinanceAdapter (the USD-M futures parser). An explicit, closed mapping
+#: replaces that: a (venue, market_type) pair either names a real supported
+#: instrument or the row is UNSUPPORTED_VENUE_OR_MARKET_TYPE -- there is no
+#: third, silently-substituted outcome.
+_ADAPTER_BY_VENUE_MARKET_TYPE: dict[tuple[str, str], type] = {
+    ("BINANCE", MARKET_SPOT): BinanceSpotAdapter,
+    ("BINANCE", MARKET_LINEAR_PERPETUAL): BinanceAdapter,
+    ("BYBIT", MARKET_LINEAR_PERPETUAL): BybitAdapter,
+    ("OKX", MARKET_LINEAR_PERPETUAL): OKXAdapter,
+}
+
+
 def _adapter_for(venue: Any, market_type: Any):
     venue_key = str(venue or "").upper()
     market_type_key = str(market_type or "")
-    if venue_key == "BINANCE" and market_type_key == "spot":
-        return BinanceSpotAdapter()
-    if venue_key == "BINANCE":
-        return BinanceAdapter()
-    if venue_key == "BYBIT":
-        return BybitAdapter()
-    if venue_key == "OKX":
-        return OKXAdapter()
-    return None
+    adapter_cls = _ADAPTER_BY_VENUE_MARKET_TYPE.get((venue_key, market_type_key))
+    return adapter_cls() if adapter_cls is not None else None
 
 
 class DedupBypassUnavailableError(RuntimeError):
@@ -349,6 +370,26 @@ def convert_raw_wire_to_dedup_evidence(
 
     Empty/missing/malformed/truncated/unroutable frames are returned
     as invalid evidence issues instead of disappearing silently.
+
+    Precondition (hostile-audit finding, this session): ``row.get(
+    "local_receive_ts", row.get("timestamp"))`` below is safe ONLY because
+    every row here is a genuine `raw_wire` row. `RawWireRecord.to_row()`
+    (raw_capture.py) always sets `"timestamp"` to the exact same value as
+    `"local_receive_ts"` -- they are the same field under two keys, by
+    construction, never independently derived. `.get(k, default)` only
+    triggers the fallback when the key is entirely ABSENT (not merely
+    falsy/invalid), so for a row that already carries `local_receive_ts`
+    -- valid or not -- the fallback never fires; it exists only for a row
+    shape that omits that key while still carrying `timestamp`.
+
+    This equivalence does NOT hold for a `raw_rest` row: `RawRestRecord.
+    to_row()` sets `"timestamp"` to `response_receive_ts or request_ts` --
+    a REST *request* time is not a receive time at all. This function is
+    documented and tested only against `raw_wire` rows; nothing in this
+    repository calls it with `raw_rest` input. Feeding it a REST-shaped
+    row would today silently misinterpret that value as receive time --
+    a real but currently unreachable risk, pinned by a dedicated test
+    below rather than left undocumented.
     """
     records: list[DedupEvidenceRecord] = []
     invalid_records: list[RawTradeEvidenceIssue] = []
@@ -410,7 +451,19 @@ def convert_raw_wire_to_dedup_evidence(
             events = _dedup_bypassed_normalize(adapter, raw_json, local_receive_ts=adapter_local_receive_ts)
         except DedupBypassUnavailableError:
             raise
-        except Exception:  # noqa: BLE001 - evidence path must classify malformed rows, not crash.
+        except InstrumentIdError:
+            # Hostile-audit finding (this session): InstrumentIdError means
+            # _stamp_instrument found an event whose (exchange, market_type)
+            # contradicts the adapter that produced it -- an internal
+            # invariant violation (a real adapter/instrument-registry bug),
+            # never a property of malformed *input*. The bare `except
+            # Exception` below used to catch this too and relabel it
+            # MALFORMED_PAYLOAD, silently hiding a programming defect behind
+            # a data-quality-sounding classification. Re-raised, exactly
+            # like DedupBypassUnavailableError above: this tool's own
+            # machinery must fail loudly, not quietly misclassify itself.
+            raise
+        except Exception:  # noqa: BLE001 - evidence path must classify malformed *input*, not crash.
             invalid_records.append(RawTradeEvidenceIssue("MALFORMED_PAYLOAD", locator))
             continue
         if not events:
@@ -540,9 +593,17 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
                 exact_duplicate_count += 1
             else:
                 identity_payload_conflict_count += 1
+            # Doc/code reconciliation (this session, section E of the design
+            # doc): a marker transition is a marker PRESENT on the duplicate
+            # and either absent or different on the first occurrence -- not
+            # "both present and different". "First had no marker, duplicate
+            # arrived with one" is itself evidence a connection-generation
+            # boundary sits between the two occurrences; requiring both
+            # non-None silently missed exactly that case. Still
+            # correlation-only: nothing here claims the reconnect CAUSED
+            # the duplicate.
             marker_transition = (
-                first.reconnect_marker is not None
-                and dup.reconnect_marker is not None
+                dup.reconnect_marker is not None
                 and dup.reconnect_marker != first.reconnect_marker
             )
             generation_transition = (
