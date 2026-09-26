@@ -20,9 +20,10 @@ import pytest
 from collector.pipeline.label_generator import (
     LabelDiscoveryError,
     LabelSchemaError,
+    discover_labeled_files,
     max_label_horizon_s,
 )
-from collector.pipeline.split_generator import generate_splits
+from collector.pipeline.split_generator import LeakageError, generate_splits
 
 
 def _write_labeled_day(data_dir, date_str, columns):
@@ -106,6 +107,110 @@ def test_permission_denied_directory_raises_not_treated_as_empty(tmp_path):
         os.chmod(labeled_dir, original_mode)  # restore so tmp_path cleanup can run
 
 
+def test_labeled_path_exists_but_is_not_a_directory_raises(tmp_path):
+    """Known Defect #2: a stray file at the labeled path must never mean
+    'nothing labeled yet' -- that reading is reserved for the path being
+    entirely absent. A file where a directory was expected is a discovery
+    failure."""
+    aligned_dir = os.path.join(tmp_path, "aligned")
+    os.makedirs(aligned_dir)
+    with open(os.path.join(aligned_dir, "labeled"), "w") as f:
+        f.write("not a directory")
+
+    with pytest.raises(LabelDiscoveryError, match="not a directory"):
+        max_label_horizon_s(str(tmp_path))
+    with pytest.raises(LabelDiscoveryError):
+        discover_labeled_files(str(tmp_path))
+
+
+def test_discover_labeled_files_distinguishes_absent_from_not_a_directory(tmp_path):
+    """The absent case must NOT raise (established 'fresh pipeline'
+    semantics); the not-a-directory case MUST raise. These are different
+    filesystem states and must not share a code path."""
+    assert discover_labeled_files(str(tmp_path)) == []  # aligned/ doesn't even exist
+
+    aligned_dir = os.path.join(tmp_path, "aligned")
+    os.makedirs(aligned_dir)
+    with open(os.path.join(aligned_dir, "labeled"), "w") as f:
+        f.write("x")
+    with pytest.raises(LabelDiscoveryError):
+        discover_labeled_files(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Known Defect #1 (end-to-end): generate_splits() must use the SAME
+# fail-closed discovery as max_label_horizon_s(), not a separate glob.glob
+# call that can silently convert a listing failure into "no files found".
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                     reason="permission bits are not enforced for root or on Windows")
+def test_generate_splits_raises_on_permission_denied_not_none(tmp_path):
+    """Before the end-to-end fix: generate_splits() discovered its file
+    list via glob.glob, which returns [] on a listing failure --
+    generate_splits() would print 'No labeled files found' and return
+    None, silently bypassing the fail-closed contract for this exact path.
+    Must now raise LabelDiscoveryError instead."""
+    labeled_dir = os.path.join(tmp_path, "aligned", "labeled")
+    os.makedirs(labeled_dir)
+    _write_labeled_day(tmp_path, "2026-01-01", ["mid_price", "return_60s"])
+    original_mode = os.stat(labeled_dir).st_mode
+    os.chmod(labeled_dir, 0o000)
+    try:
+        with pytest.raises(LabelDiscoveryError):
+            generate_splits(str(tmp_path), strict=False)
+        # And, crucially, no manifest may exist afterward.
+        assert not os.path.exists(os.path.join(tmp_path, "splits", "split_manifest.json"))
+    finally:
+        os.chmod(labeled_dir, original_mode)
+
+
+def test_generate_splits_raises_when_labeled_path_is_not_a_directory(tmp_path):
+    aligned_dir = os.path.join(tmp_path, "aligned")
+    os.makedirs(aligned_dir)
+    with open(os.path.join(aligned_dir, "labeled"), "w") as f:
+        f.write("not a directory")
+    with pytest.raises(LabelDiscoveryError):
+        generate_splits(str(tmp_path), strict=False)
+
+
+def test_generate_splits_and_max_label_horizon_s_use_the_same_discovery(tmp_path):
+    """Pins the actual fix for Defect #1: both call sites must agree on
+    what 'no files' means, by construction (same underlying function),
+    not by coincidence of two separately-maintained implementations."""
+    import inspect
+
+    from collector.pipeline import split_generator
+    source = inspect.getsource(split_generator.generate_splits)
+    assert "discover_labeled_files" in source
+    assert "glob.glob(" not in source  # no actual call left; a docstring mention of the old bug is fine
+
+
+# ---------------------------------------------------------------------------
+# Race condition (Test M): a file present at discovery time but gone by the
+# time its schema is read must still fail closed, not be silently skipped.
+# ---------------------------------------------------------------------------
+
+def test_file_disappearing_between_discovery_and_schema_read_fails_closed(tmp_path, monkeypatch):
+    _write_labeled_day(tmp_path, "2026-01-01", ["mid_price", "return_60s"])
+    _write_labeled_day(tmp_path, "2026-01-02", ["mid_price", "return_300s"])
+
+    import pyarrow.parquet as pq
+    real_read_schema = pq.read_schema
+    vanished_path = os.path.join(tmp_path, "aligned", "labeled", "2026-01-02.parquet")
+
+    def flaky_read_schema(path, *a, **kw):
+        if str(path) == vanished_path:
+            os.remove(path)  # simulate the file vanishing right before the read
+            raise FileNotFoundError(f"[simulated race] {path} no longer exists")
+        return real_read_schema(path, *a, **kw)
+
+    monkeypatch.setattr(pq, "read_schema", flaky_read_schema)
+
+    with pytest.raises(LabelSchemaError):
+        max_label_horizon_s(str(tmp_path))
+
+
 # ---------------------------------------------------------------------------
 # generate_splits() must let these propagate -- no manifest on failure
 # ---------------------------------------------------------------------------
@@ -142,6 +247,24 @@ def test_generate_splits_succeeds_normally_for_a_valid_dataset(tmp_path):
     assert os.path.exists(os.path.join(tmp_path, "splits", "split_manifest.json"))
     assert manifest.max_label_horizon_s == 60
     assert manifest.max_label_horizon_source == "derived_from_labeled_columns"
+
+
+def test_strict_mode_leakage_violation_raises_before_any_publication(tmp_path):
+    """The same 10-day dataset above fails verify_manifest in non-strict
+    mode (empty val split -- too few dates for the purge to leave a val
+    window). In strict mode (the default), that must raise LeakageError
+    -- and, more importantly for this task, must do so BEFORE anything is
+    published: no split_manifest.json, no parquet, not even a stale one
+    from a half-completed run."""
+    dates = [f"2026-01-{d:02d}" for d in range(1, 11)]
+    for date in dates:
+        _write_labeled_day(tmp_path, date, ["mid_price", "return_60s"])
+
+    with pytest.raises(LeakageError):
+        generate_splits(str(tmp_path))  # strict=True is the default
+
+    assert not os.path.exists(os.path.join(tmp_path, "splits", "split_manifest.json"))
+    assert not os.path.exists(os.path.join(tmp_path, "splits", "train.parquet"))
 
 
 # ---------------------------------------------------------------------------

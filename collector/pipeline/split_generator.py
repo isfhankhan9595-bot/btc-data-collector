@@ -43,13 +43,13 @@ producing a mislabelled artifact.
 """
 from __future__ import annotations
 
-import glob
 import json
 import math
 
 from collector.pipeline.label_generator import (
     LabelDiscoveryError,
     LabelSchemaError,
+    discover_labeled_files,
     max_label_horizon_s as observed_max_label_horizon_s,
 )
 import os
@@ -320,28 +320,48 @@ def generate_splits(
     The origin of the number is recorded in ``max_label_horizon_source`` so a
     researcher can see whether the purge was measured or assumed.
 
-    Fail-closed on label discovery/schema failures. When ``max_label_horizon_s``
-    is derived, ``label_generator.max_label_horizon_s`` can raise
-    :class:`LabelDiscoveryError` (the labeled directory could not be listed)
-    or :class:`LabelSchemaError` (a participating file's schema could not be
-    read). Neither is caught here: they propagate to the caller, and nothing
-    is written -- no ``split_manifest.json``, no ``train``/``val``/``test``
-    parquet. A run that cannot prove the label horizon must not produce an
-    artifact that looks like it did.
+    Fail-closed on label discovery/schema failures. File discovery uses
+    :func:`label_generator.discover_labeled_files` -- the same authoritative
+    call ``max_label_horizon_s`` uses -- rather than a separate
+    ``glob.glob`` here, which used to be able to convert a directory-listing
+    failure into "No labeled files found" and return ``None`` instead of
+    raising, bypassing the fail-closed contract entirely for that one path.
+    When ``max_label_horizon_s`` is derived, it can also raise
+    :class:`LabelSchemaError` (a participating file's schema could not be
+    read). None of these are caught here: they propagate to the caller, and
+    nothing is written -- no ``split_manifest.json``, no
+    ``train``/``val``/``test`` parquet. A run that cannot prove the label
+    horizon must not produce an artifact that looks like it did.
 
-    Atomic publish. All output files are written into ``<out_dir>/.pending``
-    first; only once every file has been written successfully are they
-    published into ``out_dir`` one at a time, with ``split_manifest.json``
-    -- the "this is leakage-safe" claim -- published **last**. If generation
-    fails at any point before that final publish, any previously-existing
-    valid manifest and parquet in ``out_dir`` are untouched: a failed
-    regeneration can never destroy or shadow the last known-good split.
+    Publication semantics -- read this carefully before relying on the word
+    "atomic" anywhere else. Every output file is written into
+    ``<out_dir>/.pending`` first, then published into ``out_dir`` with one
+    ``os.replace`` call per file, manifest last. Each individual
+    ``os.replace`` is atomic for that one file: a reader never observes a
+    half-written ``train.parquet``, and publishing the manifest last means a
+    reader can never observe a *published* manifest whose parquet files are
+    not also already the new ones. What this is **not**: a single
+    transaction across all four files. If the process is killed between two
+    of the ``os.replace`` calls, the result can be a mix of new and old
+    files (e.g. new ``train.parquet`` alongside old ``val.parquet`` and the
+    old manifest, since the manifest -- published last -- would in that
+    specific interruption point still be the old, valid one). The one
+    invariant that *does* hold unconditionally: a failure at any point
+    **before** publication begins (which covers every discovery/schema/
+    leakage-check failure -- the actual failure modes this task is about)
+    leaves the existing ``out_dir`` completely untouched, because nothing
+    in ``.pending`` is ever touched until every pending file already exists
+    and is complete. A crash *during* the brief publication window itself
+    (a handful of ``os.replace`` calls in a row) is a narrower, structurally
+    different risk that this implementation does not fully close; treat
+    "atomic" as describing that per-file guarantee, not a whole-publication
+    transaction.
     """
-    labeled_dir = os.path.join(data_dir, "aligned", "labeled")
-    files = glob.glob(os.path.join(labeled_dir, "*.parquet"))
+    files = discover_labeled_files(data_dir)
     if not files:
         print("No labeled files found.")
         return None
+    labeled_dir = os.path.join(data_dir, "aligned", "labeled")
 
     if max_label_horizon_s is None:
         derived = observed_max_label_horizon_s(data_dir)

@@ -201,6 +201,59 @@ def generate_labels(
     return meta
 
 
+def discover_labeled_files(data_dir: str = "data") -> List[str]:
+    """The one authoritative, fail-closed listing of labeled parquet files.
+
+    Both this module's :func:`max_label_horizon_s` and
+    ``split_generator.generate_splits`` use this rather than each rolling
+    its own discovery call, so the two can never disagree about what "no
+    files" versus "listing failed" means -- which is exactly how the
+    previous fix's end-to-end contract had a gap: ``max_label_horizon_s``
+    was fixed to use ``os.listdir`` (raises on failure), but
+    ``generate_splits`` still discovered its own file list with
+    ``glob.glob`` (silently returns ``[]`` on a listing failure), so a
+    directory-listing failure there was reported as "No labeled files
+    found" rather than the fail-closed error this contract requires.
+
+    Three filesystem states are distinguished on purpose:
+
+    1. The labeled path does not exist at all -- a fresh pipeline with
+       nothing labeled yet. Returns ``[]``, not an error.
+    2. The labeled path exists but is not a directory (a stray file where
+       a directory was expected). Never the same as "nothing labeled yet"
+       -- raises :class:`LabelDiscoveryError`.
+    3. The labeled path is a directory that cannot be listed (permission
+       denied, a transient I/O error). Also raises
+       :class:`LabelDiscoveryError` -- ``glob.glob`` would silently return
+       ``[]`` for this exact case, which is the defect this function exists
+       to close.
+
+    Returns:
+        Sorted full paths to every ``*.parquet`` file directly in the
+        labeled directory. An empty list means states 1 or "directory
+        exists, genuinely has no parquet files in it" -- both legitimate,
+        neither an error.
+    """
+    labeled_dir = os.path.join(data_dir, "aligned", "labeled")
+    if not os.path.exists(labeled_dir):
+        return []
+    if not os.path.isdir(labeled_dir):
+        raise LabelDiscoveryError(
+            f"labeled-data path exists but is not a directory: path={labeled_dir}"
+        )
+    try:
+        entries = os.listdir(labeled_dir)
+    except OSError as exc:
+        # os.listdir raises on permission errors and similar; glob.glob
+        # does not, and would have silently returned no matches for the
+        # exact same failure. Listing explicitly is what makes "permission
+        # denied" distinguishable from "genuinely empty".
+        raise LabelDiscoveryError(
+            f"could not list labeled-data directory: path={labeled_dir} reason={exc}"
+        ) from exc
+    return sorted(os.path.join(labeled_dir, name) for name in entries if name.endswith(".parquet"))
+
+
 def max_label_horizon_s(data_dir: str = "data") -> int:
     """Longest horizon present in the labeled set, read from the columns.
 
@@ -216,27 +269,7 @@ def max_label_horizon_s(data_dir: str = "data") -> int:
     with what we have" -- see split_generator.py, which lets both propagate
     uncaught so no manifest is written.
     """
-    labeled_dir = os.path.join(data_dir, "aligned", "labeled")
-    if not os.path.isdir(labeled_dir):
-        # No labeled directory at all: a fresh pipeline with nothing
-        # labeled yet, not a discovery failure. If this path exists but is
-        # not a directory, or exists but cannot be listed, that is a
-        # discovery failure and falls through to the os.listdir call below,
-        # which raises.
-        return 0
-
-    try:
-        entries = os.listdir(labeled_dir)
-    except OSError as exc:
-        # os.listdir raises on permission errors and similar; glob.glob
-        # does not, and would have silently returned no matches for the
-        # exact same failure. Listing explicitly first is what makes
-        # "permission denied" distinguishable from "genuinely empty".
-        raise LabelDiscoveryError(
-            f"could not list labeled-data directory: path={labeled_dir} reason={exc}"
-        ) from exc
-
-    files = sorted(os.path.join(labeled_dir, name) for name in entries if name.endswith(".parquet"))
+    files = discover_labeled_files(data_dir)
     if not files:
         return 0
 
