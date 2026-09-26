@@ -273,7 +273,7 @@ class CollectorApp:
         elif route == "trades":
             self._handle_binance_trade(msg, stream, local_receive_ts)
         elif route == "markprice":
-            self._handle_markprice(data, stream)
+            self._handle_markprice(data, stream, local_receive_ts)
         elif route == "liquidation":
             self._handle_liquidation(data, stream)
         self._drain_integrity_quality_events()
@@ -697,7 +697,7 @@ class CollectorApp:
             self._record_validation_rejection("liquidation", type(exc).__name__)
             logger.error("Liquidation handling failed", stream="liquidation", raw_stream=stream, error=str(exc))
 
-    def _handle_markprice(self, data: dict, stream: str):
+    def _handle_markprice(self, data: dict, stream: str, local_receive_ts: int):
         self.stream_counters["markprice"]["received"] += 1
         instrument_key = self._binance_usdm_instrument_key(data.get("s"), stream_name="markprice")
         if instrument_key is None:
@@ -709,6 +709,16 @@ class CollectorApp:
             self.stream_counters["markprice"]["empty_features"] += 1
             logger.warning("Feature extraction returned empty", stream="markprice", raw_stream=stream, keys=sorted(data.keys()))
             return
+        # P0-6: "timestamp" from compute_markprice_features is a fresh
+        # time.time() call taken when this handler runs -- processing time,
+        # not the collector's actual receive time. Before this fix,
+        # "local_timestamp" silently duplicated that same processing-time
+        # value, so no genuine availability clock existed for markprice at
+        # all. local_receive_ts is the frame's real receive time, captured
+        # once at handle_message's entry (the same clock raw_capture uses),
+        # so it is stamped here exactly as the orderbook/trades adapter
+        # paths already do for their own local_timestamp.
+        features["local_timestamp"] = local_receive_ts
         features["instrument_key"] = instrument_key
         self.stream_counters["markprice"]["computed"] += 1
         valid, reason = self.validator.validate_markprice(features)

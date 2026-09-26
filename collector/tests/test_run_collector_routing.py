@@ -131,6 +131,30 @@ async def test_diff_depth_is_processed_from_local_book_with_received_timestamp()
 
 
 @pytest.mark.asyncio
+async def test_markprice_local_timestamp_is_receive_time_not_processing_time():
+    """P0-6: markprice's ``local_timestamp`` must be the frame's actual
+    receive time (captured once at ``handle_message`` entry), never a
+    fresh ``time.time()`` call taken later inside the handler. Before the
+    fix, ``local_timestamp`` silently duplicated ``timestamp`` (processing
+    time), so the research assembler had no genuine availability clock for
+    markprice at all -- this is the mutation this test must catch."""
+    app = _seed_bridged_book(_app_without_init())
+    receive_ts = 987_654
+    before_call = int(time.time() * 1000)
+    await app.handle_message(
+        {"stream": "btcusdt@markprice@1s", "data": _valid_mark_msg()}, local_receive_ts=receive_ts,
+    )
+    record = app.mark_writer.write.call_args.args[0]
+    assert record["local_timestamp"] == receive_ts
+    # "timestamp" (processing time) is a real, independent wall-clock read
+    # taken inside compute_markprice_features -- it must not be forced to
+    # equal receive_ts, and (this being a live, later clock read) must be
+    # at or after the moment receive_ts was captured for this test.
+    assert record["timestamp"] >= before_call
+    assert record["local_timestamp"] != record["timestamp"]
+
+
+@pytest.mark.asyncio
 async def test_startup_verification_uses_cumulative_received_counters(monkeypatch):
     app = _app_without_init()
     app.stream_counters["orderbook"]["received"] = 533
@@ -160,7 +184,7 @@ def test_handlers_use_exchange_timestamp_for_gap_detection(monkeypatch):
     monkeypatch.setattr(_run_collector, "compute_markprice_features", lambda _: markprice_features)
     app._handle_trades({}, "btcusdt@aggtrade")
     app._handle_orderbook({}, "btcusdt@depth10@100ms")
-    app._handle_markprice({}, "btcusdt@markprice@1s")
+    app._handle_markprice({}, "btcusdt@markprice@1s", 11_000)
     app.gap_detector.check_gap.assert_any_call("trades", 1_200)
     app.gap_detector.check_gap.assert_any_call("orderbook", 1_300)
     app.gap_detector.check_gap.assert_any_call("markprice", 1_400)
