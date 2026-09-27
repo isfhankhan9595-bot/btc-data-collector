@@ -16,6 +16,8 @@ from collector.collector.config import (
     OPENINTEREST_SCHEMA,
     LIQUIDATION_SCHEMA,
     QUALITY_EVENTS_SCHEMA,
+    QUALITY_SEGMENT_ROWS,
+    QUALITY_SEGMENT_SECONDS,
     BINANCE_ORDERBOOK_RAW_SCHEMA,
     BINANCE_TRADES_RAW_SCHEMA,
     RAW_REST_SCHEMA,
@@ -87,7 +89,9 @@ class CollectorApp:
         self._quality_task = None
         self._quality_overflow = 0
 
-        self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, segment_rows=1, segment_seconds=1)
+        self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA,
+                                            segment_rows=QUALITY_SEGMENT_ROWS,
+                                            segment_seconds=QUALITY_SEGMENT_SECONDS)
         self._quality_journal_path = self.quality_writer.stream_dir / "quality_queue.pending.json"
         if self._quality_journal_path.exists():
             self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,

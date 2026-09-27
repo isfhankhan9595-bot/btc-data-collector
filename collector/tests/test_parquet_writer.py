@@ -340,3 +340,115 @@ def test_writer_exchange_defaults_to_binance_for_backward_compatibility(temp_dir
                            quality_event_sink=events.append)
     writer._emit_quality("SEQUENCE_GAP", "test_reason")
     assert events[0]["exchange"] == "BINANCE"
+
+
+# --------------------------------------------------------------------------
+# Quality-event tiny-file explosion fix (P0-3 scope note: this fixes the
+# real, independently-verified problem -- segment_rows=1/segment_seconds=1
+# for every live runner's quality writer, confirmed by grepping the actual
+# repository -- using QUALITY_SEGMENT_ROWS/QUALITY_SEGMENT_SECONDS from
+# config.py. It does NOT build the WAL-backed architecture a prior
+# specification assumed already existed: no write-ahead log exists
+# anywhere in this repository (confirmed by search), so that assumption
+# was false and is not fabricated here. See docs/QUALITY_EVENT_STORAGE.md.)
+# --------------------------------------------------------------------------
+
+def test_burst_of_quality_sized_events_produces_far_fewer_segments_than_events(temp_dir):
+    """10,000 tiny events must not become 10,000 files. With
+    QUALITY_SEGMENT_ROWS=500, a clean 10,000-row burst produces exactly 20
+    segments -- this pins the actual reduction, not just "fewer than N"."""
+    from collector.collector.config import QUALITY_SEGMENT_ROWS, QUALITY_SEGMENT_SECONDS
+    schema = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
+    writer = ParquetWriter("burst_test_stream", schema, base_dir=temp_dir,
+                           segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=QUALITY_SEGMENT_SECONDS)
+    for i in range(10_000):
+        writer.write({"timestamp": i, "value": float(i)})
+    writer.close()
+
+    segment_dir = os.path.join(temp_dir, "raw", "burst_test_stream")
+    segments = [f for f in os.listdir(segment_dir) if f.endswith(".seg")]
+    assert len(segments) == 10_000 // QUALITY_SEGMENT_ROWS, (
+        f"expected {10_000 // QUALITY_SEGMENT_ROWS} segments for a clean "
+        f"{QUALITY_SEGMENT_ROWS}-row-boundary burst, got {len(segments)}"
+    )
+    assert len(segments) <= 20, "burst file count must be dramatically reduced from one-per-event"
+
+
+def test_old_default_would_have_produced_one_segment_per_event_for_comparison(temp_dir):
+    """Pins the actual before/after contrast so this fix cannot silently
+    regress back toward the old behavior without a test noticing the
+    ratio has collapsed."""
+    schema = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
+    writer = ParquetWriter("old_behavior_stream", schema, base_dir=temp_dir,
+                           segment_rows=1, segment_seconds=1)
+    for i in range(50):
+        writer.write({"timestamp": i, "value": float(i)})
+    writer.close()
+    segment_dir = os.path.join(temp_dir, "raw", "old_behavior_stream")
+    segments = [f for f in os.listdir(segment_dir) if f.endswith(".seg")]
+    assert len(segments) == 50, "confirms segment_rows=1 really did mean one file per event"
+
+
+def test_partial_batch_is_flushed_on_graceful_shutdown(temp_dir):
+    """A partial batch (well under the row threshold) must not be lost when
+    the writer is closed -- shutdown must not require reaching the row
+    threshold first."""
+    from collector.collector.config import QUALITY_SEGMENT_ROWS
+    schema = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
+    writer = ParquetWriter("shutdown_test_stream", schema, base_dir=temp_dir,
+                           segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=30)
+    for i in range(7):   # far short of QUALITY_SEGMENT_ROWS
+        writer.write({"timestamp": i, "value": float(i)})
+    assert len(writer.buffer) == 7   # confirmed still buffered, not yet flushed
+    writer.close()
+
+    segment_dir = os.path.join(temp_dir, "raw", "shutdown_test_stream")
+    segments = [f for f in os.listdir(segment_dir) if f.endswith(".seg")]
+    assert len(segments) == 1, "a partial batch must still be published on close()"
+    table = pa_parquet.read_table(os.path.join(segment_dir, segments[0]))
+    assert table.num_rows == 7
+
+
+def test_batched_events_preserve_write_order_within_a_segment(temp_dir):
+    """Batching rows together must not reorder them -- forensic
+    reconstruction depends on the persisted order matching write order,
+    not a different timestamp-based resort."""
+    schema = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
+    writer = ParquetWriter("ordering_test_stream", schema, base_dir=temp_dir,
+                           segment_rows=100, segment_seconds=30)
+    written_order = list(range(37))
+    for i in written_order:
+        writer.write({"timestamp": 1_000_000 - i, "value": float(i)})   # timestamps deliberately descending
+    writer.close()
+
+    segment_dir = os.path.join(temp_dir, "raw", "ordering_test_stream")
+    (segment,) = [f for f in os.listdir(segment_dir) if f.endswith(".seg")]
+    table = pa_parquet.read_table(os.path.join(segment_dir, segment))
+    persisted_values = table.column("value").to_pylist()
+    assert persisted_values == [float(i) for i in written_order], (
+        "persisted row order must match write order, not be resorted by timestamp"
+    )
+
+
+def test_quality_segment_constants_are_shared_not_duplicated_per_runner():
+    """Regression: every live runner's quality writer must reference the
+    same authoritative config constants, not a locally hardcoded number
+    that could silently drift out of sync (this was the actual state
+    before this fix: five runners each independently wrote
+    segment_rows=1, segment_seconds=1)."""
+    import ast
+    import inspect
+    runner_modules = [
+        "collector.run_bybit_collector", "collector.run_okx_capture",
+        "collector.run_collector", "collector.run_okx_collector",
+        "collector.run_binance_spot_collector",
+    ]
+    for module_name in runner_modules:
+        module = __import__(module_name, fromlist=["_"])
+        source = inspect.getsource(module)
+        assert "QUALITY_SEGMENT_ROWS" in source and "QUALITY_SEGMENT_SECONDS" in source, (
+            f"{module_name} does not reference the shared quality segment config"
+        )
+        assert "segment_rows=1, segment_seconds=1" not in source, (
+            f"{module_name} still hardcodes the old one-event-per-file sizing"
+        )

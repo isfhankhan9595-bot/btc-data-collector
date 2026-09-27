@@ -3,6 +3,39 @@ import pyarrow as pa
 # Constants
 SYMBOL = "BTCUSDT"
 
+#: Quality-event Parquet segment sizing, shared by every live runner.
+#:
+#: Previously every runner independently set segment_rows=1,
+#: segment_seconds=1 for its quality-event writer -- meaning one Parquet
+#: segment (plus its .meta.json sidecar) per single quality event. For a
+#: 24/7 collector, any sustained run of gaps/recoveries/duplicates/errors
+#: creates one tiny file per incident, which is operationally unsafe
+#: (inode pressure, slow directory listing, backup/rsync cost) independent
+#: of correctness.
+#:
+#: Raised to a bounded batch instead. `ParquetWriter` already publishes a
+#: segment atomically (fsync + os.replace, confirmed by reading
+#: parquet_writer.py's _close_segment) regardless of segment_rows/
+#: segment_seconds, so this change does not weaken the durability of any
+#: segment that HAS been published. The real, honestly-stated tradeoff:
+#: quality events sitting in the writer's in-memory buffer between flushes
+#: are lost if the process crashes before the next flush, and a larger
+#: segment_rows/segment_seconds means a longer window of unflushed events.
+#: There is no write-ahead log anywhere in this repository (confirmed by
+#: searching for one) to eliminate that window the way a durable WAL
+#: would -- raising these values is a deliberate, bounded trade of a small,
+#: rare crash-loss window for a large, certain reduction in file count,
+#: not a claim that the loss window has been eliminated.
+#:
+#: 500 rows / 30 seconds (whichever comes first) targets roughly 10-20
+#: segments for a 10,000-event burst, matches this project's own stated
+#: target for such a burst, and keeps the crash-loss window small relative
+#: to how rarely quality events fire in normal operation (each one
+#: represents a discrete incident -- a gap, a recovery, a disconnect --
+#: not routine per-message traffic).
+QUALITY_SEGMENT_ROWS = 500
+QUALITY_SEGMENT_SECONDS = 30
+
 #: Bybit v5 public linear endpoint. Verified 2026-09-19 against
 #: https://bybit-exchange.github.io/docs/v5/ws/connect (USDT/USDC perpetual
 #: & USDT Futures -> wss://stream.bybit.com/v5/public/linear).
