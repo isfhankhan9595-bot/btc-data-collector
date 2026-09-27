@@ -298,3 +298,75 @@ Also verified and narrowly documented, not fixed (no defect found):
 `compileall` clean, `git diff --check` clean. Scope unchanged: exactly
 `dedup_evidence_analysis.py` and its test file -- no production dedup,
 routing for any P0 task, replay, CVD, or orderbook code touched.
+
+## Hostile-audit fixes: real-data timestamp types, discarded adapter classifications, tied-timestamp reconnect direction (rebase + final-audit session)
+
+Rebased onto current `main` (`2edeb727...`, includes merged PR #58/P0-5, which
+does not touch this PR's files) using `--rebase-merges` again, for the same
+reason as before: a flat rebase replays individual commits and re-derives the
+already-reconciled merge from scratch. Recovered by restoring that merge
+commit's exact resolved content before continuing; all three prior fixes
+(unsupported-market routing, `InstrumentIdError` re-raise, asymmetric
+reconnect-marker contract) verified intact afterward.
+
+Four real, previously-undetected defects found this session:
+
+1. **Every real production row's timestamp would have been misclassified as
+   invalid.** `RAW_WIRE_SCHEMA` stores `local_receive_ts` as
+   `pa.timestamp("ms", tz="UTC")`, not an integer. The only production reader
+   (`ReplaySource.from_directory`) gets rows via
+   `pandas.read_parquet(path).to_dict("records")`, which returns a real
+   `pandas.Timestamp` for that column -- verified empirically, not assumed.
+   Every test before this session used a hand-built dict with a plain Python
+   `int`, so this was never exercised end-to-end. Fixed with an explicit
+   `_as_epoch_ms()` that recognizes `pandas.Timestamp` (via `.value` -- ns
+   since epoch, pandas' fixed internal unit -- floor-divided to ms; `pandas.
+   NaT` checked via `pd.isna()` first, since `NaT.value` is the raw int64
+   sentinel `-9223372036854775808`, not a real instant), `datetime.datetime`
+   (the shape a `pyarrow.Table.to_pylist()` reader would give), and
+   `numpy.integer` (not a Python `int` by `isinstance`); `numpy.bool_` is
+   explicitly excluded (neither a Python `bool` nor `int` by `isinstance`).
+   Proven end-to-end with a real `ParquetWriter` write, a real
+   `pandas.read_parquet` read, then conversion -- not a synthetic dict.
+2. **The adapter's own specific `UnhandledReason` was discarded.** The
+   adapter's `normalize()` already distinguishes `NO_ROUTE`,
+   `CHANNEL_NOT_IMPLEMENTED`, `CONTROL_FRAME`, `EMPTY_DATA`, and an
+   internally-detected `MALFORMED_PAYLOAD` (via `self.unhandled()`, never a
+   raised exception) -- but the converter collapsed all of them into one
+   generic `UNROUTABLE_FRAME`. Since a fresh adapter is constructed per row,
+   `adapter.drain_unhandled()` after an empty `events` result can only
+   reflect this row's own message(s); used to build a specific
+   `UNHANDLED_<REASON>` label when unambiguous, falling back to the generic
+   label only if a row somehow produced several different reasons (no
+   current adapter does).
+3. **`reconnect_associated` could flip purely from an arbitrary tie-break.**
+   When two occurrences share one `local_receive_ts`, which one is "first"
+   vs "duplicate" is decided by `_sort_key`'s secondary fields (payload
+   hash, `connection_id`, ...) -- not real arrival evidence. `marker_
+   transition` is asymmetric (checks only the duplicate's own marker), so
+   swapping which tied record plays which role, driven by an unrelated field
+   like `connection_id`, could change `reconnect_associated` even though
+   nothing about real arrival changed. Suppressed to `False` whenever
+   `arrival_order_ambiguous` is true: with no real "before", there is no
+   direction for a transition to have occurred in.
+
+Also independently verified this session, no defect found:
+
+4. **Delay statistics are already correctly qualified.** `ObservedStatistic.
+   describe()` always renders `"... observed in this sample of N records"`
+   with `sample_size` attached; `None` means no data, never a fabricated
+   zero; `_percentile` is a documented, deterministic nearest-rank method.
+5. **Same-frame conflict provenance is sufficient without a new locator
+   field.** Two elements from one frame sharing an identity but differing in
+   price/quantity/side/exchange-timestamp are already distinguishable by
+   those very fields (already asserted surviving distinctly by the
+   same-frame-duplicate tests); when all of those agree too, the two
+   occurrences are economically identical, so no further position index
+   would add real information.
+
+15 new tests this session, each mutation-checked against the real fix (all
+caught: 4 for the timestamp-type recognition, 3 for the discarded
+classification, 1 for the tied-timestamp suppression, plus the earlier
+rebase-survival checks). Full suite: **1354 passed**. `compileall` and
+`git diff --check` clean. Scope unchanged: exactly `dedup_evidence_analysis.
+py`, its test file, and this design doc.

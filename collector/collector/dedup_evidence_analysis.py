@@ -227,16 +227,88 @@ def _sort_key(record: DedupEvidenceRecord, local_receive_ts: int) -> tuple:
     )
 
 
+def _as_epoch_ms(value: Any) -> Optional[int]:
+    """Recognize the shapes the real raw-wire read path actually produces.
+
+    Hostile-audit finding (this session): RAW_WIRE_SCHEMA stores
+    `local_receive_ts` as `pa.timestamp("ms", tz="UTC")`, not an integer.
+    `ReplaySource.from_directory` -- the only production reader -- gets rows
+    via `pandas.read_parquet(path).to_dict("records")`, which returns a real
+    `pandas.Timestamp` for that column, verified empirically:
+    `pd.read_parquet(...).to_dict("records")[0]["local_receive_ts"]` is a
+    `pandas.Timestamp`, never a plain `int`. Every existing test before this
+    session used hand-built dicts with a plain Python `int`, so this path
+    was never actually exercised end-to-end -- the tool would have
+    misclassified every real row's timestamp as invalid.
+
+    This function recognizes exactly the representations that are the SAME
+    already-recorded instant under a different type -- it converts, it does
+    not fabricate:
+    * `pandas.Timestamp` -- `.value` is nanoseconds since epoch (pandas'
+      fixed internal unit, independent of the column's stored resolution);
+      floor-divided to ms. A null Timestamp (`pandas.NaT`) is checked via
+      `pd.isna()` BEFORE reading `.value` -- `NaT.value` is the raw
+      `int64` sentinel `-9223372036854775808`, not a real instant, and must
+      never leak out as if it were one.
+    * `datetime.datetime` -- the shape a `pyarrow.Table.to_pylist()` reader
+      (used elsewhere in this repo) would give for the same column;
+      converted via `.timestamp()`, UTC-assumed if naive (matching the
+      schema's declared `tz="UTC"`).
+    * `numpy.integer` (e.g. `numpy.int64`) -- not a Python `int` by
+      `isinstance`, but a genuine, already-valid epoch-ms value; converted
+      via `int()`. `numpy.bool_` is explicitly excluded first: it is
+      neither a Python `bool` nor a Python `int` by `isinstance`, so it
+      would otherwise slip past both existing guards silently.
+
+    Returns `None` (never a fabricated value) for anything not recognized
+    as a genuine instant, including a null Timestamp/None.
+    """
+    if isinstance(value, bool) or type(value).__name__ == "bool_":
+        return None
+    try:
+        import pandas as pd
+        # pd.isna() first, unconditionally: pandas.NaT duck-types as both a
+        # Timestamp-like and a datetime-like object (calling .timestamp() on
+        # it raises ValueError rather than behaving like a real instant), so
+        # it must be recognized as null before either specific branch below
+        # is tried, not routed into one of them and left to fail loudly.
+        if isinstance(value, pd.Timestamp) or type(value).__name__ == "NaTType":
+            return None if pd.isna(value) else value.value // 1_000_000
+    except ImportError:  # pragma: no cover - pandas is a repository dependency
+        pass
+    import datetime as _dt
+    if isinstance(value, _dt.datetime):
+        return int(value.timestamp() * 1000)
+    if isinstance(value, int):
+        return value
+    try:
+        import numpy as np
+        if isinstance(value, np.integer):
+            return int(value)
+    except ImportError:  # pragma: no cover - numpy is a repository dependency
+        pass
+    return None
+
+
 def _valid_local_receive_ts(value: Any) -> tuple[Optional[int], Optional[str]]:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or type(value).__name__ == "bool_":
         return None, "INVALID_LOCAL_RECEIVE_TS_BOOL"
     if value is None:
         return None, "INVALID_LOCAL_RECEIVE_TS_NONE"
-    if not isinstance(value, int):
+    epoch_ms = _as_epoch_ms(value)
+    if epoch_ms is None:
+        # Distinguish a null-valued recognized type (NaT / a null datetime)
+        # from a genuinely unrecognized shape, for a more useful reason code.
+        try:
+            import pandas as pd
+            if isinstance(value, pd.Timestamp) or type(value).__name__ == "NaTType":
+                return None, "INVALID_LOCAL_RECEIVE_TS_NONE"
+        except ImportError:  # pragma: no cover
+            pass
         return None, "INVALID_LOCAL_RECEIVE_TS_NON_INT"
-    if value < 0:
+    if epoch_ms < 0:
         return None, "INVALID_LOCAL_RECEIVE_TS_NEGATIVE"
-    return value, None
+    return epoch_ms, None
 
 
 def _duplicate_classification(first: DedupEvidenceRecord, duplicate: DedupEvidenceRecord) -> tuple[str, tuple[str, ...]]:
@@ -435,7 +507,8 @@ def convert_raw_wire_to_dedup_evidence(
             invalid_records.append(RawTradeEvidenceIssue("UNSUPPORTED_VENUE_OR_MARKET_TYPE", locator))
             continue
 
-        adapter_local_receive_ts = local_receive_ts if isinstance(local_receive_ts, int) and not isinstance(local_receive_ts, bool) else 0
+        _epoch_ms_for_parser = _as_epoch_ms(local_receive_ts)
+        adapter_local_receive_ts = _epoch_ms_for_parser if _epoch_ms_for_parser is not None and _epoch_ms_for_parser >= 0 else 0
         # `adapter_local_receive_ts` exists ONLY to satisfy the parser's
         # positional requirement when the raw row's own value is invalid
         # (None/bool/string/negative) -- it is never read back out. The
@@ -467,13 +540,37 @@ def convert_raw_wire_to_dedup_evidence(
             invalid_records.append(RawTradeEvidenceIssue("MALFORMED_PAYLOAD", locator))
             continue
         if not events:
-            invalid_records.append(RawTradeEvidenceIssue("UNROUTABLE_FRAME", locator))
+            # Hostile-audit finding (this session): a fresh adapter is
+            # constructed per row above, so drain_unhandled() here can only
+            # contain THIS row's own unhandled message(s) -- never a stale
+            # entry from a previous row. The adapter's own parser already
+            # distinguishes NO_ROUTE, CHANNEL_NOT_IMPLEMENTED, CONTROL_FRAME,
+            # EMPTY_DATA and an internally-detected MALFORMED_PAYLOAD (via
+            # self.unhandled(), not a raised exception) -- collapsing all of
+            # them into one generic UNROUTABLE_FRAME discarded exactly the
+            # specificity the adapter had already computed. Used only when
+            # every unhandled entry this row produced agrees on one reason;
+            # a row that somehow produced several different reasons (no
+            # adapter today does this in one call) keeps the safe generic
+            # label rather than guessing which one is representative.
+            reasons = {message.reason for message in adapter.drain_unhandled()}
+            if len(reasons) == 1:
+                invalid_records.append(RawTradeEvidenceIssue(f"UNHANDLED_{next(iter(reasons)).name}", locator))
+            else:
+                invalid_records.append(RawTradeEvidenceIssue("UNROUTABLE_FRAME", locator))
             continue
         trade_events = [event for event in events if isinstance(event, CanonicalTradeEvent)]
         if not trade_events:
             invalid_records.append(RawTradeEvidenceIssue("NON_TRADE_FRAME", locator))
             continue
 
+        # Stored on the record as its recognized epoch-ms int when the raw
+        # value is a genuine instant under a different type (pandas.Timestamp
+        # / datetime / numpy int -- see _as_epoch_ms); otherwise the exact
+        # original raw value is kept, so an invalid value's own shape stays
+        # inspectable rather than being replaced by a placeholder.
+        _recognized_receive_ts = _as_epoch_ms(local_receive_ts)
+        _stored_receive_ts = _recognized_receive_ts if _recognized_receive_ts is not None else local_receive_ts
         for event in trade_events:
             records.append(
                 DedupEvidenceRecord(
@@ -483,7 +580,7 @@ def convert_raw_wire_to_dedup_evidence(
                     stream=event.stream,
                     trade_id=event.trade_id,
                     exchange_event_ts=event.exchange_event_ts,
-                    local_receive_ts=local_receive_ts,
+                    local_receive_ts=_stored_receive_ts,
                     local_processing_ts=row.get("local_processing_ts", event.local_process_ts),
                     connection_id=row.get("connection_id"),
                     reconnect_marker=row.get("reconnect_marker"),
@@ -614,6 +711,19 @@ def analyze_dedup_evidence(records: list) -> DedupEvidenceReport:
             reconnect_associated = (
                 marker_transition or generation_transition
             )
+            # Hostile-audit finding (this session): when the two occurrences
+            # tie on local_receive_ts, WHICH of them is "first" vs
+            # "duplicate" is an artifact of _sort_key's arbitrary secondary
+            # fields (payload hash, connection_id, ...), not real arrival
+            # evidence. marker_transition is NOT symmetric in first/dup
+            # (only dup.reconnect_marker is checked), so reconnect_associated
+            # could flip depending on that arbitrary tie-break alone --
+            # exactly the invented directional claim arrival_order_ambiguous
+            # exists to warn against. Suppressed whenever ambiguous: with no
+            # real "before", there is no direction for a marker/generation
+            # transition to have occurred IN.
+            if dup_receive_ts == first_receive_ts:
+                reconnect_associated = False
             duplicates.append(DuplicateDelayReport(
                 identity=identity,
                 first_local_receive_ts=first_receive_ts,

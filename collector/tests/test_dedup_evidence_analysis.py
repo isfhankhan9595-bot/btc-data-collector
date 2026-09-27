@@ -23,6 +23,7 @@ from collector.collector.dedup_evidence_analysis import (
     convert_raw_wire_to_dedup_evidence,
 )
 from collector.collector.dedup_evidence_analysis import _payload_sha256 as _payload_sha256_for_test
+from collector.collector.dedup_evidence_analysis import _as_epoch_ms as _as_epoch_ms_for_test
 
 
 def _rec(exchange, market_type, stream, trade_id, local_receive_ts, *,
@@ -229,6 +230,26 @@ def test_duplicate_on_the_same_connection_is_not_flagged_associated():
     assert report.duplicates[0].reconnect_associated is False
 
 
+def test_tied_timestamp_reconnect_association_is_suppressed_not_direction_dependent():
+    """Real defect (this session): marker_transition only checks dup's own
+    marker (asymmetric), and which of two tied-timestamp records becomes
+    "first" vs "duplicate" is an artifact of _sort_key's arbitrary secondary
+    fields (payload hash, connection_id) -- not real arrival order. Two
+    records differing ONLY in an arbitrary tie-break field (connection_id)
+    would otherwise flip reconnect_associated purely from that swap."""
+    # "aaa" always sorts before "zzz" regardless of input-list order (the
+    # deterministic tie-break is by field value, not position) -- so the
+    # marker that would trigger marker_transition=True must sit on the
+    # "zzz" (second-sorting, i.e. "duplicate") record for this test to
+    # actually distinguish "suppressed" from "not suppressed".
+    a = _rec("BINANCE", "linear_perpetual", "trades", "1", 1000, connection_id="aaa", reconnect_marker=None)
+    b = _rec("BINANCE", "linear_perpetual", "trades", "1", 1000, connection_id="zzz", reconnect_marker="X")
+    for pair in ([a, b], [b, a]):
+        report = analyze_dedup_evidence(pair)
+        assert report.duplicates[0].arrival_order_ambiguous is True
+        assert report.duplicates[0].reconnect_associated is False
+
+
 def test_first_marker_absent_duplicate_marker_present_is_flagged_associated():
     """Doc/code reconciliation (this session): section E's documented
     contract is asymmetric -- present-on-duplicate + absent-or-different-on-
@@ -416,6 +437,79 @@ def test_payload_hash_is_sensitive_to_exact_bytes_not_semantic_json_equality():
     # identical bytes -> identical hash (the other half of the contract)
     assert _payload_sha256_for_test(compact) == _payload_sha256_for_test(compact)
     assert _payload_sha256_for_test(compact) != _payload_sha256_for_test(reformatted)
+
+
+def test_real_parquet_round_trip_local_receive_ts_is_recognized_not_misclassified(tmp_path):
+    """The single most important test in this audit. RAW_WIRE_SCHEMA stores
+    local_receive_ts as pa.timestamp("ms", tz="UTC"), not an integer.
+    ReplaySource.from_directory -- the ONLY production reader -- gets rows
+    via pandas.read_parquet(path).to_dict("records"), which returns a real
+    pandas.Timestamp for that column (verified empirically). Every test
+    before this session used hand-built dicts with a plain int, so this
+    was never exercised end-to-end: against real recorded data, every row's
+    timestamp would have been misclassified as invalid."""
+    import pandas as pd
+    from collector.collector.parquet_writer import ParquetWriter
+    from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawWireRecord
+    from collector.collector.storage_layout import iter_segments, venue_stream
+
+    payload = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":1000,"a":9,"p":"100","q":"0.1","m":false}}'
+    writer = ParquetWriter(venue_stream("BINANCE", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=str(tmp_path),
+                          exchange="BINANCE", segment_rows=1000, segment_seconds=3600)
+    writer.write(RawWireRecord(local_receive_ts=1000, payload=payload, venue="BINANCE",
+                               market_type="linear_perpetual", connection_id="c1").to_row())
+    writer.close()
+
+    (segment,) = list(iter_segments(tmp_path, venue_stream("BINANCE", "raw_wire")))
+    real_rows = pd.read_parquet(segment).to_dict("records")   # exactly ReplaySource.from_directory's own read
+    assert isinstance(real_rows[0]["local_receive_ts"], pd.Timestamp), \
+        "fixture assumption broke: the real schema no longer stores a Timestamp type"
+
+    conversion = convert_raw_wire_to_dedup_evidence(real_rows)
+    assert len(conversion.invalid_records) == 0, conversion.invalid_records
+    assert len(conversion.records) == 1
+    assert conversion.records[0].local_receive_ts == 1000
+    assert isinstance(conversion.records[0].local_receive_ts, int)
+
+    report = analyze_dedup_evidence(conversion.records)
+    assert report.invalid_local_receive_ts_count == 0
+
+
+def test_pandas_timestamp_value_is_recognized_and_converted_to_epoch_ms():
+    import pandas as pd
+    ts = pd.Timestamp(1_780_000_000_000, unit="ms", tz="UTC")
+    assert _as_epoch_ms_for_test(ts) == 1_780_000_000_000
+
+
+def test_pandas_nat_is_invalid_not_its_raw_int64_sentinel():
+    """pandas.NaT.value is the raw int64 sentinel -9223372036854775808 -- a
+    real, callable attribute that must NEVER leak out as if it were an
+    actual instant. Checked via pd.isna() before .value is ever read."""
+    import pandas as pd
+    assert _as_epoch_ms_for_test(pd.NaT) is None
+    record = _rec("BINANCE", "linear_perpetual", "trades", "1", pd.NaT)
+    report = analyze_dedup_evidence([record])
+    assert report.invalid_local_receive_ts_count == 1
+    assert record.local_receive_ts is pd.NaT   # original shape preserved for invalid evidence
+
+
+def test_python_datetime_is_recognized_the_shape_a_pyarrow_to_pylist_reader_would_give():
+    import datetime
+    dt = datetime.datetime(2026, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+    assert _as_epoch_ms_for_test(dt) == int(dt.timestamp() * 1000)
+
+
+def test_numpy_int64_is_recognized_as_a_valid_epoch_ms_value():
+    import numpy as np
+    assert _as_epoch_ms_for_test(np.int64(1000)) == 1000
+
+
+def test_numpy_bool_is_invalid_it_is_neither_python_bool_nor_python_int():
+    import numpy as np
+    assert _as_epoch_ms_for_test(np.bool_(True)) is None
+    record = _rec("BINANCE", "linear_perpetual", "trades", "1", np.bool_(True))
+    report = analyze_dedup_evidence([record])
+    assert report.invalid_local_receive_ts_count == 1
 
 
 def test_timestamp_fallback_recovers_receive_time_for_a_row_lacking_the_key():
@@ -985,6 +1079,42 @@ def test_bybit_and_okx_reject_a_market_type_other_than_linear_perpetual():
               "connection_id": "c1", "local_receive_ts": 1000, "payload": "{}"}
         conversion = convert_raw_wire_to_dedup_evidence([row])
         assert conversion.invalid_records[0].reason == "UNSUPPORTED_VENUE_OR_MARKET_TYPE", venue
+
+
+def test_a_control_frame_keeps_its_adapters_own_specific_classification():
+    """Real defect (this session): the adapter's normalize() already calls
+    self.unhandled(CONTROL_FRAME, ...) for a subscribe-ack-shaped message,
+    but the converter discarded that and always said UNROUTABLE_FRAME.
+    A fresh adapter is constructed per row, so drain_unhandled() here can
+    only reflect this one row."""
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@aggTrade",
+          "connection_id": "c1", "local_receive_ts": 1000,
+          "payload": json.dumps({"result": None, "id": 1})}   # a subscribe-ack control frame
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert conversion.invalid_records[0].reason == "UNHANDLED_CONTROL_FRAME"
+
+
+def test_a_genuinely_unroutable_channel_still_gets_its_own_specific_no_route_label():
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@unknownChannel",
+          "connection_id": "c1", "local_receive_ts": 1000,
+          "payload": json.dumps({"stream": "btcusdt@unknownChannel", "data": {"e": "somethingElse"}})}
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert conversion.invalid_records[0].reason == "UNHANDLED_NO_ROUTE"
+
+
+def test_adapter_detected_malformed_payload_via_unhandled_is_distinct_from_a_json_parse_failure():
+    """Two different mechanisms both end up here: MALFORMED_JSON (json.loads
+    itself raised) vs. an adapter that parsed valid JSON but found the
+    payload structurally unusable and called self.unhandled(MALFORMED_PAYLOAD).
+    Losing this distinction was exactly the specificity this fix restores."""
+    row = {"venue": "BINANCE", "market_type": "linear_perpetual", "stream": "btcusdt@bookTicker",
+          "connection_id": "c1", "local_receive_ts": 1000,
+          # "bookTicker" matches no route token and no "e" value, and "data" is
+          # empty, so this falls through to the adapter's own graceful
+          # self.unhandled(MALFORMED_PAYLOAD) -- never raises.
+          "payload": json.dumps({"stream": "btcusdt@bookTicker", "data": {}})}
+    conversion = convert_raw_wire_to_dedup_evidence([row])
+    assert conversion.invalid_records[0].reason == "UNHANDLED_MALFORMED_PAYLOAD"
 
 
 def test_dedup_bypass_unavailable_error_is_never_swallowed_by_the_converter():
