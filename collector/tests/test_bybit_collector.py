@@ -45,9 +45,18 @@ class _FakeSocket:
 
 
 def _drive(app, frames):
-    """Run frames through the real WebSocketClient._consume() coroutine."""
+    """Run frames through the real WebSocketClient._consume() coroutine,
+    then drain the processing worker -- P0-1 split _consume (receive-only)
+    from _process_queue (decode/raw-capture/on_message); tests exercising
+    the pipeline end-to-end now need both halves, not just the receive
+    half, to see the same effects they did before the split."""
     app.client.running = True
-    asyncio.run(app.client._consume(_FakeSocket(frames)))
+
+    async def _run():
+        await app.client._consume(_FakeSocket(frames))
+        app.client.running = False
+        await app.client._process_queue()
+    asyncio.run(_run())
 
 
 def test_topics_use_configured_depth_and_all_four_declared_channels():
