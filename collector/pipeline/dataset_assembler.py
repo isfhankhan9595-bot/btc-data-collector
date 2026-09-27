@@ -61,11 +61,14 @@ aligned with the exact same rule as every other stream: their own
   with a staleness tolerance), and a missing/stale reading is represented as
   NaN plus ``openinterest_gap`` -- NEVER as ``open_interest = 0``. A poll
   failure or an OI value of zero are not interchangeable, and this module
-  never invents the latter to paper over the former. Per the documented
-  scope in ``docs/REPLAY.md``/``docs/DATA_SUFFICIENCY.md``, Binance OI is a
-  REST poll and is **not currently replayable**; this module only aligns
-  whatever OI segments were actually collected (live), and does not attempt
-  to reconstruct OI from replay.
+  never invents the latter to paper over the former. Binance OI IS
+  replayable at the canonical-event layer (``replay.py``'s
+  ``FrameKind.REST_OI`` / ``_handle_rest_oi`` route a recorded response
+  through the same ``normalize_binance_oi()`` live uses -- see
+  ``docs/REPLAY.md``), but nothing currently writes replayed OI back into
+  the flattened ``OPENINTEREST_SCHEMA`` parquet this module reads, so in
+  practice this module only aligns whatever OI segments were actually
+  collected live.
 * Liquidations are sparse, irregular events. They are aggregated per grid
   bin the same way trades are (count/volumes/notional, keyed on the
   availability clock, never fabricated for a bin with no events) -- see
@@ -236,13 +239,14 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_liq = _prepare_stream_frame(pd.concat(liq_dfs).reset_index(drop=True), "liq")
         # Liquidations have no venue-assigned unique event id (unlike
         # trades' trade_id in TRADES_SCHEMA) -- forceOrder gives no such
-        # field. A conservative, evidence-only dedup: two rows sharing the
-        # exact (exchange_timestamp, side, price, quantity) tuple are
-        # treated as one WS-redelivered event, never summed twice. This is
-        # not a guarantee against two genuinely distinct liquidations
-        # coincidentally sharing all four fields at millisecond
-        # granularity (vanishingly unlikely, not impossible) -- documented
-        # in docs/RESEARCH_DATASET_TIME_CONTRACT.md.
+        # field, and nothing in this repository establishes that this
+        # tuple is guaranteed unique. This is a heuristic, not exact
+        # deduplication: two rows sharing the exact
+        # (exchange_timestamp, side, price, quantity) tuple are treated as
+        # one WS-redelivered event and never summed twice, but two
+        # genuinely distinct liquidations that happen to share all four
+        # fields would be incorrectly collapsed into one. See
+        # docs/RESEARCH_DATASET_TIME_CONTRACT.md for the full tradeoff.
         before = len(df_liq)
         df_liq = df_liq.drop_duplicates(subset=["liq_exchange_ts", "side", "price", "quantity"], keep="first")
         if len(df_liq) < before:

@@ -1607,12 +1607,12 @@ write path was confirmed already correct (`_poll_openinterest` already uses
   streams the assembler now reads, as defense-in-depth instrument/venue
   isolation behind the existing write-time validation.
 - Added liquidation dedup on `(exchange_timestamp, side, price, quantity)` —
-  liquidations, unlike trades, carry no venue-assigned unique event id.
+  a heuristic, not exact deduplication (no venue-assigned unique event id
+  exists for liquidations; see reconciliation note below).
 - Confirmed no unit conversion is needed or performed for OI (Binance's
   native contract units pass through unchanged).
-- Confirmed Binance OI is deliberately not replayable (documented in
-  `docs/REPLAY.md`/`docs/DATA_SUFFICIENCY.md`); did not attempt to change
-  this — out of scope.
+- ~~Confirmed Binance OI is deliberately not replayable~~ **[CORRECTED
+  below — this was wrong.]**
 - `run_collector.py`: `_handle_liquidation` now threads `local_receive_ts`
   through and stamps `local_timestamp` from it.
 
@@ -1654,3 +1654,54 @@ architectural choice, not a defect).
 Branch: `p0-7-oi-liquidation-research-dataset`. Base: `main` @
 `cd4a7031435267da255c7c036be79637d3ca12f9`. No PR opened (not requested).
 Nothing merged.
+
+### P0-7 reconciliation — corrected stale replay claim, tightened dedup wording
+
+A review of the P0-7 branch (before PR creation) caught a factual error in
+the original P0-7 report and docs above: **"Binance OI is not replayable" is
+false.** The claim was inherited from stale prose in `docs/REPLAY.md` /
+`docs/DATA_SUFFICIENCY.md` instead of being verified against current source.
+Actual repository state, verified directly:
+
+- `collector/collector/replay.py` has `FrameKind.REST_OI`;
+  `ReplaySource.from_records()` routes a recorded `purpose="open_interest"`
+  REST row into one, ordered by `response_receive_ts`; `ReplayEngine._handle_rest_oi()`
+  sends it through `binance_oi.normalize_binance_oi()` — the exact same
+  normalizer `run_collector.py`'s live poll loop calls — producing an
+  identical `CanonicalOIEvent`.
+- This is proven by `tests/test_binance_oi_replayability.py`, which already
+  existed in the repository (from an earlier "G2: live/replay identity
+  parity" phase, predating P0-5/P0-6/P0-7) and needed no new test:
+  `test_live_and_replay_produce_identical_canonical_events_from_the_same_body`
+  and `test_availability_is_the_response_receive_time_not_the_exchange_time`
+  directly prove shared-normalizer identity and receive-time (not
+  exchange-time) causal availability. Re-ran this file fresh: all tests pass.
+- What is still true, and is the accurate scope statement: replay produces
+  `CanonicalOIEvent` objects at the canonical layer (for consumers like
+  cross-exchange alignment); no pipeline stage exists that writes replayed
+  OI back into the flattened `OPENINTEREST_SCHEMA` parquet
+  `pipeline/dataset_assembler.py` reads. So P0-7's assembler still only
+  aligns OI segments actually collected live — that practical conclusion was
+  right, but "not replayable" as the stated reason was wrong.
+
+**Fixed:** `docs/REPLAY.md` (summary table + the "Not replayed: Binance open
+interest" paragraph + the "Known limitations" bullet — all corrected to
+state OI replay accurately), `docs/DATA_SUFFICIENCY.md` (two stale
+"OI: no" / "not replayable" cells corrected), `docs/RESEARCH_DATASET_TIME_CONTRACT.md`
+and `dataset_assembler.py`'s module docstring (both corrected with the
+precise replayable-but-not-reconstructed-into-this-schema distinction).
+
+**Liquidation dedup wording tightened** per review: the
+`(exchange_timestamp, side, price, quantity)` heuristic was already
+documented as non-exact, but the wording is now more explicit that this is
+**not proven identity** — no repository evidence establishes the exchange
+guarantees that tuple is unique, and two genuinely distinct liquidations
+sharing all four fields would be incorrectly collapsed. Removed the
+unsupported "vanishingly unlikely" characterization of collision
+probability (an unverified claim I had no evidence for). No fabricated ID
+introduced; no raw evidence discarded beyond this labeled, narrow risk.
+
+**No code behavior changed** — this was a documentation-accuracy pass only.
+Re-ran the full suite, targeted P0-7/P0-6/replay/OI tests, compileall, and
+`git diff --check` after these doc-only edits; all still pass/clean (see PR
+completion report for exact figures).
