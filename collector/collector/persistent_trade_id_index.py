@@ -84,6 +84,7 @@ module does not choose one on the caller's behalf.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import Iterable
 
@@ -150,6 +151,29 @@ class PersistentTradeIdIndex:
         except sqlite3.Error as exc:
             raise PersistentIndexError(f"failed to count entries in {self.path!r}: {exc}") from exc
 
+    def disk_size_bytes(self) -> int:
+        """The size of the underlying database file(s) on disk right now.
+
+        Exists so a caller can *observe* unbounded disk growth explicitly
+        (task's Issue #12: bounded RAM is not the same as bounded storage --
+        this component moves the growth from the Python heap to disk, it
+        does not remove it). This module does not cap or alert on this
+        value itself; see the design doc's "disk growth" section for why
+        capping it would require an eviction policy this project has
+        already ruled out as unproven, and for the operational monitoring
+        recommendation in its place."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error:
+            pass   # best-effort only; the size below is still meaningful without a checkpoint
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
+
     def close(self) -> None:
         self._conn.close()
 
@@ -162,16 +186,28 @@ class PersistentTradeIdIndex:
 
 def identity_key(exchange: str, market_type: str, instrument_key: str, stream: str, trade_id: str) -> str:
     """The exact, tested join format for the five-part identity tuple
-    production ``_dedupe_trades`` already keys on (adapters/base.py). Uses
-    a delimiter (``"\\x1f"``, ASCII unit separator) that cannot appear in
-    any of the five components as currently produced -- exchange names,
-    market_type constants, and stream names are fixed internal literals;
-    instrument_key is itself pipe-delimited (never contains \\x1f); trade_id
-    is a venue-native string (numeric or UUID-shaped for every currently
-    supported venue, never containing a control character) -- so no
-    delimiter-injection ambiguity is possible with real production values.
+    production ``_dedupe_trades`` already keys on (adapters/base.py).
+
+    Length-prefixed, not delimiter-joined: each component is encoded as
+    ``f"{len(part)}:{part}"`` and the five encodings concatenated. This is
+    a standard unambiguous framing (the same technique Bencode uses) --
+    reading length-prefixed segments greedily from the front can only
+    reconstruct the original partition, so two *different* five-tuples can
+    never produce the same string, regardless of what bytes any component
+    contains, including the digits-and-colon shape of another component's
+    own length prefix. This replaces an earlier version of this function
+    that joined components with ``"\\x1f"`` and argued informally that no
+    production value would ever contain that byte -- true for every value
+    observed so far, but not a structural guarantee for "all production
+    values" as this task's own audit required. No behavior in
+    `ExchangeAdapter._dedupe_trades` depends on this function's exact
+    output format (it is only ever used as an opaque SQLite key), so
+    changing the encoding here has no production-facing effect -- and
+    production does not currently call this function at all (see the
+    module docstring: not wired in).
     """
-    return "\x1f".join((exchange, market_type, instrument_key, stream, trade_id))
+    parts = (exchange, market_type, instrument_key, stream, trade_id)
+    return "".join(f"{len(part)}:{part}" for part in parts)
 
 
 class ReferenceExactSet:

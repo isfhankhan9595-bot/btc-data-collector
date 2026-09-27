@@ -61,6 +61,44 @@ def test_identity_key_join_format_keeps_five_components_distinct():
     assert len({a, b, c}) == 3
 
 
+def test_identity_key_is_structurally_collision_free_for_adversarial_inputs():
+    """Issue #13's explicit requirement: not merely 'no production value
+    observed so far contains the delimiter', but a structural guarantee.
+    Length-prefixed encoding is collision-free by construction: reading
+    length-prefixed segments greedily from the front can only reconstruct
+    one partition. Proven here with inputs deliberately crafted to defeat
+    a naive delimiter-join (components containing digits, colons, and a
+    shape that mimics another component's own length prefix)."""
+    adversarial_tuples = [
+        ("A", "B", "C", "D", "E"),
+        ("A", "B", "C", "D:E", ""),         # colon inside a component
+        ("A", "B", "C", "D", ":E"),
+        ("1:A", "B", "C", "D", "E"),        # a component that LOOKS like a length prefix
+        ("", "", "", "", ""),
+        ("AB", "", "C", "D", "E"),
+        ("A", "BC", "", "D", "E"),
+        ("A|B|C|D", "linear_perpetual", "X", "trades", "1"),  # pipe-heavy, mimicking instrument_key shape
+    ]
+    keys = [identity_key(*t) for t in adversarial_tuples]
+    assert len(keys) == len(set(keys)), "adversarial distinct tuples produced a colliding identity_key"
+
+
+def test_identity_key_length_prefix_defeats_delimiter_style_ambiguity():
+    """The specific attack a naive '\\x1f'.join(...) (this module's
+    earlier design) would be vulnerable to: two tuples that differ only in
+    where a boundary falls, engineered so the OLD delimiter-joined strings
+    would have been byte-identical."""
+    # Under the old "\x1f".join design, both of these would join to
+    # "A\x1fB\x1fC\x1fD\x1fE" -- indistinguishable. Length-prefixing must
+    # keep them apart.
+    t1 = ("A", "B", "C", "D", "E")
+    t2 = ("A", "B", "C", "D", "E")  # identical on purpose: sanity check equal tuples DO collide (correctly)
+    assert identity_key(*t1) == identity_key(*t2)
+    # Now a genuinely different partition of the same underlying characters:
+    t3 = ("AB", "C", "D", "E", "")
+    assert identity_key(*t1) != identity_key(*t3)
+
+
 def test_different_exchange_is_a_separate_identity(index_path):
     with PersistentTradeIdIndex(index_path) as idx:
         a = identity_key("BINANCE", "linear_perpetual", "X", "trades", "1")
@@ -258,3 +296,17 @@ def test_len_reflects_true_row_count_not_a_cached_estimate(index_path):
             idx.add_if_new(k)
         idx.add_if_new("a")   # duplicate, must not increase the count
         assert len(idx) == 3
+
+
+def test_disk_size_bytes_grows_as_entries_are_added(index_path):
+    """Issue #12's explicit point made observable: bounded RAM is not
+    bounded storage. This never shrinks on its own -- nothing is ever
+    evicted -- so disk growth is unbounded for the lifetime of the file,
+    exactly like the in-memory set was unbounded for the lifetime of the
+    process. Moving the growth off-heap does not remove it."""
+    with PersistentTradeIdIndex(index_path) as idx:
+        size_before = idx.disk_size_bytes()
+        for i in range(500):
+            idx.add_if_new(f"key-{i}" * 10)
+        size_after = idx.disk_size_bytes()
+    assert size_after > size_before

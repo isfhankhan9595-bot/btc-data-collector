@@ -193,7 +193,131 @@ reconstruction, all four live runners, PR #54's forensic tooling
 (inspected as supporting evidence only, not modified), AWS/deployment
 configuration (untouched, no live exchange connection made).
 
-## 11. Remaining limitations
+## 11. Crash-consistency analysis (this session's core finding)
+
+### The storage durability boundary, read directly from source
+
+`ParquetWriter.write()` only appends to an in-memory Python list
+(`self.buffer`). `flush()` moves buffered rows into the still-open,
+uncommitted `.tmp` Parquet writer and atomically persists a row-count
+sidecar (`fsync` + `os.replace`) — but **does not `fsync` the `.tmp`
+Parquet file itself**. The `.tmp` file only becomes crash-durable inside
+`_close_segment()`, which explicitly `fsync`s it before `os.replace`ing it
+to its final published name. A segment closes only every
+`segment_seconds` (default 30s) or `segment_rows` (default 5,000) — not
+per trade.
+
+`_recover_orphans()`, run on every `ParquetWriter` construction (i.e. on
+every restart), deletes any `*.seg.tmp` left over from a crash and emits
+an honest `DATA_DROP` quality event for however many rows it counted via
+the sidecar. **Verified empirically in this session, not just read from
+source**: a `ParquetWriter` was flushed (rows moved into the open
+writer) but never closed, then a fresh `ParquetWriter` was constructed
+for the same stream directory (simulating a restart) — the orphaned
+`.tmp` file was deleted and a `DATA_DROP` (`rows_lost=1`) was emitted, as
+predicted.
+
+`RawCapture` (`raw_capture.py`) is built on the exact same `ParquetWriter`
+abstraction, so raw wire evidence has the identical ~30s/5,000-row
+durability lag and the identical crash-discard behavior. **This means
+Invariant E ("raw wire evidence must remain intact even when canonical
+dedup suppresses an event") is only true up to this same boundary** — a
+crash inside the buffering window loses both raw and canonical evidence
+for that window symmetrically, which is the *existing*, already-accepted
+contract of this storage layer, not something P0-4 introduces or can fix.
+
+### Why this changes the crash-ordering analysis
+
+The task's own framing (§6, options A and B) implicitly assumes "canonical
+trade write" is a single, synchronously-observable durable event that a
+dedup insert can be ordered before or after. **It is not.** A trade's
+canonical row becomes durable only when its *containing segment* closes,
+up to 30 seconds or 5,000 rows later — an emergent property of a batched
+lifecycle, not a per-trade event. This reframes both orderings:
+
+**Option A (dedup-first: insert into SQLite, then hand the row to
+`ParquetWriter.write()`).** If the process crashes before that trade's
+segment closes, `_recover_orphans` already discards the row and reports
+`DATA_DROP` — **today, with no dedup at all**. Wiring in dedup-first
+makes this *worse*, not merely equally risky: the SQLite index would
+already durably remember the ID as seen, so a venue redelivery of the
+same trade (which would otherwise let the collector recover the lost
+row) is now **permanently and silently suppressed** — the reported,
+bounded `DATA_DROP` becomes an unreported, permanent gap. Verified
+directly from the interaction between `_dedupe_trades`'s synchronous
+insert-then-emit contract and `_recover_orphans`'s unconditional discard.
+
+**Option B (canonical-first: hand the row to `ParquetWriter.write()`,
+then insert into SQLite).** Two sub-cases, not one:
+
+- *Crash before the segment closes*: the row is discarded by
+  `_recover_orphans` exactly as above, **and** the dedup insert never
+  ran — so a later redelivery is correctly treated as new and produces
+  exactly one canonical row. This sub-case is safe, and is safe for a
+  specific reason: the same crash discards both consistently.
+- *Crash after the segment closes (row durably published) but before the
+  dedup insert commits*: the canonical row **is** durably on disk, but
+  the index does not know it. A redelivery is (correctly, by the index's
+  own logic) treated as new, and a genuine **duplicate canonical row is
+  written** — the exact failure mode the task's §6.B names. This window
+  recurs roughly every 30 seconds (or 5,000 rows) per stream — it is not
+  a rare edge case, it is a *routine* segment boundary.
+
+**Neither simple ordering is safe across the whole lifecycle** with the
+current buffered-segment architecture, for a structural reason (the
+granularity mismatch), not a missing feature of `PersistentTradeIdIndex`
+itself.
+
+### The smallest correct fix identified, not implemented
+
+Move the dedup **commit** to segment-close granularity instead of
+per-trade: batch every trade ID a segment durably contains and insert
+them into the persistent index in the same step that publishes the
+segment (immediately after the `fsync`+`os.replace` that makes the
+segment durable, ideally using the segment's own publication as the
+recovery anchor — e.g. a startup reconciliation pass that can detect a
+published segment whose IDs are not yet reflected in the index and
+finish that batch insert before accepting new traffic). This aligns
+dedup durability with canonical durability at the same instant instead
+of two independent, differently-timed commits: a crash before segment
+close loses both consistently (today's already-accepted contract,
+unchanged); a crash after segment close but before the batched index
+update leaves a single, much narrower window per segment (not per
+trade), closable further with a startup reconciliation step.
+
+This is a real architectural change — it moves duplicate suppression
+from "immediate, per-message" to "deferred until the containing segment
+is durable," which means a duplicate arriving within one still-open
+segment's window would not yet be reflected in the index and could be
+double-counted *within that segment* unless the in-memory
+`_seen_trade_ids` (today's exact, unbounded set) is *also* kept as the
+authoritative same-segment check, with the persistent index only
+handling cross-segment/cross-restart durability. That combination —
+today's exact in-memory set for the live segment, batched persistence at
+segment-close time for restart survival — is the design this session
+recommends as the next concrete step. **Not implemented in this session**:
+it touches `ParquetWriter`'s segment-close path and the runner
+constructors in a way that goes beyond "wire in a set replacement," and
+per this task's own instruction ("if a larger change is truly required
+for correctness, explain exactly why before doing it" / "do not perform a
+broad architectural rewrite"), implementing it here would be exactly that
+broader rewrite.
+
+### Conclusion: PR #57 remains NOT READY
+
+The existing `PersistentTradeIdIndex` component (exact, atomic,
+differentially tested against the reference set) is unchanged in its own
+correctness. What this session's audit adds is proof that **wiring it
+into the current per-trade `_dedupe_trades` call site is unsafe**,
+independent of the deployment-benchmark and throughput questions raised
+earlier — a structural granularity mismatch with `ParquetWriter`'s own
+durability boundary, not a benchmark or configuration problem. Production
+wiring remains deferred; the identified next step (segment-granularity
+dedup commit, in-memory set as the same-segment authority) is the
+smallest correct design found, not yet built.
+
+## 12. Remaining limitations
+
 
 - **Proven**: exactness (differential testing), atomicity (structural
   test + mutation), identity scoping, reconnect-overlap suppression,
@@ -216,7 +340,7 @@ configuration (untouched, no live exchange connection made).
   path for existing long-running adapter instances (this change does not
   touch `ExchangeAdapter.__init__`, so there is nothing to migrate yet).
 
-## 12. Git state
+## 13. Git state
 
 - Branch: `p0-4-bounded-trade-dedup`
 - Base: `main` @ `790df62` (verified via `git rev-parse origin/main`)
