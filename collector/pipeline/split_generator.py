@@ -43,12 +43,13 @@ producing a mislabelled artifact.
 """
 from __future__ import annotations
 
-import glob
 import json
 import math
 
 from collector.pipeline.label_generator import (
+    LabelDiscoveryError,
     _max_label_horizon_s_detailed,
+    discover_labeled_files,
     max_label_horizon_s as observed_max_label_horizon_s,
 )
 import os
@@ -349,9 +350,18 @@ def generate_splits(
     leakage-safe, which is the precise failure this module exists to prevent.
     The origin of the number is recorded in ``max_label_horizon_source`` so a
     researcher can see whether the purge was measured or assumed.
+
+    File discovery uses :func:`label_generator.discover_labeled_files` -- the
+    same authoritative call ``max_label_horizon_s`` uses -- rather than a
+    separate ``glob.glob`` here. ``glob.glob`` silently returns ``[]`` on a
+    directory-listing failure (permission denied, a parent-directory access
+    failure), which would otherwise be reported as "No labeled files found"
+    and return ``None`` instead of raising -- bypassing the fail-closed
+    horizon-discovery contract entirely for that one path, since
+    ``_max_label_horizon_s_detailed`` would never even be reached.
     """
+    files = discover_labeled_files(data_dir)
     labeled_dir = os.path.join(data_dir, "aligned", "labeled")
-    files = glob.glob(os.path.join(labeled_dir, "*.parquet"))
     if not files:
         print("No labeled files found.")
         return None

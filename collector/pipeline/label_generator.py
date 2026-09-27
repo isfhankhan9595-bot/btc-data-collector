@@ -29,8 +29,8 @@ Two further silent misnamings are closed:
 """
 from __future__ import annotations
 
-import glob
 import os
+import stat as stat_module
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -41,6 +41,86 @@ DEFAULT_HORIZONS_S: tuple[int, ...] = (1, 5, 15, 60, 300)
 
 class LabelHorizonError(ValueError):
     """The requested horizon cannot be realised on this grid."""
+
+
+class LabelDiscoveryError(RuntimeError):
+    """Label file discovery could not be completed reliably.
+
+    Distinct from :class:`LabelHorizonError`, which covers a file that was
+    found but whose *schema* could not be read. This class covers failing
+    to establish the label file set itself -- and, in particular, the case
+    where a filesystem/permission failure could otherwise be mistaken for
+    "the labeled directory is empty".
+
+    ``glob.glob`` and the boolean ``os.path.exists``/``os.path.isdir`` APIs
+    all catch ``OSError`` broadly and silently return an empty/false result
+    for a listing or stat failure, not only for genuine absence (CPython's
+    own ``genericpath.py``: ``except (OSError, ValueError): return False``).
+    A permission-denied labeled directory, a parent-directory access
+    failure, or a transient I/O error must never be silently read as "no
+    files found" -- that is precisely the "unknown -> empty -> horizon 0 ->
+    leakage safe" transition this module exists to make impossible.
+    """
+
+
+def discover_labeled_files(data_dir: str = "data") -> list[str]:
+    """The one authoritative, fail-closed listing of labeled parquet files.
+
+    Both :func:`_max_label_horizon_s_detailed` and
+    ``split_generator.generate_splits`` use this rather than each rolling
+    its own ``glob.glob`` call, so the two can never disagree about what
+    "no files" versus "listing failed" means.
+
+    Three filesystem states are distinguished on purpose:
+
+    1. The labeled path does not exist at all -- a fresh pipeline with
+       nothing labeled yet. Returns ``[]``, not an error.
+    2. The labeled path exists but is not a directory (a stray file where a
+       directory was expected). Never the same as "nothing labeled yet" --
+       raises :class:`LabelDiscoveryError`.
+    3. The labeled path exists (as a directory) but cannot be inspected or
+       listed (permission denied, a transient I/O error, a parent-directory
+       access failure). Also raises :class:`LabelDiscoveryError`.
+
+    Implementation note: state 1 vs. states 2/3 is distinguished with
+    ``os.stat`` directly, catching only ``FileNotFoundError`` as genuine
+    absence -- deliberately NOT ``os.path.exists``/``os.path.isdir``, both
+    of which catch ``OSError`` broadly (see :class:`LabelDiscoveryError`)
+    and would silently collapse state 3 into state 1. Verified: monkeypatching
+    ``os.stat`` to raise ``PermissionError`` for an existing directory's
+    exact path makes ``os.path.exists`` return ``False`` for that path --
+    indistinguishable from the directory never having existed.
+
+    Returns:
+        Sorted full paths to every ``*.parquet`` file directly in the
+        labeled directory. An empty list means state 1 or "directory
+        exists, genuinely has no parquet files in it" -- both legitimate,
+        neither an error.
+    """
+    labeled_dir = os.path.join(data_dir, "aligned", "labeled")
+    try:
+        st = os.stat(labeled_dir)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise LabelDiscoveryError(
+            f"could not inspect labeled-data path: path={labeled_dir} reason={exc}"
+        ) from exc
+    if not stat_module.S_ISDIR(st.st_mode):
+        raise LabelDiscoveryError(
+            f"labeled-data path exists but is not a directory: path={labeled_dir}"
+        )
+    try:
+        entries = os.listdir(labeled_dir)
+    except OSError as exc:
+        # os.listdir raises on permission errors and similar; glob.glob
+        # does not, and would have silently returned no matches for the
+        # exact same failure. Listing explicitly is what makes "permission
+        # denied" distinguishable from "genuinely empty".
+        raise LabelDiscoveryError(
+            f"could not list labeled-data directory: path={labeled_dir} reason={exc}"
+        ) from exc
+    return sorted(os.path.join(labeled_dir, name) for name in entries if name.endswith(".parquet"))
 
 
 def _verify_grid(
@@ -197,8 +277,15 @@ def _max_label_horizon_s_detailed(
     the incompleteness explicitly rather than silently trusting the
     number. No caller in this codebase may use ``strict=False`` to justify
     ``leakage_safe: true``; ``generate_splits`` never does.
+
+    File discovery itself uses :func:`discover_labeled_files` -- the one
+    authoritative, fail-closed listing -- rather than a private
+    ``glob.glob`` call. A directory-listing or stat failure on the labeled
+    path therefore raises :class:`LabelDiscoveryError` here regardless of
+    ``strict`` (discovery failure and schema-read failure are different
+    things; only the latter has a ``strict=False`` escape hatch).
     """
-    files = sorted(glob.glob(os.path.join(data_dir, "aligned", "labeled", "*.parquet")))
+    files = discover_labeled_files(data_dir)
     if not files:
         return 0, []
 
