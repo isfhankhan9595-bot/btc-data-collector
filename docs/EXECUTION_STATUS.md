@@ -1572,3 +1572,85 @@ timestamp architecture (P0-11 territory).
 
 Branch: `p0-6-research-time-contract`. Base: `main` @ `790df62ddadb347abf7cd5cd6cae16d9250d44b6`.
 No PR opened (not requested). Nothing merged.
+
+### P0-7 — OI / liquidation research-dataset assembly — **COMPLETE, VERIFIED**
+
+**Reproduction confirmed against current main:** `dataset_assembler.py`
+contained zero references to `openinterest`/`liquidation` — both streams
+were genuinely collected (their own `ParquetWriter`s and schemas, per P0-6's
+already-correct instrument-key validation) but never read into the research
+dataset (critical-question answer: **C**, both absent).
+
+**Dependency found and fixed (same defect class as P0-6's markprice fix):**
+`_handle_liquidation` never captured a genuine receive time —
+`local_timestamp` silently duplicated the processing-time `"timestamp"`
+value, and the handler didn't even receive `local_receive_ts` from its
+caller. This also broke live/replay parity, since `BinanceAdapter.normalize()`
+already threads a real `local_receive_ts` into `CanonicalLiquidationEvent`
+for the replay path. Fixed identically to markprice's P0-6 fix. Binance OI's
+write path was confirmed already correct (`_poll_openinterest` already uses
+`event.local_receive_ts` for both `timestamp` and `local_timestamp`).
+
+**Implemented:**
+- `dataset_assembler.py`: reads `openinterest` and `liquidation` as two
+  additional optional streams (like trades — absence doesn't block
+  assembly). OI: `merge_asof` backward, receive-time keyed, 5000ms staleness
+  tolerance, NaN + `openinterest_gap` on miss (never a fabricated 0).
+  Liquidation: binned like trades (receive-time keyed), producing
+  count/buy/sell/net volume + notional, with a new `liquidation_stream_available`
+  flag distinguishing "no segment collected all day" (unknown) from "segment
+  present, bin genuinely empty" (confident zero) — full per-bin coverage
+  tracking (joining the persisted quality-event stream against the grid) was
+  identified as a larger, separate undertaking and explicitly left out of
+  scope, documented as a known limitation.
+- Added `_enforce_single_instrument`, applied uniformly across all five
+  streams the assembler now reads, as defense-in-depth instrument/venue
+  isolation behind the existing write-time validation.
+- Added liquidation dedup on `(exchange_timestamp, side, price, quantity)` —
+  liquidations, unlike trades, carry no venue-assigned unique event id.
+- Confirmed no unit conversion is needed or performed for OI (Binance's
+  native contract units pass through unchanged).
+- Confirmed Binance OI is deliberately not replayable (documented in
+  `docs/REPLAY.md`/`docs/DATA_SUFFICIENCY.md`); did not attempt to change
+  this — out of scope.
+- `run_collector.py`: `_handle_liquidation` now threads `local_receive_ts`
+  through and stamps `local_timestamp` from it.
+
+**Adversarial tests added** (`test_dataset_assembler_oi_liquidation.py`, 13
+tests) covering: OI/liquidation happy-path assembly; missing OI is NaN never
+zero; missing-liquidation-stream vs. present-but-empty-bin distinction;
+stale OI flagged; future-receive leakage (OI and liquidation) despite an old
+exchange timestamp; processing-delay immunity; instrument/venue isolation
+(mismatched `instrument_key` dropped, not blended); no silent OI unit
+conversion; duplicate liquidation event not double-counted; duplicate OI
+observation resolves to one value, never summed. Plus one new routing test
+(`test_liquidation_local_timestamp_is_receive_time_not_processing_time`).
+
+**Mutation testing** (dataset_assembler.py and run_collector.py, each
+restored to exact byte-equivalence via `md5sum` after every mutation): all
+10 required mutations applied to real source — remove OI from assembly
+(caught, 6/13), remove liquidation from assembly (caught, 4/13), receive→exchange
+timestamp for OI join (caught, 7/13), receive→processing timestamp for
+liquidation binning (caught, 2/13), OI `backward`→`nearest` (caught, 2/13, no
+gap this time), missing OI→zero (caught, 1/13), missing liquidation→confident-zero
+(caught, 1/13), disable instrument isolation (caught, 1/13), silent OI 1000x
+unit-conversion bug (caught, 6/13), disable liquidation dedup/double-count
+(caught, 1/13). One additional mutation on the liquidation source fix
+(revert to processing-time-duplication) — caught by the new routing test.
+No testing gaps found this round.
+
+**Full validation:** 1284 tests passed (1270 pre-existing/updated + 14 new:
+13 OI/liquidation + 1 liquidation routing test), `compileall` clean,
+`git diff --check` clean, working tree byte-identical to pre-mutation state
+after every restore.
+
+**Out of scope, not touched:** P0-1 through P0-6 implementations untouched
+except the single necessary liquidation receive-time dependency above. Did
+not build per-bin liquidation/quality-event coverage tracking (a materially
+larger undertaking, documented as a known limitation instead of solved).
+Did not attempt to make Binance OI replayable (a deliberate, already-documented
+architectural choice, not a defect).
+
+Branch: `p0-7-oi-liquidation-research-dataset`. Base: `main` @
+`cd4a7031435267da255c7c036be79637d3ca12f9`. No PR opened (not requested).
+Nothing merged.

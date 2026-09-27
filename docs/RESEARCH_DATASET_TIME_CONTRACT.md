@@ -1,4 +1,4 @@
-# Research dataset time contract (P0-6)
+# Research dataset time contract (P0-6 / P0-7)
 
 `collector/pipeline/dataset_assembler.py`. Governs which clock decides whether
 a row of information was available to the collector at a given research
@@ -76,3 +76,88 @@ Tests: `tests/test_dataset_assembler.py`,
 future-exchange-timestamp, processing-delay, cross-stream consistency,
 legacy-fallback flagging, determinism), `tests/test_run_collector_routing.py`
 (`test_markprice_local_timestamp_is_receive_time_not_processing_time`).
+
+## P0-7: open interest and liquidations
+
+Before P0-7, `dataset_assembler.py` contained **zero references** to
+`openinterest` or `liquidation` at all — both were genuinely collected (their
+own `ParquetWriter`s, `OPENINTEREST_SCHEMA`/`LIQUIDATION_SCHEMA`) but never
+read into the research dataset. Raw data existed; research data did not
+represent it. P0-7 fixes this while preserving the P0-6 contract above.
+
+**Dependency found and fixed:** `_handle_liquidation` in `run_collector.py`
+had the exact same defect class markprice had before P0-6: `compute_liquidation_features`'s
+`"timestamp"` is a fresh `time.time()` call (processing time), and
+`"local_timestamp"` silently duplicated it — no genuine receive time existed
+for liquidation at all. This also broke live/replay parity: `BinanceAdapter.normalize()`
+already threads a real `local_receive_ts` into `CanonicalLiquidationEvent`
+for the replay path. Fixed the same way markprice was: `local_receive_ts`
+(captured once at `handle_message` entry) is now threaded through and stamps
+`local_timestamp`.
+
+Binance OI's write path (`_poll_openinterest`) was already correct before
+P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
+
+### Open interest
+
+- Joined with `merge_asof` exactly like markprice: backward, receive-time
+  keyed, with a staleness tolerance (`OI_STALE_MS = 5000`, comfortably above
+  the ~3s `OI_POLL_INTERVAL_S` REST-poll cadence in `run_collector.py`).
+- A miss or stale reading is `NaN` + `openinterest_gap = True` — **never**
+  `open_interest = 0`. A poll outage and a genuine zero-OI reading are not
+  interchangeable, and none is fabricated to stand in for the other.
+- No unit conversion is performed anywhere in the assembler: Binance's
+  `/fapi/v1/openInterest` response is already in native contract units
+  (`binance_oi.normalize_binance_oi` passes it through unchanged), so there
+  is nothing to silently rescale.
+- **Not replayable.** Per `docs/REPLAY.md`/`docs/DATA_SUFFICIENCY.md`,
+  Binance OI is a REST poll and is deliberately excluded from
+  `ReplaySource.from_records`'s routing. P0-7 does not change this — the
+  assembler aligns whichever OI segments were actually collected live; it
+  does not attempt to reconstruct OI from replay.
+
+### Liquidations
+
+- Aggregated per grid bin the same way trades are: binned by the causal
+  availability clock (never processing time), producing
+  `liquidation_count`, `liquidation_buy_volume`, `liquidation_sell_volume`
+  (side: `+1`=BUY/short-liquidated, `-1`=SELL/long-liquidated, per
+  `feature_computer.compute_liquidation_features`), `liquidation_net_volume`,
+  `liquidation_notional`.
+- **No venue-assigned unique event id.** Unlike trades (`trade_id`),
+  Binance's `forceOrder` liquidation stream carries no id field. A
+  conservative, evidence-only dedup drops rows sharing an identical
+  `(exchange_timestamp, side, price, quantity)` tuple before aggregation, on
+  the assumption that this is a WS-redelivered copy of one event, not two
+  coincidentally identical liquidations. This is a heuristic, not a proof —
+  documented here rather than silently assumed.
+- **Empty-interval semantics are explicit**, per the requirement that "no row
+  = zero" must not be silently assumed: `liquidation_stream_available`
+  distinguishes a day with **no liquidation segment collected at all**
+  (`False` — the zero columns carry no evidentiary weight, we simply don't
+  know) from a day where the stream **was** collected and a bin genuinely saw
+  no events (`True` — a confidently observed zero). This does not extend to
+  per-bin outage detection (e.g. a mid-day WS reconnect gap within an
+  otherwise-available day) — building that would require joining the
+  collector's persisted quality-event stream against the grid, which is a
+  separate, larger undertaking outside P0-7's scope. The known limitation:
+  liquidations, like trades, rely on the same real-time WS capture with no
+  separate per-bin coverage record; an empty bin within an "available" day is
+  only as trustworthy as that connection's own uptime for that window.
+
+### Instrument/venue isolation
+
+Both OI and liquidation frames pass through `_enforce_single_instrument`
+(applied uniformly to all five streams this assembler reads) as
+defense-in-depth: any row whose `instrument_key` contradicts the single
+expected instrument (`BINANCE_USDM_BTCUSDT`) is dropped and reported, never
+silently blended in. This is a second layer behind the write-time validation
+(`_binance_usdm_instrument_key`) that already rejects mismatched symbols
+before they reach a writer.
+
+Tests: `tests/test_dataset_assembler_oi_liquidation.py` (OI/liquidation
+happy path, missing-vs-stale-vs-unavailable semantics, future-receive
+leakage, exchange/processing-timestamp substitution, instrument isolation,
+no silent unit conversion, liquidation dedup, OI tie-resolution),
+`tests/test_run_collector_routing.py`
+(`test_liquidation_local_timestamp_is_receive_time_not_processing_time`).

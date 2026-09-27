@@ -47,6 +47,40 @@ rows sharing one ``<stream>_ts`` keep their original (input) order --
 matching the documented tie rule in
 ``pipeline/cross_exchange_alignment.py.causally_align()``. Determinism does
 not depend on filesystem iteration order or a non-stable sort algorithm.
+
+P0-7: open interest and liquidations
+--------------------------------------
+Open interest (``open_interest``) and liquidations (``liquidation_*``) are
+aligned with the exact same rule as every other stream: their own
+``local_timestamp`` (receive time), never ``exchange_timestamp`` or
+``timestamp``. Two points specific to these two streams:
+
+* Open interest is REST-polled (``OI_POLL_INTERVAL_S`` in ``run_collector.py``,
+  currently 3s), not event-driven, so it is naturally coarser than book/mark
+  data. It is joined with ``merge_asof`` exactly like markprice (backward,
+  with a staleness tolerance), and a missing/stale reading is represented as
+  NaN plus ``openinterest_gap`` -- NEVER as ``open_interest = 0``. A poll
+  failure or an OI value of zero are not interchangeable, and this module
+  never invents the latter to paper over the former. Per the documented
+  scope in ``docs/REPLAY.md``/``docs/DATA_SUFFICIENCY.md``, Binance OI is a
+  REST poll and is **not currently replayable**; this module only aligns
+  whatever OI segments were actually collected (live), and does not attempt
+  to reconstruct OI from replay.
+* Liquidations are sparse, irregular events. They are aggregated per grid
+  bin the same way trades are (count/volumes/notional, keyed on the
+  availability clock, never fabricated for a bin with no events) -- see
+  ``docs/RESEARCH_DATASET_TIME_CONTRACT.md`` for the explicit, documented
+  limitation this shares with the trades aggregation: an empty bin means
+  "no liquidation was received in this window", which is only as trustworthy
+  as the forceOrder stream's own connection coverage for that window (the
+  same real-time WS capture as trades, with no separate per-bin coverage
+  record persisted to prove it). This is not new to P0-7 -- it is the same
+  assumption the trades aggregation already makes -- but it is called out
+  explicitly here rather than silently inherited.
+
+Neither stream's absence blocks assembly: like trades, both are optional
+inputs (a quiet day with zero liquidations, or an OI poll outage, does not
+prevent the rest of the dataset from being built).
 """
 import calendar
 import os
@@ -54,6 +88,17 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from collector.collector.storage_layout import iter_segments
+from collector.collector.instrument import BINANCE_USDM_BTCUSDT
+
+#: This assembler is intentionally single-venue, single-instrument
+#: (Binance USD-M BTCUSDT). ``instrument_key`` is validated at write time
+#: (a payload symbol that contradicts the configured instrument is rejected
+#: before it ever reaches a writer -- see run_collector.py's
+#: ``_binance_usdm_instrument_key``/``normalize_binance_oi``), so this is a
+#: defense-in-depth check, not the primary guard: any row whose
+#: ``instrument_key`` contradicts the expected instrument is dropped here
+#: too, never silently merged into the aligned series.
+_EXPECTED_INSTRUMENT_KEY = BINANCE_USDM_BTCUSDT.key
 
 
 def _normalize_ms(frame: pd.DataFrame, col: str) -> None:
@@ -87,6 +132,26 @@ def _availability_series(frame: pd.DataFrame) -> tuple[pd.Series, bool]:
     return frame["timestamp"], True
 
 
+def _enforce_single_instrument(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Defense-in-depth instrument isolation (see module-level constant).
+
+    A row with no ``instrument_key`` at all (legacy data predating the
+    column) is kept -- absence is not a contradiction, matching the same
+    principle already applied to missing ``local_timestamp``. A row whose
+    ``instrument_key`` is present and does NOT match the expected single
+    instrument is dropped and reported; it must never silently blend into
+    this single-instrument series.
+    """
+    if "instrument_key" not in frame.columns:
+        return frame
+    mismatched = frame["instrument_key"].notna() & (frame["instrument_key"] != _EXPECTED_INSTRUMENT_KEY)
+    if mismatched.any():
+        print(f"WARNING: dropping {int(mismatched.sum())} {prefix} row(s) with "
+              f"unexpected instrument_key (expected {_EXPECTED_INSTRUMENT_KEY})")
+        frame = frame.loc[~mismatched]
+    return frame
+
+
 def _prepare_stream_frame(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
     """Attach the causal availability clock and make every clock's role explicit.
 
@@ -103,7 +168,13 @@ def _prepare_stream_frame(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
     * ``<prefix>_time_unknown`` -- True iff ``local_timestamp`` was absent
                                     and ``<prefix>_ts`` had to fall back to
                                     the ambiguous processing timestamp.
+
+    Also enforces single-instrument isolation (see
+    ``_enforce_single_instrument``) and drops the now-redundant
+    ``instrument_key`` column -- this assembler covers exactly one
+    venue/instrument by construction.
     """
+    frame = _enforce_single_instrument(frame, prefix)
     avail, used_fallback = _availability_series(frame)
     out = frame.copy()
     out[f"{prefix}_ts"] = avail.astype("int64")
@@ -114,7 +185,7 @@ def _prepare_stream_frame(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
     if "exchange_timestamp" in out.columns:
         rename["exchange_timestamp"] = f"{prefix}_exchange_ts"
     out = out.rename(columns=rename)
-    return out.drop(columns=["local_timestamp"], errors="ignore")
+    return out.drop(columns=["local_timestamp", "instrument_key"], errors="ignore")
 
 
 def _read_stream(data_dir: str, stream: str, date_str: str) -> list[pd.DataFrame]:
@@ -133,6 +204,8 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     ob_dfs = _read_stream(data_dir, "orderbook", date_str)
     trades_dfs = _read_stream(data_dir, "trades", date_str)
     mark_dfs = _read_stream(data_dir, "markprice", date_str)
+    oi_dfs = _read_stream(data_dir, "openinterest", date_str)
+    liq_dfs = _read_stream(data_dir, "liquidation", date_str)
 
     if not ob_dfs or not mark_dfs:
         print(f"Insufficient data for {date_str}")
@@ -149,6 +222,35 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
     df_mark = _prepare_stream_frame(pd.concat(mark_dfs).reset_index(drop=True), "mark")
     df_mark = df_mark.sort_values("mark_ts", kind="stable").reset_index(drop=True)
+
+    # OI and liquidation are optional inputs, like trades: a quiet day with
+    # zero liquidations, or an OI REST-poll outage, must not block assembly
+    # of the rest of the dataset (see module docstring).
+    if oi_dfs:
+        df_oi = _prepare_stream_frame(pd.concat(oi_dfs).reset_index(drop=True), "oi")
+        df_oi = df_oi.sort_values("oi_ts", kind="stable").reset_index(drop=True)
+    else:
+        df_oi = pd.DataFrame()
+
+    if liq_dfs:
+        df_liq = _prepare_stream_frame(pd.concat(liq_dfs).reset_index(drop=True), "liq")
+        # Liquidations have no venue-assigned unique event id (unlike
+        # trades' trade_id in TRADES_SCHEMA) -- forceOrder gives no such
+        # field. A conservative, evidence-only dedup: two rows sharing the
+        # exact (exchange_timestamp, side, price, quantity) tuple are
+        # treated as one WS-redelivered event, never summed twice. This is
+        # not a guarantee against two genuinely distinct liquidations
+        # coincidentally sharing all four fields at millisecond
+        # granularity (vanishingly unlikely, not impossible) -- documented
+        # in docs/RESEARCH_DATASET_TIME_CONTRACT.md.
+        before = len(df_liq)
+        df_liq = df_liq.drop_duplicates(subset=["liq_exchange_ts", "side", "price", "quantity"], keep="first")
+        if len(df_liq) < before:
+            print(f"WARNING: dropped {before - len(df_liq)} duplicate liquidation row(s) "
+                  f"(identical exchange_timestamp/side/price/quantity)")
+        df_liq = df_liq.sort_values("liq_ts", kind="stable").reset_index(drop=True)
+    else:
+        df_liq = pd.DataFrame()
 
     # Create common time grid
     start_dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -180,6 +282,24 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         "ob_time_unknown": "orderbook_time_unknown",
         "mark_time_unknown": "markprice_time_unknown",
     })
+
+    # Open interest: a REST poll every OI_POLL_INTERVAL_S (currently 3s, see
+    # run_collector.py), so a generous but explicit staleness tolerance --
+    # never a fabricated 0 for a poll outage or a not-yet-collected value.
+    OI_STALE_MS = 5000
+    if not df_oi.empty:
+        df_aligned = pd.merge_asof(df_aligned, df_oi, left_on="timestamp", right_on="oi_ts",
+                                    direction="backward", tolerance=OI_STALE_MS)
+        df_aligned["openinterest_gap"] = df_aligned["oi_ts"].isna() | (
+            (df_aligned["timestamp"] - df_aligned["oi_ts"]) > OI_STALE_MS)
+        df_aligned = df_aligned.drop(columns=["oi_ts"])
+        df_aligned = df_aligned.rename(columns={"oi_time_unknown": "openinterest_time_unknown"})
+    else:
+        df_aligned["open_interest"] = np.nan
+        df_aligned["oi_process_ts"] = np.nan
+        df_aligned["oi_exchange_ts"] = np.nan
+        df_aligned["openinterest_gap"] = True
+        df_aligned["openinterest_time_unknown"] = False
 
     # Preserve stress observations.  This flag is descriptive only; no spread
     # value is masked or forward-filled.
@@ -252,6 +372,58 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     # A grid bin with no trades has nothing ambiguous to flag: absence of a
     # trade is not a legacy/unknown-timestamp condition.
     df_aligned["trades_time_unknown"] = df_aligned["trades_time_unknown"].fillna(False).astype(bool)
+
+    # Aggregate liquidations: same causal binning as trades (ceil to the
+    # availability clock, never the processing timestamp), see module
+    # docstring for the shared "empty bin = zero" limitation this inherits
+    # from the trades aggregation.
+    if not df_liq.empty:
+        df_liq["grid_ts"] = np.ceil((df_liq["liq_ts"] - start_ts) / grid_ms) * grid_ms + start_ts
+        df_liq["grid_ts"] = df_liq["grid_ts"].astype(np.int64)
+
+        # side: +1 == BUY (forced buy => a short position was liquidated),
+        # -1 == SELL (forced sell => a long position was liquidated). See
+        # feature_computer.compute_liquidation_features.
+        df_liq["liq_buy_vol"] = np.where(df_liq["side"] > 0, df_liq["quantity"], 0.0)
+        df_liq["liq_sell_vol"] = np.where(df_liq["side"] < 0, df_liq["quantity"], 0.0)
+        df_liq["liq_notional"] = df_liq["quantity"] * df_liq["price"]
+
+        liq_aggs = df_liq.groupby("grid_ts").agg(
+            liquidation_count=("price", "count"),
+            liquidation_buy_volume=("liq_buy_vol", "sum"),
+            liquidation_sell_volume=("liq_sell_vol", "sum"),
+            liquidation_net_volume=("signed_qty", "sum"),
+            liquidation_notional=("liq_notional", "sum"),
+            liquidation_time_unknown=("liq_time_unknown", "any"),
+        ).reset_index()
+
+        df_aligned = pd.merge(df_aligned, liq_aggs, left_on="timestamp", right_on="grid_ts", how="left")
+        df_aligned = df_aligned.drop(columns=["grid_ts"])
+        # The stream was collected for this day: a bin with no matching
+        # aggregate genuinely had zero liquidations (not "unknown"),
+        # distinct from the whole-stream-absent case below (see
+        # docs/RESEARCH_DATASET_TIME_CONTRACT.md, "empty liquidation
+        # interval" semantics).
+        df_aligned["liquidation_stream_available"] = True
+    else:
+        df_aligned["liquidation_count"] = 0
+        df_aligned["liquidation_buy_volume"] = 0.0
+        df_aligned["liquidation_sell_volume"] = 0.0
+        df_aligned["liquidation_net_volume"] = 0.0
+        df_aligned["liquidation_notional"] = 0.0
+        df_aligned["liquidation_time_unknown"] = False
+        # No liquidation segment exists for this day at all: a count of 0
+        # here is NOT the same causal claim as "we watched and saw zero" --
+        # it means we have no evidence either way. Never collapse this into
+        # the same signal as a genuinely observed quiet interval.
+        df_aligned["liquidation_stream_available"] = False
+
+    df_aligned["liquidation_count"] = df_aligned["liquidation_count"].fillna(0).astype(np.int32)
+    df_aligned["liquidation_buy_volume"] = df_aligned["liquidation_buy_volume"].fillna(0.0)
+    df_aligned["liquidation_sell_volume"] = df_aligned["liquidation_sell_volume"].fillna(0.0)
+    df_aligned["liquidation_net_volume"] = df_aligned["liquidation_net_volume"].fillna(0.0)
+    df_aligned["liquidation_notional"] = df_aligned["liquidation_notional"].fillna(0.0)
+    df_aligned["liquidation_time_unknown"] = df_aligned["liquidation_time_unknown"].fillna(False).astype(bool)
 
     # Save aligned dataset
     out_dir = os.path.join(data_dir, "aligned")
