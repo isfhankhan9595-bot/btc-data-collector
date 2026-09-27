@@ -358,3 +358,56 @@ def test_production_function_is_what_fails_not_a_test_reimplementation():
     # The old defect's exact shape -- a bare continue with no raise -- must
     # not be reachable when strict is True.
     assert "if strict:" in source
+
+
+# ---------------------------------------------------------------------------
+# Additive coverage from a parallel audit pass on this same P0-5 phase.
+# The implementation above was independently found and verified correct
+# before adding anything -- this closes one specific gap the original task
+# spec named explicitly (Test C: a file present at glob() time but gone by
+# the time its schema is read is incomplete evidence, not an empty dataset,
+# and must not be treated as though it simply never existed).
+# ---------------------------------------------------------------------------
+
+
+def test_file_disappearing_between_glob_and_schema_read_fails_closed(tmp_path, monkeypatch):
+    """A file selected for the scan vanishes before its schema can be read.
+    This is a distinct failure mode from a corrupt/malformed file: the
+    exception raised is FileNotFoundError/OSError, not a pyarrow parsing
+    error, and it must be caught by the same generic `except Exception`
+    guard rather than silently falling through as though the file had
+    never been part of the dataset."""
+    dates = _write_labeled(tmp_path, ["return_300s"], count=3)
+    victim = tmp_path / "aligned" / "labeled" / f"{dates[1]}.parquet"
+
+    import pyarrow.parquet as pq
+    real_read_schema = pq.read_schema
+
+    def flaky_read_schema(path, *a, **kw):
+        if str(path) == str(victim):
+            os.remove(path)
+        return real_read_schema(path, *a, **kw)
+
+    monkeypatch.setattr(pq, "read_schema", flaky_read_schema)
+
+    with pytest.raises(LabelHorizonError):
+        max_label_horizon_s(str(tmp_path))
+
+
+def test_disappearing_file_also_fails_closed_through_generate_splits(tmp_path, monkeypatch):
+    dates = _write_labeled(tmp_path, ["return_300s"], count=20)
+    victim = tmp_path / "aligned" / "labeled" / f"{dates[10]}.parquet"
+
+    import pyarrow.parquet as pq
+    real_read_schema = pq.read_schema
+
+    def flaky_read_schema(path, *a, **kw):
+        if str(path) == str(victim):
+            os.remove(path)
+        return real_read_schema(path, *a, **kw)
+
+    monkeypatch.setattr(pq, "read_schema", flaky_read_schema)
+
+    with pytest.raises(LabelHorizonError):
+        generate_splits(str(tmp_path), embargo_days=0)
+    assert not (tmp_path / "splits" / "split_manifest.json").exists()
