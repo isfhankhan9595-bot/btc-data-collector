@@ -155,6 +155,29 @@ async def test_markprice_local_timestamp_is_receive_time_not_processing_time():
 
 
 @pytest.mark.asyncio
+async def test_liquidation_local_timestamp_is_receive_time_not_processing_time():
+    """P0-7: liquidation's ``local_timestamp`` must be the frame's actual
+    receive time (captured once at ``handle_message`` entry), never a fresh
+    ``time.time()`` call taken later inside the handler. Before this fix,
+    ``local_timestamp`` silently duplicated ``timestamp`` (processing time)
+    -- the same defect class fixed for markprice in P0-6 -- so the research
+    assembler would have had no genuine availability clock for liquidation
+    at all. This also restores parity with replay: BinanceAdapter.normalize()
+    already threads a real ``local_receive_ts`` into CanonicalLiquidationEvent
+    for the replay path."""
+    app = _seed_bridged_book(_app_without_init())
+    receive_ts = 555_111
+    before_call = int(time.time() * 1000)
+    await app.handle_message(
+        {"stream": "btcusdt@forceOrder", "data": _valid_liquidation_msg()}, local_receive_ts=receive_ts,
+    )
+    record = app.liq_writer.write.call_args.args[0]
+    assert record["local_timestamp"] == receive_ts
+    assert record["timestamp"] >= before_call
+    assert record["local_timestamp"] != record["timestamp"]
+
+
+@pytest.mark.asyncio
 async def test_startup_verification_uses_cumulative_received_counters(monkeypatch):
     app = _app_without_init()
     app.stream_counters["orderbook"]["received"] = 533

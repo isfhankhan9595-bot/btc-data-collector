@@ -275,7 +275,7 @@ class CollectorApp:
         elif route == "markprice":
             self._handle_markprice(data, stream, local_receive_ts)
         elif route == "liquidation":
-            self._handle_liquidation(data, stream)
+            self._handle_liquidation(data, stream, local_receive_ts)
         self._drain_integrity_quality_events()
         if self.validator.check_failure_rate():
             logger.error("Validation spike detected: >0.1% failures in 60s window")
@@ -663,7 +663,7 @@ class CollectorApp:
             return None
         return BINANCE_USDM_BTCUSDT.key
 
-    def _handle_liquidation(self, data: dict, stream: str):
+    def _handle_liquidation(self, data: dict, stream: str, local_receive_ts: int):
         self.stream_counters["liquidation"]["received"] += 1
         try:
             instrument_key = self._binance_usdm_instrument_key(
@@ -678,6 +678,16 @@ class CollectorApp:
                 self.stream_counters["liquidation"]["empty_features"] += 1
                 logger.warning("Feature extraction returned empty", stream="liquidation", raw_stream=stream, keys=sorted(data.keys()))
                 return
+            # P0-7: compute_liquidation_features's "timestamp" is a fresh
+            # time.time() call taken when this handler runs -- processing
+            # time, not receive time. Before this fix, "local_timestamp"
+            # silently duplicated that same value, so (as with markprice
+            # before its P0-6 fix) there was no genuine availability clock
+            # for liquidation at all. local_receive_ts is the frame's real
+            # receive time, captured once at handle_message's entry (the
+            # same clock the replay-side CanonicalLiquidationEvent uses via
+            # BinanceAdapter.normalize()), so live and replay now agree.
+            features["local_timestamp"] = local_receive_ts
             features["instrument_key"] = instrument_key
             self.stream_counters["liquidation"]["computed"] += 1
             valid, reason = self.validator.validate_liquidation(features)
