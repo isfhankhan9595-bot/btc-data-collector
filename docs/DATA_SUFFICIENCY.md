@@ -18,7 +18,7 @@ never converts one into the other.**
 
 | Venue | Adapter | Collector (runner) | Streams collected | Tested | Replay-verified | LIVE-VERIFIED |
 |---|---|---|---|---|---|---|
-| Binance USD-M | complete; sequence semantics documented (D14 closed) | `run_collector.py` | book (diff + REST snapshot), aggTrade, markPrice (funding), forceOrder, OI **REST poll** | yes | book, trades, mark price, liquidation. **OI: no** (see `REPLAY.md`) | **not established by this repo** |
+| Binance USD-M | complete; sequence semantics documented (D14 closed) | `run_collector.py` | book (diff + REST snapshot), aggTrade, markPrice (funding), forceOrder, OI **REST poll** | yes | book, trades, mark price, liquidation, OI (see `REPLAY.md`) | **not established by this repo** |
 | Bybit v5 linear | 4/4 declared channels | `run_bybit_collector.py` | `orderbook.<depth>`, `publicTrade`, `tickers` (mark/index/funding/OI), `allLiquidation` | yes (fake socket, official-doc fixtures) | book, trades, ticker -> mark + OI, liquidation | **no** |
 | OKX v5 swap | all 7 D11 channels | `run_okx_collector.py` (storage-wired); `run_okx_capture.py` (raw frames only) | `trades`, `trades-all`, `mark-price`, `index-tickers`, `funding-rate`, `open-interest`, `liquidation-orders`. **`books` is parsed by the adapter but deliberately not collected.** | yes (fake socket, official-doc fixtures) | the 7 D11 channels. Book: no committed test | **no** |
 | Any BTC spot | **none** | **none** | none | n/a | n/a | n/a |
@@ -51,7 +51,7 @@ that computes the event does not exist for any row.
 | Liquidity sweep | book depth history + penetration + reclaim | **YES** (Binance, Bybit) | feature layer |
 | Failed sweep / failed breakout | range definition + flow + OI | **YES** | feature layer |
 | CVD / CVD divergence | trade flow + price | **YES** (all three) | feature layer |
-| OI / price divergence | OI + price | **PARTIAL** | Binance OI is a REST poll, not event-time, and is not replayable; **OI units are not comparable across venues (below)** |
+| OI / price divergence | OI + price | **PARTIAL** | Binance OI is a REST poll, not event-time; it IS replayable at the canonical-event layer (see `REPLAY.md`), but there is no pipeline stage that writes replayed OI back into the flattened research-dataset schema (see `RESEARCH_DATASET_TIME_CONTRACT.md`); **OI units are not comparable across venues (below)** |
 | Funding extreme | funding fields | **YES** (Binance markPrice, Bybit ticker, OKX `funding-rate`) | feature layer; per-venue funding-interval differences not analysed |
 | Order-book imbalance / microprice | reconstructed book | **YES** (Binance, Bybit) | feature layer |
 | Liquidity depletion / replenishment / vacuum | depth history per level | **YES** (Binance, Bybit) | feature layer |

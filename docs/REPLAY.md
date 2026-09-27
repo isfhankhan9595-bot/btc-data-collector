@@ -56,16 +56,27 @@ REPLAY-VERIFIED by `tests/test_replay_non_book_events.py`:
 
 | Venue | Events replayed | Notes |
 |---|---|---|
-| Binance | trades (`aggTrade`), mark price, liquidation | mark price value is asserted; the funding field it carries is not separately asserted by a replay test |
+| Binance | trades (`aggTrade`), mark price, liquidation, open interest (REST poll) | mark price value is asserted; the funding field it carries is not separately asserted by a replay test; OI is routed through the same `normalize_binance_oi()` live uses -- see below |
 | Bybit | trades, liquidation, ticker -> mark price **and** OI | carried-forward field provenance from a partial ticker survives replay unaltered (tested directly) |
 | OKX | `trades`, `trades-all`, `mark-price`, `index-tickers`, `funding-rate`, `open-interest`, `liquidation-orders` | `trades` and `trades-all` are never conflated; mark and index stay on separate fields; OI preserves all three units (contracts / coin / USD); liquidation attribution is preserved and **never filtered by instrument** |
 
-**Not replayed: Binance open interest.** Binance OI is a REST poll, recorded as
-a `raw_rest` row with `purpose="open_interest"`. `ReplaySource.from_records`
-consumes only `purpose == "orderbook_snapshot"` REST rows
-(`test_non_snapshot_rest_purposes_do_not_drive_the_book`), and OI is not routed
-through `BinanceAdapter.normalize()`. There is therefore no shared live/replay
-path for Binance OI, and it never appears in `non_book_events`.
+**Binance open interest IS replayable.** Binance OI is a REST poll, recorded
+as a `raw_rest` row with `purpose="open_interest"`.
+`ReplaySource.from_records` routes it into a `FrameKind.REST_OI` frame
+(ordered by `response_receive_ts`, never by the exchange-reported time), and
+`ReplayEngine._handle_rest_oi()` sends the recorded response body through
+`binance_oi.normalize_binance_oi()` -- **the exact same normalizer**
+`run_collector.py`'s live poll loop calls, producing an identical
+`CanonicalOIEvent` (`local_receive_ts = response_receive_ts`, never the
+exchange-reported time). See `tests/test_binance_oi_replayability.py`
+(`test_live_and_replay_produce_identical_canonical_events_from_the_same_body`,
+`test_availability_is_the_response_receive_time_not_the_exchange_time`).
+This produces canonical-layer `CanonicalOIEvent` objects for replay
+consumers (e.g. cross-exchange alignment); there is currently no pipeline
+stage that writes replayed OI back into the flattened `OPENINTEREST_SCHEMA`
+parquet `pipeline/dataset_assembler.py` reads, so that assembler only aligns
+whichever OI segments were actually collected live (see
+`docs/RESEARCH_DATASET_TIME_CONTRACT.md`).
 
 Replay does **not** compute features over these events, and it does not assess
 their quality: each event carries whatever `quality_state` its adapter assigned
@@ -156,7 +167,6 @@ segments. Enforced by an AST-based test over the module's own imports
 - A full live-vs-replay parity harness over a captured production session does
   not exist. Parity is demonstrated by driving the same adapter and book
   engine over the same frames.
-- Binance OI is not replayable (above).
 - OKX order-book replay is untested and has no live collector (above).
 - Non-book events are preserved, not featurised or quality-gated.
 - Bybit and OKX sequence semantics are exercised against documented protocol

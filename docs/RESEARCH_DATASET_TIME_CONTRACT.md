@@ -110,11 +110,28 @@ P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
   `/fapi/v1/openInterest` response is already in native contract units
   (`binance_oi.normalize_binance_oi` passes it through unchanged), so there
   is nothing to silently rescale.
-- **Not replayable.** Per `docs/REPLAY.md`/`docs/DATA_SUFFICIENCY.md`,
-  Binance OI is a REST poll and is deliberately excluded from
-  `ReplaySource.from_records`'s routing. P0-7 does not change this — the
-  assembler aligns whichever OI segments were actually collected live; it
-  does not attempt to reconstruct OI from replay.
+- **Replayable at the canonical-event layer, but not reconstructed into this
+  assembler's input.** Correcting an earlier version of this document:
+  Binance OI **is** replayable. `ReplaySource.from_records` routes a
+  recorded `purpose="open_interest"` REST row into a `FrameKind.REST_OI`
+  frame ordered by `response_receive_ts` (never the exchange-reported
+  time), and `ReplayEngine._handle_rest_oi()` sends it through
+  `binance_oi.normalize_binance_oi()` — **the exact same normalizer**
+  `run_collector.py`'s live poll loop calls — producing an identical
+  `CanonicalOIEvent` with `local_receive_ts = response_receive_ts`. This is
+  proven by the repository's existing
+  `tests/test_binance_oi_replayability.py` (predates P0-7; in particular
+  `test_live_and_replay_produce_identical_canonical_events_from_the_same_body`
+  and `test_availability_is_the_response_receive_time_not_the_exchange_time`),
+  which P0-7 re-ran and confirmed still passing rather than duplicating.
+  What replay does *not* currently do is write its `CanonicalOIEvent`
+  output back into the flattened `OPENINTEREST_SCHEMA` parquet this
+  assembler reads — no such pipeline stage exists. So in practice this
+  assembler only aligns whichever OI segments `_poll_openinterest` actually
+  wrote live; reconstructing a day's OI from raw REST records via replay,
+  into this assembler's input format, would need a new (currently
+  nonexistent) stage and is out of P0-7's scope. See `docs/REPLAY.md` for
+  the full replay-support table.
 
 ### Liquidations
 
@@ -124,13 +141,23 @@ P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
   (side: `+1`=BUY/short-liquidated, `-1`=SELL/long-liquidated, per
   `feature_computer.compute_liquidation_features`), `liquidation_net_volume`,
   `liquidation_notional`.
-- **No venue-assigned unique event id.** Unlike trades (`trade_id`),
-  Binance's `forceOrder` liquidation stream carries no id field. A
-  conservative, evidence-only dedup drops rows sharing an identical
-  `(exchange_timestamp, side, price, quantity)` tuple before aggregation, on
-  the assumption that this is a WS-redelivered copy of one event, not two
-  coincidentally identical liquidations. This is a heuristic, not a proof —
-  documented here rather than silently assumed.
+- **No venue-assigned unique event id — dedup here is a heuristic, not
+  exact deduplication.** Unlike trades (`trade_id`), Binance's `forceOrder`
+  liquidation stream carries no id field, and no repository evidence (in
+  `canonical.py`, `binance_oi.py`, or the raw payload shape) establishes
+  that the exchange guarantees any tuple of fields is a unique identifier.
+  Rows sharing an identical `(exchange_timestamp, side, price, quantity)`
+  tuple are dropped before aggregation, keeping the first, on the
+  assumption that this is a WS-redelivered copy of one event. **This is not
+  proven identity**: two genuinely distinct liquidations could in principle
+  share all four fields (same millisecond, same side, same price, same
+  size) and would then be incorrectly collapsed into one. No fabricated ID
+  is invented and no raw evidence is discarded beyond this specific,
+  explicitly-labeled collision risk — the alternative (not deduplicating at
+  all) trades a rare false negative for a comparatively more likely false
+  positive from genuine WS redelivery, which is the more common failure
+  mode this heuristic targets. Do not describe this elsewhere as "exact" or
+  "guaranteed" deduplication.
 - **Empty-interval semantics are explicit**, per the requirement that "no row
   = zero" must not be silently assumed: `liquidation_stream_available`
   distinguishes a day with **no liquidation segment collected at all**
