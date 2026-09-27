@@ -358,3 +358,132 @@ def test_production_function_is_what_fails_not_a_test_reimplementation():
     # The old defect's exact shape -- a bare continue with no raise -- must
     # not be reachable when strict is True.
     assert "if strict:" in source
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation hardening (p0-5-reconcile-discovery-hardening): file
+# discovery itself used a bare glob.glob(...) call in both
+# _max_label_horizon_s_detailed and generate_splits, independently of each
+# other. glob.glob silently returns [] on a directory-listing/stat failure
+# (permission denied, a parent-directory access failure) -- indistinguishable
+# from the labeled directory never having existed, which both call sites
+# would then report as "no labels" rather than raising. Consolidated into
+# one authoritative discover_labeled_files(), which both now call.
+# ---------------------------------------------------------------------------
+
+from collector.pipeline.label_generator import LabelDiscoveryError, discover_labeled_files
+
+
+def test_discovery_is_now_a_single_authoritative_function_not_duplicated():
+    """Guards against the discovery logic drifting back into two
+    independently-maintained glob.glob call sites."""
+    import inspect
+    from collector.pipeline import label_generator, split_generator
+
+    horizon_source = inspect.getsource(label_generator._max_label_horizon_s_detailed)
+    splits_source = inspect.getsource(split_generator.generate_splits)
+    assert "discover_labeled_files" in horizon_source
+    assert "discover_labeled_files" in splits_source
+    assert "glob.glob(" not in horizon_source
+    assert "glob.glob(" not in splits_source
+
+
+def test_absent_labeled_directory_is_not_an_error():
+    """State 1: genuinely nothing labeled yet -- must not raise."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        assert discover_labeled_files(tmp) == []
+
+
+def test_labeled_path_exists_but_is_not_a_directory_raises(tmp_path):
+    """State 2: a stray file where a directory was expected must never be
+    read as 'nothing labeled yet'."""
+    aligned_dir = tmp_path / "aligned"
+    aligned_dir.mkdir()
+    (aligned_dir / "labeled").write_text("not a directory")
+
+    with pytest.raises(LabelDiscoveryError, match="not a directory"):
+        discover_labeled_files(str(tmp_path))
+    with pytest.raises(LabelDiscoveryError):
+        max_label_horizon_s(str(tmp_path))
+    with pytest.raises(LabelDiscoveryError):
+        generate_splits(str(tmp_path), strict=False)
+
+
+def test_stat_failure_on_an_existing_labeled_directory_is_not_silently_absent(tmp_path, monkeypatch):
+    """The core reconciliation finding, reproduced with a precise
+    monkeypatch (this sandbox runs as root, so a real permission-bit
+    reproduction is not possible -- verified separately that
+    os.path.exists()/os.path.isdir() both still return True/True under a
+    genuine os.chmod(0o000) as root). os.path.exists()/os.path.isdir() both
+    catch OSError broadly (CPython's genericpath module) and would return
+    False for this exact failure, indistinguishable from genuine absence --
+    discover_labeled_files() calls os.stat() directly instead and must
+    raise for anything other than FileNotFoundError."""
+    _write_labeled(tmp_path, ["return_60s"], count=1)
+    labeled_dir = os.path.join(str(tmp_path), "aligned", "labeled")
+
+    real_stat = os.stat
+
+    def flaky_stat(path, *a, **kw):
+        if os.fspath(path) == labeled_dir:
+            raise PermissionError(13, "Permission denied", labeled_dir)
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+
+    with pytest.raises(LabelDiscoveryError, match="could not inspect"):
+        discover_labeled_files(str(tmp_path))
+    with pytest.raises(LabelDiscoveryError):
+        max_label_horizon_s(str(tmp_path))
+
+
+def test_stat_failure_end_to_end_through_generate_splits_is_not_none(tmp_path, monkeypatch):
+    """The exact bug this reconciliation closes: generate_splits() used to
+    discover its own file list via a separate glob.glob call, so this
+    failure was reported as 'No labeled files found' and None was returned
+    -- never reaching _max_label_horizon_s_detailed at all."""
+    _write_labeled(tmp_path, ["return_60s"], count=1)
+    labeled_dir = os.path.join(str(tmp_path), "aligned", "labeled")
+
+    real_stat = os.stat
+
+    def flaky_stat(path, *a, **kw):
+        if os.fspath(path) == labeled_dir:
+            raise PermissionError(13, "Permission denied", labeled_dir)
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+
+    with pytest.raises(LabelDiscoveryError):
+        generate_splits(str(tmp_path), strict=False)
+    assert not (tmp_path / "splits" / "split_manifest.json").exists()
+
+
+def test_listdir_failure_still_raises_after_reconciliation(tmp_path, monkeypatch):
+    """A directory that stats fine but cannot be listed must also raise --
+    confirms the reconciliation didn't narrow coverage to only the stat
+    call."""
+    _write_labeled(tmp_path, ["return_60s"], count=1)
+    labeled_dir = os.path.join(str(tmp_path), "aligned", "labeled")
+
+    real_listdir = os.listdir
+
+    def flaky_listdir(path, *a, **kw):
+        if os.fspath(path) == labeled_dir:
+            raise PermissionError(13, "Permission denied", labeled_dir)
+        return real_listdir(path, *a, **kw)
+
+    monkeypatch.setattr(os, "listdir", flaky_listdir)
+
+    with pytest.raises(LabelDiscoveryError, match="could not list"):
+        discover_labeled_files(str(tmp_path))
+
+
+def test_empty_but_listable_labeled_directory_is_not_an_error(tmp_path):
+    """State: directory exists, genuinely has zero files -- distinct from
+    every failure state above, and must remain a non-error, unchanged from
+    established behaviour."""
+    (tmp_path / "aligned" / "labeled").mkdir(parents=True)
+    assert discover_labeled_files(str(tmp_path)) == []
+    assert max_label_horizon_s(str(tmp_path)) == 0
