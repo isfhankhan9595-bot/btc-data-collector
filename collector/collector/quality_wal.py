@@ -45,12 +45,33 @@ RECORD IDENTITY
 Every appended event gets a ``quality_event_id`` of the form
 ``"{process_start_marker}-{global_seq}"``: deterministic and testable (the
 caller controls ``process_start_marker`` and the sequence is a plain
-incrementing integer, not random), globally unique for the process's
-lifetime, and monotonically informative -- a higher seq is always a later
-event, including across a WAL rotation (the sequence is never reset by
-rotation) and across a process restart (``QualityEventWAL.resume_from``
-continues counting from the highest seq recovery observed, so IDs never
-collide with a previous process's).
+incrementing integer, not random), monotonically informative within one
+``process_start_marker`` (a higher seq is always a later event, including
+across a WAL rotation -- the sequence is never reset by rotation), and
+resumed across a process restart via ``highest_recovered_seq`` so a new
+process's IDs never collide with an old one's **for the common case where
+the two processes' default ``process_start_marker`` values differ**.
+
+That default is ``f"{int(time.time()*1000)}-{os.getpid()}"`` --
+millisecond timestamp plus PID. This is NOT a mathematically proven
+collision-free identifier: two process starts landing in the exact same
+millisecond *and* receiving the same PID would produce the same marker.
+On a bare-metal host or VM this is vanishingly unlikely (process restart
+takes far longer than one millisecond, and PID reuse within that window
+essentially never happens in practice). Under containerized deployment,
+where the main process very commonly gets PID 1 in every fresh container,
+the PID half of that pair is far more likely to repeat across restarts
+than the reasoning above assumes -- the guarantee then rests entirely on
+the millisecond-timestamp half not coinciding across two separate
+container starts, which restart latency still makes practically
+implausible, but is not proven, not tested, and not something this module
+should be read as claiming to rule out. If that ever needs to be
+eliminated rather than merely made implausible, the caller can pass its
+own ``process_start_marker`` incorporating something guaranteed unique in
+its deployment (a container instance ID, for example) -- the module
+supports this today via the constructor parameter; it is not done by
+default in order to keep the identifier deterministic and testable rather
+than introducing a random or environment-sourced component.
 
 ============================================================================
 CHECKPOINTING AND ROTATION
@@ -100,7 +121,19 @@ class QualityEventWAL:
         self.process_start_marker = process_start_marker or f"{int(time.time() * 1000)}-{os.getpid()}"
         self._seq = start_seq
         self._lock = threading.Lock()
-        self._checkpointed_seq = start_seq - 1 if start_seq else -1
+        # Independent audit finding: this must read the ACTUAL on-disk
+        # checkpoint state, never infer it from start_seq. start_seq only
+        # tells the sequence counter where to resume from (so new IDs
+        # never collide with old ones) -- it says nothing about what is
+        # truly durable. Conflating the two meant a caller who legitimately
+        # needed to checkpoint a LOWER seq than start_seq-1 (e.g. recovery
+        # stopping at the first persist failure, checkpointing only the
+        # contiguous prefix before it) would silently no-op: checkpoint()'s
+        # own "up_to_seq <= self._checkpointed_seq -> return" guard would
+        # incorrectly believe that lower seq was already checkpointed,
+        # because start_seq alone said so, with no checkpoint.json ever
+        # written to back that belief up.
+        self._checkpointed_seq = _read_checkpointed_seq(self.wal_dir)
         self._active_path = self._new_wal_path()
         self._handle = open(self._active_path, "a", encoding="utf-8")
         self._write_failed = False
