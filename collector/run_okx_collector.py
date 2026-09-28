@@ -137,7 +137,8 @@ class OKXCollectorApp:
 
     def _capture_raw_frame(self, payload, *, local_receive_ts, connection_id=None,
                            connection_generation=None, decode_ok=True,
-                           decode_error=None, parsed=None, control_frame=False):
+                           decode_error=None, parsed=None, control_frame=False,
+                           local_receive_ns=None, receive_mono_ns=None):
         channel = None
         symbol = None
         if isinstance(parsed, dict):
@@ -148,7 +149,8 @@ class OKXCollectorApp:
         if control_frame:
             channel = "__control__"
         record = RawWireRecord(
-            local_receive_ts=local_receive_ts,
+            local_receive_ts=local_receive_ts, local_receive_ns=local_receive_ns,
+            receive_mono_ns=receive_mono_ns,
             payload=payload if isinstance(payload, str) else str(payload),
             venue="OKX", connection_id=connection_id,
             connection_generation=connection_generation, channel=channel,

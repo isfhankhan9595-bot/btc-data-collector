@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, FrozenSet, Optional
 import websockets
 
 from .backoff import BackoffExhausted, ExponentialBackoff
+from .clock import ReceiveStamp, capture_receive_stamp
 from .utils import logger
 
 
@@ -53,6 +54,9 @@ class IngestItem:
     data: Optional[dict]
     decode_error: Optional[str]
     is_control: bool
+    #: P0-11: the receive-boundary stamp, taken before decode/capture/queue.
+    #: Carried through unchanged; the worker never re-stamps.
+    receive_stamp: Optional[ReceiveStamp] = None
 
 
 class WebSocketClient:
@@ -71,6 +75,7 @@ class WebSocketClient:
         # Raw capture hook. Invoked with the undecoded frame text before
         # json.loads so a malformed payload is still preserved.
         self.on_raw_frame = on_raw_frame
+        self._raw_hook_takes_ns: Optional[bool] = None
         self._on_message_takes_connection = self._accepts_connection_id(on_message)
         self.running = False
         self.connected = False
@@ -159,6 +164,27 @@ class WebSocketClient:
         #: rather than either hanging shutdown forever or pretending the
         #: frame was fully processed.
         self.frames_abandoned_at_shutdown = 0
+
+    def _receive_kwargs(self, stamp: ReceiveStamp) -> dict:
+        """ns/monotonic kwargs for on_raw_frame, only when it accepts them.
+
+        Probed once (cached) so legacy hooks with a fixed signature keep
+        working unchanged and a genuine TypeError inside a hook is never
+        mistaken for a signature mismatch.
+        """
+        if self._raw_hook_takes_ns is None:
+            hook = self.on_raw_frame
+            try:
+                params = inspect.signature(hook).parameters
+                self._raw_hook_takes_ns = (
+                    "local_receive_ns" in params
+                    or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+                )
+            except (TypeError, ValueError):
+                self._raw_hook_takes_ns = False
+        if not self._raw_hook_takes_ns:
+            return {}
+        return {"local_receive_ns": stamp.wall_ns, "receive_mono_ns": stamp.mono_ns}
 
     @staticmethod
     def _accepts_connection_id(callback) -> bool:
@@ -352,7 +378,8 @@ class WebSocketClient:
             # Capture arrival time before anything else, including before
             # decoding, so it reflects actual network arrival rather than
             # any work performed on the frame afterward.
-            local_receive_ts = int(time.time() * 1000)
+            receive_stamp = capture_receive_stamp()
+            local_receive_ts = receive_stamp.wall_ms  # same clock read as wall_ns
             self._last_inbound_monotonic = self._monotonic()
             self.frames_received += 1
 
@@ -386,6 +413,7 @@ class WebSocketClient:
                         decode_error=decode_error,
                         parsed=data,
                         control_frame=is_control,
+                        **self._receive_kwargs(receive_stamp),
                     )
                 except Exception as exc:  # noqa: BLE001 - capture fails open
                     logger.warning("raw_frame_capture_failed", error=str(exc))
@@ -395,6 +423,7 @@ class WebSocketClient:
                 connection_id=self.connection_id,
                 connection_generation=self._connection_serial,
                 data=data, decode_error=decode_error, is_control=is_control,
+                receive_stamp=receive_stamp,
             )
 
             # Bounded queue, and never a dropped frame under normal
