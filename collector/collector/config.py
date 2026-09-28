@@ -56,13 +56,28 @@ ORDERBOOK_SCHEMA = pa.schema([
     ("obi_level_3", pa.float64()),
     ("obi_level_5", pa.float64()),
     ("instrument_key", pa.string()),
-], metadata={"schema_version": "1.1", "stream_name": "orderbook", "symbol": SYMBOL,
+    ("bid_depth", pa.int32()),
+    ("ask_depth", pa.int32()),
+], metadata={"schema_version": "1.2", "stream_name": "orderbook", "symbol": SYMBOL,
              "migration": "v1.1 adds nullable instrument_key (InstrumentId.key, e.g. "
                           "'BINANCE|linear_perpetual|BTC-USDT|BTCUSDT'); missing on rows "
                           "written before this version, never fabricated for them. This "
                           "stream is per-event resolved from BinanceAdapter.normalize()'s "
                           "own instrument stamp (see adapters/base.py __init_subclass__), "
-                          "not a blind constant -- see instrument.py"})
+                          "not a blind constant -- see instrument.py. "
+                          "v1.2 (P0-8) adds nullable bid_depth/ask_depth: the count of "
+                          "REAL observed levels in bids_price/asks_price (which are no "
+                          "longer padded to length 10 -- feature_computer.py used to repeat "
+                          "the last real price with a fabricated zero quantity when fewer "
+                          "than 10 levels existed; it no longer does, and bids_price/"
+                          "asks_price can now be shorter than 10). obi_level_3/obi_level_5 "
+                          "are null whenever bid_depth/ask_depth is below 3/5 respectively "
+                          "-- a level-N OBI computed over fewer than N real levels on either "
+                          "side is never written under that name. Missing on rows written "
+                          "before this version; never fabricated for them (the historical "
+                          "padding artifact in those rows' bids_price/asks_price is a known, "
+                          "pre-P0-8 data-quality limitation -- see "
+                          "docs/ORDERBOOK_LEVEL_TRUTH.md)."})
 
 TRADES_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),

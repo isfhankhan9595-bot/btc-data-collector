@@ -131,6 +131,54 @@ async def test_diff_depth_is_processed_from_local_book_with_received_timestamp()
 
 
 @pytest.mark.asyncio
+async def test_p0_8_partial_diff_does_not_shrink_features_to_the_diff_depth():
+    """P0-8: a diff touching only ONE level per side, applied to an
+    authoritative 10-level reconstructed book, must yield a feature row
+    built from all 10 real reconstructed levels -- never from the
+    1-level diff alone (a 1-row update is not a 1-level book)."""
+    app = _seed_bridged_book(_app_without_init())
+    diff = {"E": int(time.time() * 1000), "U": 11, "u": 11, "pu": 10,
+            "b": [["100.0", "2.0"]], "a": [["101.0", "2.0"]]}
+    await app.handle_message({"stream": "btcusdt@depth@100ms", "data": diff}, local_receive_ts=1)
+    record = app.ob_writer.write.call_args.args[0]
+    assert record["bid_depth"] == 10
+    assert record["ask_depth"] == 10
+    assert len(record["bids_price"]) == 10
+    assert record["bids_qty"][0] == 2.0  # the diff's change is applied
+    assert record["bids_qty"][1] == 1.0  # untouched real levels are preserved
+    assert record["obi_level_5"] is not None
+
+
+@pytest.mark.asyncio
+async def test_p0_8_genuinely_thin_book_is_never_padded_on_the_live_path():
+    """P0-8: when the authoritative reconstructed book genuinely has only
+    3 levels per side, the persisted feature row carries exactly 3 real
+    levels (bid_depth/ask_depth == 3), obi_level_3 is valid, and
+    obi_level_5 is None -- no fabricated levels 4-10."""
+    from decimal import Decimal as _D
+    app = _app_without_init()
+    snapshot = CanonicalOrderBookEvent(
+        "BINANCE", "orderbook", None, None, 0,
+        bids=tuple((_D("100.0") - _D("0.1") * i, _D("1.0")) for i in range(3)),
+        asks=tuple((_D("101.0") + _D("0.1") * i, _D("1.0")) for i in range(3)),
+        update_id=10, is_snapshot=True,
+    )
+    app.binance_book.snapshot(snapshot)
+    app.binance_book.state.recovered()
+    diff = {"E": int(time.time() * 1000), "U": 11, "u": 11, "pu": 10,
+            "b": [["100.0", "2.0"]], "a": [["101.0", "2.0"]]}
+    await app.handle_message({"stream": "btcusdt@depth@100ms", "data": diff}, local_receive_ts=1)
+    record = app.ob_writer.write.call_args.args[0]
+    assert record["bid_depth"] == 3
+    assert record["ask_depth"] == 3
+    assert len(record["bids_price"]) == 3
+    assert len(record["asks_price"]) == 3
+    assert len(set(record["bids_price"])) == 3  # no repeated (fabricated) price
+    assert record["obi_level_3"] is not None
+    assert record["obi_level_5"] is None
+
+
+@pytest.mark.asyncio
 async def test_markprice_local_timestamp_is_receive_time_not_processing_time():
     """P0-6: markprice's ``local_timestamp`` must be the frame's actual
     receive time (captured once at ``handle_message`` entry), never a
