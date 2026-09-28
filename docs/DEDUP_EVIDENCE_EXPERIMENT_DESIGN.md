@@ -370,3 +370,30 @@ classification, 1 for the tied-timestamp suppression, plus the earlier
 rebase-survival checks). Full suite: **1354 passed**. `compileall` and
 `git diff --check` clean. Scope unchanged: exactly `dedup_evidence_analysis.
 py`, its test file, and this design doc.
+
+## Final rebase verification (onto main `f2829b24`)
+
+Rebased again onto current main (now includes P0-1, P0-6, P0-7 and the P0-5
+reconciliation through PR #65, none of which touch this PR's three files)
+with `--rebase-merges`, restoring the branch's own already-reconciled merge
+commit at its one known conflict point. `git diff origin/main...HEAD
+--name-only` is exactly the same three files. `test_p0_5_fail_closed_label_
+horizon.py` (PR #65's restored test) is untouched by this PR and passes.
+
+Which `UnhandledReason` values can genuinely occur on the forensic bypass
+path: `NO_ROUTE`, `CHANNEL_NOT_IMPLEMENTED`, `CONTROL_FRAME`, `EMPTY_DATA`
+and an internally-detected `MALFORMED_PAYLOAD` are all raised from inside
+each adapter's own parser and so pass through unchanged. `DUPLICATE_TRADE`
+cannot: it is raised only inside the production wrapper's `_dedupe_trades`
+(`adapters/base.py`), which the bypass never calls. Pinned by a test so a
+future change reintroducing dedup on this path would be visible.
+
+Mutation re-verification against the rebased source, all six caught: timestamp
+helper reduced to int-only (4 failing tests), adapter-specific unhandled
+classification removed (3), tied-timestamp reconnect suppression removed (1),
+bypass replaced with production `normalize()` fallback (3), same-frame
+duplicate collapse reintroduced (11), `InstrumentIdError` swallowed again (1).
+Three of these first appeared to pass undetected; each was a flaw in the
+mutation itself (a pattern that never applied, a fallback branch placed after
+a raise that already fired, an `except ()` clause that matches nothing), not a
+test gap -- corrected and re-run before being counted as caught.

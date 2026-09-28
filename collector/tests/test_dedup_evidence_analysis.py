@@ -596,6 +596,27 @@ def test_raw_forensic_analysis_uses_raw_rows_not_deduplicated_replay_output():
 # ---------------------------------------------------------------------------
 
 
+def test_duplicate_trade_unhandled_reason_never_occurs_on_the_bypass_path():
+    """UnhandledReason.DUPLICATE_TRADE is raised only inside the production
+    wrapper's _dedupe_trades (adapters/base.py), which the forensic bypass
+    never calls -- it invokes the raw parser via __wrapped__ directly. So
+    of the adapter's unhandled reasons, DUPLICATE_TRADE cannot genuinely
+    occur here. A same-frame duplicate must therefore yield BOTH records and
+    ZERO invalid-record issues; if a future change reintroduced dedup on
+    this path, it would surface as UNHANDLED_DUPLICATE_TRADE (or a lost
+    record) instead of passing silently."""
+    payload = json.dumps({"arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"}, "data": [
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+        {"instId": "BTC-USDT-SWAP", "tradeId": "1", "px": "100", "sz": "1", "side": "buy", "ts": "1000"},
+    ]})
+    conversion = convert_raw_wire_to_dedup_evidence([{
+        "venue": "OKX", "market_type": "linear_perpetual", "local_receive_ts": 1000, "payload": payload,
+    }])
+    assert len(conversion.records) == 2
+    assert conversion.invalid_records == []
+    assert not any("DUPLICATE_TRADE" in issue.reason for issue in conversion.invalid_records)
+
+
 def test_raw_converter_preserves_a_same_frame_duplicate_trade():
     """Critical Issue #2's mandatory test: a SINGLE raw frame containing
     two identical trade entries must produce TWO DedupEvidenceRecord
