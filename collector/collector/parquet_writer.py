@@ -6,7 +6,7 @@ import os
 import time
 from datetime import date as _date, datetime, timezone
 from pathlib import Path
-from typing import IO, Any, Callable, Dict, List, Optional
+from typing import IO, Any, Callable, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -128,6 +128,7 @@ class ParquetWriter:
         segment_rows: int = 5_000, segment_seconds: float = 30.0,
         quality_event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         exchange: str = "BINANCE",
+        on_segment_published: Optional[Callable[[Tuple[str, int], Path], None]] = None,
     ) -> None:
         if segment_rows <= 0 or segment_seconds <= 0:
             raise ValueError("segment_rows and segment_seconds must be positive")
@@ -142,6 +143,10 @@ class ParquetWriter:
         self.stream_dir = Path(base_dir) / "raw" / stream_name
         self.stream_dir.mkdir(parents=True, exist_ok=True)
         self._closed = False
+        #: P0-4: called after a segment is durably published (fsync+rename+dir
+        #: fsync) with ``((hour, seq), final_path)``. None = no behaviour change.
+        self.on_segment_published = on_segment_published
+        self._publication_failure: Optional[BaseException] = None
         self._lock_handle: Optional[IO[bytes]] = _acquire_writer_lock(self.stream_dir)
         try:
             self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
@@ -325,7 +330,20 @@ class ParquetWriter:
             os.fsync(handle.fileno())
         os.replace(temporary, self._counter_filepath)
 
-    def write(self, record: Dict[str, Any]) -> None:
+    def current_segment_token(self) -> Tuple[str, int]:
+        return (self.current_hour, self._seq)
+
+    def write(self, record: Dict[str, Any], *,
+              bind: Optional[Callable[[Tuple[str, int]], None]] = None) -> None:
+        """Append ``record``. ``bind(token)``, if given, is called with the
+        token of the segment that will receive the record -- after any hour
+        rollover, before the append -- so a caller can attribute the record to
+        its segment exactly (a rotation after the append cannot race it)."""
+        if self._publication_failure is not None:
+            raise RuntimeError(
+                f"ParquetWriter for {self.stream_name!r} refuses writes: the segment-publication "
+                f"hook failed ({self._publication_failure!r}); dedup/storage state is uncertain"
+            ) from self._publication_failure
         hour = self._get_current_hour_str()
         if hour != self.current_hour:
             if self._closed:
@@ -339,6 +357,8 @@ class ParquetWriter:
             self._finalize_segment()
             self.current_hour, self._seq = hour, self._next_sequence(hour)
             self._open_segment()
+        if bind is not None:
+            bind((self.current_hour, self._seq))
         self.buffer.append(record)
         ts = _epoch_ms(record.get("timestamp"))
         if self._first_record_ts is None:
@@ -403,6 +423,13 @@ class ParquetWriter:
                 f"segment published but metadata sidecar failed: {type(exc).__name__}: {exc}",
             )
         logger.info("closed_parquet_segment", stream=self.stream_name, file=str(final), rows=self.record_count)
+        if self.on_segment_published is not None:
+            try:
+                self.on_segment_published((self.current_hour, self._seq), final)
+            except Exception as exc:  # noqa: BLE001 - segment is durable; fail CLOSED on the next write
+                self._publication_failure = exc
+                self._emit_quality("DEDUP_STATE_FAILED",
+                                   f"segment published but publication hook failed: {type(exc).__name__}: {exc}")
         self._sequence_cache[self.current_hour] = self._seq + 1
         if open_next:
             self._seq += 1
