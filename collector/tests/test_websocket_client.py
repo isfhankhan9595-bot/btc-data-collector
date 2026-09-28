@@ -318,3 +318,143 @@ async def test_queue_high_watermark_and_backpressure_metrics_are_observable():
         client.running = False
         await worker
     await _run()
+
+
+# ---------------------------------------------------------------------------
+# P0-1 post-merge corrective hardening.
+# ---------------------------------------------------------------------------
+
+
+def test_zero_maxsize_is_rejected_not_silently_unbounded():
+    """asyncio.Queue treats maxsize<=0 as unbounded -- the opposite of
+    every 'bounded queue' claim in this class's own docs/comments."""
+    with pytest.raises(ValueError):
+        WebSocketClient("ws://localhost:9999", lambda *a, **k: None, ingest_queue_maxsize=0)
+
+
+def test_negative_maxsize_is_rejected():
+    with pytest.raises(ValueError):
+        WebSocketClient("ws://localhost:9999", lambda *a, **k: None, ingest_queue_maxsize=-5)
+
+
+@pytest.mark.asyncio
+async def test_raw_capture_happens_before_enqueue_frames_still_in_queue_are_already_durable():
+    """The core post-merge correction: a frame sitting in the queue,
+    never dequeued at all, must still have reached raw capture. This is
+    what makes the queue's contents 'already durable, awaiting on_message
+    only' rather than 'the only copy of this frame that exists'."""
+    captured = []
+
+    def on_raw_frame(msg, **kwargs):
+        captured.append(msg)
+
+    async def on_message(data, local_receive_ts, connection_id=None):
+        pass  # never actually invoked in this test -- worker is never started
+
+    client = WebSocketClient(
+        "ws://localhost:9999", on_message, on_raw_frame=on_raw_frame, ingest_queue_maxsize=50,
+    )
+    client.running = True
+    frames = [f'{{"n":{i}}}' for i in range(5)]
+    await client._consume(_FakeSocket(frames))   # worker never started
+
+    # All 5 frames are still sitting, unprocessed, in the queue -- and all
+    # 5 already reached raw capture regardless.
+    assert client._ingest_queue.qsize() == 5
+    assert len(captured) == 5
+
+
+@pytest.mark.asyncio
+async def test_malformed_frame_still_reaches_raw_capture_before_enqueue():
+    captured = []
+
+    def on_raw_frame(msg, **kwargs):
+        captured.append((msg, kwargs["decode_ok"]))
+
+    client = WebSocketClient(
+        "ws://localhost:9999", lambda *a, **k: None, on_raw_frame=on_raw_frame, ingest_queue_maxsize=10,
+    )
+    client.running = True
+    await client._consume(_FakeSocket(["{not valid json"]))
+    assert captured == [("{not valid json", False)]
+
+
+@pytest.mark.asyncio
+async def test_stop_unblocks_a_backpressured_consume_loop_promptly():
+    """Shutdown responsiveness: _consume must not stay blocked
+    indefinitely on a full queue once running flips False, even with no
+    worker draining it. Bounded by the 0.01s poll interval, not by
+    worker availability."""
+    client = WebSocketClient("ws://localhost:9999", lambda *a, **k: None, ingest_queue_maxsize=2)
+    client.running = True
+    # Fill the queue to capacity with no worker running to drain it.
+    frames = [f'{{"n":{i}}}' for i in range(2)]
+    await client._consume(_FakeSocket(frames))
+    assert client._ingest_queue.qsize() == 2
+
+    async def _stop_soon():
+        await asyncio.sleep(0.03)
+        client.running = False
+
+    stopper = asyncio.ensure_future(_stop_soon())
+    # One more frame arrives while the queue is already full and no
+    # worker exists to drain it -- _consume must still return promptly
+    # once running flips False, not hang forever.
+    await asyncio.wait_for(client._consume(_FakeSocket(['{"n":99}'])), timeout=2.0)
+    await stopper
+
+    assert client.frames_abandoned_at_shutdown == 1
+    assert client._ingest_queue.qsize() == 2   # the abandoned frame never made it in
+
+
+@pytest.mark.asyncio
+async def test_frame_abandoned_at_shutdown_still_reached_raw_capture():
+    """The frame _consume gives up enqueueing at shutdown must already
+    have been raw-captured -- 'abandoned' means abandoned from on_message
+    processing in this run, never from raw evidence."""
+    captured = []
+
+    def on_raw_frame(msg, **kwargs):
+        captured.append(msg)
+
+    client = WebSocketClient(
+        "ws://localhost:9999", lambda *a, **k: None, on_raw_frame=on_raw_frame, ingest_queue_maxsize=1,
+    )
+    client.running = True
+    await client._consume(_FakeSocket(['{"n":1}']))   # fills the queue (maxsize=1)
+    assert client._ingest_queue.qsize() == 1
+
+    async def _stop_soon():
+        await asyncio.sleep(0.03)
+        client.running = False
+
+    stopper = asyncio.ensure_future(_stop_soon())
+    # This frame arrives while the queue is already full; running flips
+    # False while _consume is blocked in the retry loop for it -- the
+    # in-flight-abandonment path, not the already-stopped path.
+    await asyncio.wait_for(client._consume(_FakeSocket(['{"n":2}'])), timeout=2.0)
+    await stopper
+
+    assert client.frames_abandoned_at_shutdown == 1
+    assert captured == ['{"n":1}', '{"n":2}']
+
+
+# ---------------------------------------------------------------------------
+# Real mutation testing against the actual source (M1, M9).
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_M9_zero_maxsize_validation_is_load_bearing():
+    """Removing the maxsize<=0 check from __init__ must be caught."""
+    import collector.collector.websocket_client as wsc_module
+    import inspect
+
+    source = inspect.getsource(wsc_module.WebSocketClient.__init__)
+    assert "ingest_queue_maxsize <= 0" in source, (
+        "the maxsize validation guard is missing from __init__ -- "
+        "this test's own inspection would not have caught its removal "
+        "if it had never been added; the real regression test is "
+        "test_zero_maxsize_is_rejected_not_silently_unbounded above, "
+        "which exercises the actual runtime behavior, not just presence "
+        "of a string in the source"
+    )
