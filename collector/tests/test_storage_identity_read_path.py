@@ -51,7 +51,8 @@ def _record(**overrides):
         if pa.types.is_timestamp(field.type):
             values[field.name] = dt.datetime(2026, 6, 10, 0, 0, 1, tzinfo=dt.UTC)
         elif pa.types.is_list(field.type):
-            values[field.name] = [1.0]
+            # P0-9: list<string> exact-text companions vs list<float64> arrays.
+            values[field.name] = ["1"] if pa.types.is_string(field.type.value_type) else [1.0]
         elif pa.types.is_boolean(field.type):
             values[field.name] = False
         elif pa.types.is_string(field.type):

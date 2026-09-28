@@ -57,6 +57,7 @@ MARKET_TYPE_SPOT = "spot"
 
 
 from ..instrument import BINANCE_SPOT_BTCUSDT
+from ..numeric import dec
 
 class BinanceSpotAdapter(ExchangeAdapter):
     #: Book-engine/storage-namespace key -- see module docstring. Canonical
@@ -129,8 +130,8 @@ class BinanceSpotAdapter(ExchangeAdapter):
 
         if route == "trades" or (isinstance(d, dict) and d.get("e") == "trade"):
             try:
-                price = float(d["p"])
-                quantity = float(d["q"])
+                price = dec(d["p"])
+                quantity = dec(d["q"])
             except (KeyError, TypeError, ValueError):
                 return self.unhandled(UnhandledReason.MALFORMED_PAYLOAD, raw, local_receive_ts=now)
             return [CanonicalTradeEvent(

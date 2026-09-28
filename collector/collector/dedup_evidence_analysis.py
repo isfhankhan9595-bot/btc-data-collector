@@ -312,17 +312,16 @@ def _valid_local_receive_ts(value: Any) -> tuple[Optional[int], Optional[str]]:
 
 
 def _duplicate_classification(first: DedupEvidenceRecord, duplicate: DedupEvidenceRecord) -> tuple[str, tuple[str, ...]]:
-    """See test_duplicate_classification_is_not_masked_by_float_precision_at_btc_usdt_scale
-    for the evidence behind comparing canonical_price/quantity as float here.
-    All four adapters parse them via `float(decimal_string)`. IEEE-754 double
-    has ~15-17 significant decimal digits; a BTC-USDT price (~5 significant
-    digits before the point) with up to 8 fractional digits (1 satoshi) is
-    ~13 significant digits total, well inside that range, so two DISTINCT
-    decimal strings a real venue could actually send cannot round to the
-    same float. This claim is deliberately narrow: it covers the precision
-    these four venues transmit today, not an arbitrary decimal string, and
-    it is not a resolution of the separate native-precision-loss question
-    (out of scope here) about whether float is the right STORAGE type."""
+    """Compare canonical price/quantity EXACTLY (P0-9).
+
+    The canonical fields are ``Decimal`` parsed from the venue's decimal text,
+    so this comparison is exact ``Decimal`` equality: two distinct venue
+    decimal strings can never compare equal, and no precision argument about
+    binary floating point is needed. (Before P0-9 these were floats and this
+    docstring carried a narrow argument that BTC-USDT scale was safe; that
+    argument is now unnecessary.) Historical rows written before P0-9 hold
+    float64 values whose precision may already be lost -- see
+    docs/NUMERIC_PRECISION.md."""
     different_fields = tuple(
         name for name, first_value, duplicate_value in (
             ("canonical_price", first.canonical_price, duplicate.canonical_price),

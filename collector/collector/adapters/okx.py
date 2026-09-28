@@ -47,8 +47,8 @@ from ..canonical import (
 from ..sequence import OKXSequenceComparator
 
 
-def _num(value: Any) -> Optional[float]:
-    """Best-effort numeric-string -> float. Empty/None/unparseable -> None.
+def _num(value: Any) -> Optional[Decimal]:
+    """Best-effort numeric-string -> exact Decimal (P0-9). Empty/None/unparseable -> None.
 
     Never raises: several OKX fields (``nextFundingRate``, ``impactValue``,
     liquidation ``ccy``-adjacent numerics) are documented as sometimes an
@@ -59,7 +59,7 @@ def _num(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        return dec(value)
     except (TypeError, ValueError):
         return None
 
@@ -74,6 +74,8 @@ def _int(value: Any) -> Optional[int]:
 
 
 from ..instrument import MARKET_LINEAR_PERPETUAL, resolve_instrument
+from decimal import Decimal
+from ..numeric import dec
 
 class OKXAdapter(ExchangeAdapter):
     venue = "OKX"
@@ -184,8 +186,8 @@ class OKXAdapter(ExchangeAdapter):
     def _parse_books(self, data, now):
         return [CanonicalOrderBookEvent(
             "OKX", "orderbook", int(d["ts"]), None, now,
-            bids=tuple((float(x[0]), float(x[1])) for x in d.get("bids", [])),
-            asks=tuple((float(x[0]), float(x[1])) for x in d.get("asks", [])),
+            bids=tuple((dec(x[0]), dec(x[1])) for x in d.get("bids", [])),
+            asks=tuple((dec(x[0]), dec(x[1])) for x in d.get("asks", [])),
             update_id=d.get("seqId"), previous_update_id=d.get("prevSeqId"),
             is_snapshot=d.get("prevSeqId") == -1,
         ) for d in data]
@@ -202,7 +204,7 @@ class OKXAdapter(ExchangeAdapter):
         """
         return [CanonicalTradeEvent(
             "OKX", "trades", _int(d["ts"]), None, now,
-            trade_id=d.get("tradeId"), price=float(d["px"]), quantity=float(d["sz"]),
+            trade_id=d.get("tradeId"), price=dec(d["px"]), quantity=dec(d["sz"]),
             side=d.get("side"), venue_sequence=_int(d.get("seqId")),
         ) for d in data]
 
@@ -217,7 +219,7 @@ class OKXAdapter(ExchangeAdapter):
         """
         return [CanonicalTradeEvent(
             "OKX", "trades-all", _int(d["ts"]), None, now,
-            trade_id=d.get("tradeId"), price=float(d["px"]), quantity=float(d["sz"]),
+            trade_id=d.get("tradeId"), price=dec(d["px"]), quantity=dec(d["sz"]),
             side=d.get("side"), venue_sequence=_int(d.get("seqId")), source=d.get("source"),
         ) for d in data]
 
@@ -228,7 +230,7 @@ class OKXAdapter(ExchangeAdapter):
         style channel-purity requires."""
         return [CanonicalMarkPriceEvent(
             "OKX", "mark-price", _int(d["ts"]), None, now,
-            mark_price=float(d["markPx"]),
+            mark_price=dec(d["markPx"]),
         ) for d in data]
 
     def _parse_index_tickers(self, data, now):
@@ -271,7 +273,7 @@ class OKXAdapter(ExchangeAdapter):
         unnamed field."""
         return [CanonicalOIEvent(
             "OKX", "open-interest", _int(d["ts"]), None, now,
-            open_interest=float(d["oi"]), oi_ccy=_num(d.get("oiCcy")),
+            open_interest=dec(d["oi"]), oi_ccy=_num(d.get("oiCcy")),
             oi_usd=_num(d.get("oiUsd")), source=OISource.WS_PUSH,
             # OKX documents `oi` as "Open interest, in contracts"
             # (docs/OKX_D11_CHANNEL_SCHEMAS.md) and `oiCcy` as base currency.

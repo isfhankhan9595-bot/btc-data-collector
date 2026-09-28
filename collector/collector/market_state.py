@@ -49,6 +49,7 @@ from typing import Optional
 
 from .book_engine import NON_AUTHORITATIVE_BOOK_SOURCES
 from .instrument import InstrumentId
+from .numeric import to_float
 from .canonical import (
     CanonicalLiquidationEvent,
     CanonicalMarkPriceEvent,
@@ -314,12 +315,12 @@ class MarketStateEngine:
         if last_mark is not None:
             mark_ts = last_mark.local_receive_ts
             mark_stale = (observation_ts - mark_ts) > self._mark_stale_ms
-            mark_price, index_price = last_mark.mark_price, last_mark.index_price
+            mark_price, index_price = to_float(last_mark.mark_price), to_float(last_mark.index_price)
         price_vs_mark = None
         if last_trade is not None and mark_price is not None and not mark_stale:
-            price_vs_mark = last_trade.price - mark_price
+            price_vs_mark = to_float(last_trade.price) - mark_price
         return PriceState(
-            last_trade_price=last_trade.price if last_trade else None,
+            last_trade_price=to_float(last_trade.price) if last_trade else None,
             last_trade_ts=last_trade.local_receive_ts if last_trade else None,
             mark_price=mark_price, index_price=index_price, mark_ts=mark_ts,
             mark_stale=mark_stale, price_vs_mark=price_vs_mark,
@@ -357,15 +358,15 @@ class MarketStateEngine:
         for t in trades:
             side = (t.side or "").lower()
             if side in ("buy", "b"):
-                buy += t.quantity
+                buy += float(t.quantity)
             elif side in ("sell", "s"):
-                sell += t.quantity
+                sell += float(t.quantity)
             # An unrecognised/absent side contributes to trade_count only,
             # never silently guessed into buy or sell.
         window_start = observation_ts - self._trade_flow_window_ms
         windowed = [t for t in trades if t.local_receive_ts > window_start]
-        w_buy = sum(t.quantity for t in windowed if (t.side or "").lower() in ("buy", "b"))
-        w_sell = sum(t.quantity for t in windowed if (t.side or "").lower() in ("sell", "s"))
+        w_buy = sum(float(t.quantity) for t in windowed if (t.side or "").lower() in ("buy", "b"))
+        w_sell = sum(float(t.quantity) for t in windowed if (t.side or "").lower() in ("sell", "s"))
         return TradeFlowState(
             cumulative_buy_volume=buy, cumulative_sell_volume=sell, cvd=buy - sell,
             trade_count=len(trades), window_ms=self._trade_flow_window_ms,
@@ -378,8 +379,8 @@ class MarketStateEngine:
         liqs = self._available_at(self._liquidations, observation_ts)
         if not liqs:
             return LiquidationState()
-        buy_qty = sum(l.quantity or 0.0 for l in liqs if (l.side or "").lower() in ("buy", "b"))
-        sell_qty = sum(l.quantity or 0.0 for l in liqs if (l.side or "").lower() in ("sell", "s"))
+        buy_qty = sum(float(l.quantity) if l.quantity is not None else 0.0 for l in liqs if (l.side or "").lower() in ("buy", "b"))
+        sell_qty = sum(float(l.quantity) if l.quantity is not None else 0.0 for l in liqs if (l.side or "").lower() in ("sell", "s"))
         return LiquidationState(
             liquidation_count=len(liqs), buy_side_quantity=buy_qty,
             sell_side_quantity=sell_qty, last_liquidation_ts=liqs[-1].local_receive_ts,
@@ -394,19 +395,19 @@ class MarketStateEngine:
         oi_stale = True
         if ois:
             latest_oi = ois[-1]
-            oi_val, oi_unit, oi_ts = latest_oi.open_interest, latest_oi.unit, latest_oi.local_receive_ts
+            oi_val, oi_unit, oi_ts = to_float(latest_oi.open_interest), latest_oi.unit, latest_oi.local_receive_ts
             oi_stale = (observation_ts - oi_ts) > self._oi_stale_ms
             if len(ois) >= 2 and ois[-2].unit == oi_unit and ois[-2].open_interest is not None and oi_val is not None:
                 # Same engine, same venue, same unit by construction -- the
                 # one case canonical.py's OIUnit contract calls safe even
                 # when the unit itself is UNKNOWN.
-                oi_change = oi_val - ois[-2].open_interest
+                oi_change = oi_val - to_float(ois[-2].open_interest)
         funding_rate = funding_ts = funding_age = None
         funding_stale = True
         if marks:
             latest_mark = marks[-1]
             if latest_mark.funding_rate is not None:
-                funding_rate = latest_mark.funding_rate
+                funding_rate = to_float(latest_mark.funding_rate)
                 funding_ts = latest_mark.local_receive_ts
                 funding_age = observation_ts - funding_ts
                 funding_stale = funding_age > self._funding_stale_ms

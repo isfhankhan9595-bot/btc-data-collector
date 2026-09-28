@@ -284,8 +284,11 @@ class BybitCollectorApp:
         bids, asks = applied.bids, applied.asks
         self.ob_writer.write({
             **base,
-            "bids_price": [float(p) for p, _ in bids], "bids_qty": [float(q) for _, q in bids],
-            "asks_price": [float(p) for p, _ in asks], "asks_qty": [float(q) for _, q in asks],
+            # P0-9: the book engine holds exact Decimals; pass them through and let
+            # numeric.column_value (the single boundary) derive the float64
+            # columns and the exact-text companions.
+            "bids_price": [p for p, _ in bids], "bids_qty": [q for _, q in bids],
+            "asks_price": [p for p, _ in asks], "asks_qty": [q for _, q in asks],
             "update_id": event.update_id, "sequence": event.sequence,
             "is_snapshot": event.is_snapshot,
         })

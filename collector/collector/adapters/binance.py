@@ -7,6 +7,7 @@ from ..canonical import CanonicalLiquidationEvent, CanonicalMarkPriceEvent, Cano
 from ..sequence import BinanceSequenceComparator, binance_snapshot_bridge
 
 from ..instrument import BINANCE_USDM_BTCUSDT
+from ..numeric import dec
 
 class BinanceAdapter(ExchangeAdapter):
     venue = "BINANCE"
@@ -39,10 +40,10 @@ class BinanceAdapter(ExchangeAdapter):
         if route == "orderbook" or d.get("e") == "depthUpdate":
             source = "PARTIAL_DEPTH" if "@depth10" in raw.get("stream", "") else "DIFF_DEPTH_RECONSTRUCTED"
             return [CanonicalOrderBookEvent("BINANCE","orderbook",d.get("E"),d.get("T"),now, bids=tuple((Decimal(p),Decimal(q)) for p,q in d.get("b",[])), asks=tuple((Decimal(p),Decimal(q)) for p,q in d.get("a",[])), update_id=d.get("u"),first_update_id=d.get("U"),previous_update_id=d.get("pu"), is_snapshot=False, book_source=source)]
-        if route == "trades" or d.get("e") == "aggTrade": return [CanonicalTradeEvent("BINANCE","trades",d.get("E"),d.get("T"),now,trade_id=str(d.get("a")) if d.get("a") is not None else None,price=float(d["p"]),quantity=float(d["q"]),side="SELL" if d.get("m") else "BUY",nq=float(d["nq"]) if d.get("nq") is not None else None)]
-        if route == "markprice" or d.get("e") == "markPriceUpdate": return [CanonicalMarkPriceEvent("BINANCE","markprice",d.get("E"),None,now,mark_price=float(d["p"]),index_price=float(d["i"]) if d.get("i") is not None else None,funding_rate=float(d["r"]),next_funding_time=d.get("T"))]
+        if route == "trades" or d.get("e") == "aggTrade": return [CanonicalTradeEvent("BINANCE","trades",d.get("E"),d.get("T"),now,trade_id=str(d.get("a")) if d.get("a") is not None else None,price=dec(d["p"]),quantity=dec(d["q"]),side="SELL" if d.get("m") else "BUY",nq=dec(d["nq"]) if d.get("nq") is not None else None)]
+        if route == "markprice" or d.get("e") == "markPriceUpdate": return [CanonicalMarkPriceEvent("BINANCE","markprice",d.get("E"),None,now,mark_price=dec(d["p"]),index_price=dec(d["i"]) if d.get("i") is not None else None,funding_rate=dec(d["r"]),next_funding_time=d.get("T"))]
         if route == "liquidation" or d.get("e") == "forceOrder":
-            o=d.get("o",{}); return [CanonicalLiquidationEvent("BINANCE","liquidation",d.get("E"),o.get("T"),now,side=o.get("S"),price=float(o["p"]),quantity=float(o["q"]))]
+            o=d.get("o",{}); return [CanonicalLiquidationEvent("BINANCE","liquidation",d.get("E"),o.get("T"),now,side=o.get("S"),price=dec(o["p"]),quantity=dec(o["q"]))]
         if not isinstance(d, dict) or not d:
             return self.unhandled(UnhandledReason.MALFORMED_PAYLOAD, raw, local_receive_ts=now)
         if any(key in raw for key in ("result", "id", "code", "msg")) and "data" not in raw:

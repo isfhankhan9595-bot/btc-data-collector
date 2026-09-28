@@ -1,5 +1,16 @@
 import time
+
+from .numeric import dec
 from typing import Dict, Any, Optional
+
+def _required(msg: Dict[str, Any], key: str) -> Any:
+    """A venue numeric field that MUST be present. A missing value is a
+    malformed message (raises ValueError -> callers return {}), never a
+    fabricated 0.0 that would look like a real price/rate/quantity."""
+    if key not in msg or msg[key] is None:
+        raise ValueError(f"missing required numeric field {key!r}")
+    return msg[key]
+
 
 def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     bids = msg.get("b", [])
@@ -9,11 +20,14 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     try:
-        bids_price = [float(b[0]) for b in bids]
-        bids_qty = [float(b[1]) for b in bids]
-        asks_price = [float(a[0]) for a in asks]
-        asks_qty = [float(a[1]) for a in asks]
-    except (ValueError, TypeError):
+        # P0-9: parse EXACTLY (Decimal from the venue string, never via
+        # float). The evidence arrays below stay Decimal; float64 only ever
+        # appears as an explicitly derived value (best_bid, obi, ...).
+        bids_price = [dec(b[0]) for b in bids]
+        bids_qty = [dec(b[1]) for b in bids]
+        asks_price = [dec(a[0]) for a in asks]
+        asks_qty = [dec(a[1]) for a in asks]
+    except (ValueError, TypeError, IndexError):
         return {}
 
     # P0-8: NEVER fabricate a missing price level. Truncate to the top 10
@@ -30,6 +44,17 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     asks_qty = asks_qty[:10]
     bid_depth = len(bids_price)
     ask_depth = len(asks_price)
+
+    # Exact evidence (Decimal) is kept for the persisted arrays; the float
+    # mirrors below exist ONLY for the derived analytics that follow
+    # (float(Decimal(text)) is identical to float(text), so those values are
+    # unchanged from before P0-9).
+    evidence_bids_price, evidence_bids_qty = bids_price, bids_qty
+    evidence_asks_price, evidence_asks_qty = asks_price, asks_qty
+    bids_price = [float(x) for x in evidence_bids_price]
+    bids_qty = [float(x) for x in evidence_bids_qty]
+    asks_price = [float(x) for x in evidence_asks_price]
+    asks_qty = [float(x) for x in evidence_asks_qty]
 
     best_bid = bids_price[0]
     best_ask = asks_price[0]
@@ -87,10 +112,10 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": timestamp,
         "exchange_timestamp": exchange_timestamp,
         "local_timestamp": timestamp,
-        "bids_price": bids_price,
-        "bids_qty": bids_qty,
-        "asks_price": asks_price,
-        "asks_qty": asks_qty,
+        "bids_price": evidence_bids_price,
+        "bids_qty": evidence_bids_qty,
+        "asks_price": evidence_asks_price,
+        "asks_qty": evidence_asks_qty,
         "bid_depth": bid_depth,
         "ask_depth": ask_depth,
         "best_bid": best_bid,
@@ -109,15 +134,15 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_trades_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        trade_id = int(msg.get("a", -1))
-        price = float(msg.get("p", 0.0))
-        quantity = float(msg.get("q", 0.0))
+        trade_id = int(msg.get("a", -1))  # exact integer; never via float
+        price = dec(_required(msg, "p"))
+        quantity = dec(_required(msg, "q"))
         is_buyer_maker = bool(msg.get("m", False))
     except (ValueError, TypeError):
         return {}
 
     side_sign = -1 if is_buyer_maker else 1
-    signed_qty = quantity * side_sign
+    signed_qty = float(quantity) * side_sign  # derived analytic (float64)
 
     timestamp = int(time.time() * 1000)
     exchange_timestamp = int(msg.get("T", msg.get("E", timestamp)))
@@ -136,13 +161,13 @@ def compute_trades_features(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_markprice_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        mark_price = float(msg.get("p", 0.0))
-        funding_rate = float(msg.get("r", 0.0))
+        mark_price = dec(_required(msg, "p"))
+        funding_rate = dec(_required(msg, "r"))
         next_funding_time = int(msg.get("T", 0))
     except (ValueError, TypeError):
         return {}
 
-    funding_rate_bps = funding_rate * 10000.0
+    funding_rate_bps = float(funding_rate) * 10000.0  # derived analytic
     exchange_timestamp = int(msg.get("E", 0))
 
     hours_to_funding = (next_funding_time - exchange_timestamp) / 3600000.0
@@ -162,7 +187,7 @@ def compute_markprice_features(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_openinterest_features(data: dict) -> dict:
     try:
-        oi = float(data.get("openInterest", 0.0))
+        oi = dec(_required(data, "openInterest"))
         exchange_ts = int(data.get("time", int(time.time() * 1000)))
     except (ValueError, TypeError):
         return {}
@@ -183,8 +208,8 @@ def compute_liquidation_features(msg: dict) -> dict:
         side_str = o.get("S", "")
         # BUY side in forceOrder = short position liquidated (forced buy)
         side = 1 if side_str == "BUY" else -1
-        price = float(o.get("p", 0.0))
-        quantity = float(o.get("q", 0.0))
+        price = dec(_required(o, "p"))
+        quantity = dec(_required(o, "q"))
         ts = int(time.time() * 1000)
         exchange_ts = int(o.get("T", ts))
     except (ValueError, TypeError):
@@ -198,7 +223,7 @@ def compute_liquidation_features(msg: dict) -> dict:
         "side": side,
         "price": price,
         "quantity": quantity,
-        "signed_qty": quantity * side,
+        "signed_qty": float(quantity) * side,
         "order_status": str(o.get("X", "")),
         "time_in_force": str(o.get("f", "")),
     }

@@ -37,12 +37,21 @@ ALL_STREAMS = tuple(STREAM_SCHEMAS.keys())
 #: Every stream compacted here is a Binance USD-M BTCUSDT stream, so each row's
 #: persisted ``instrument_key`` must be null or exactly this identity.
 STREAM_INSTRUMENT: InstrumentId = BINANCE_USDM_BTCUSDT
-#: Columns a pre-migration (legacy) hourly segment may legitimately lack. Only
-#: ``instrument_key`` (added by the v1.1 schema migrations) qualifies; any other
-#: missing column is still a hard error. Absent -> filled with nulls, never with
+#: Columns a pre-migration (legacy) hourly segment may legitimately lack:
+#: ``instrument_key`` (v1.1 migrations) and ``bid_depth``/``ask_depth`` (P0-8);
+#: any other missing column is still a hard error. Absent -> filled with nulls, never with
 #: a fabricated identity: null means "unidentified", the same value the resolver
 #: returns for a legacy row.
-LEGACY_ABSENT_COLUMNS = frozenset({"instrument_key"})
+LEGACY_ABSENT_COLUMNS = frozenset({"instrument_key", "bid_depth", "ask_depth"})
+#: P0-9 exact-text companions (``<field>_exact``) were added after these streams
+#: had already been written, so older hourly segments legitimately lack them too.
+#: Same rule: absent -> nulls, NEVER reconstructed from the (possibly already
+#: lossy) float64 column -- null means "no exact evidence was recorded".
+LEGACY_ABSENT_SUFFIX = "_exact"
+
+
+def _legacy_absent(name: str) -> bool:
+    return name in LEGACY_ABSENT_COLUMNS or name.endswith(LEGACY_ABSENT_SUFFIX)
 TIMESTAMP_TYPE = pa.timestamp("ms", tz="UTC")
 DEFAULT_GUARD_SECONDS = 90
 class CompactionError(RuntimeError):
@@ -246,7 +255,7 @@ def _align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     arrays = []
     for field in schema:
         if field.name not in table.column_names:
-            if field.name in LEGACY_ABSENT_COLUMNS and field.nullable:
+            if _legacy_absent(field.name) and field.nullable:
                 arrays.append(pa.nulls(table.num_rows, type=field.type))
                 continue
             raise CompactionError(f"missing required column: {field.name}")

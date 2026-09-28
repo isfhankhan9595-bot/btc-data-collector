@@ -1,3 +1,4 @@
+from decimal import Decimal
 import pytest
 from collector.collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features, compute_openinterest_features, compute_liquidation_features
 
@@ -305,7 +306,7 @@ def test_compute_markprice_features():
     features = compute_markprice_features(msg)
 
     assert features["mark_price"] == 100.0
-    assert features["funding_rate"] == 0.0001
+    assert features["funding_rate"] == Decimal("0.0001")
     assert features["funding_rate_bps"] == 1.0
     assert features["hours_to_funding"] == 1.0
 
@@ -320,7 +321,7 @@ def test_compute_openinterest_features_valid_response(monkeypatch):
         "timestamp": 1234568000,
         "exchange_timestamp": 1234567000,
         "local_timestamp": 1234568000,
-        "open_interest": 123.45,
+        "open_interest": Decimal("123.45"),
     }
 
 

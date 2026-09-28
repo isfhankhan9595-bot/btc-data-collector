@@ -268,7 +268,9 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
     # Causal joins have explicit freshness limits.  Never present old market
     # state as current during an outage.
-    df_ob = df_ob.drop(columns=["bids_price", "bids_qty", "asks_price", "asks_qty"], errors="ignore")
+    df_ob = df_ob.drop(columns=["bids_price", "bids_qty", "asks_price", "asks_qty",
+                                "bids_price_exact", "bids_qty_exact", "asks_price_exact", "asks_qty_exact"],
+                       errors="ignore")
 
     # Causal merges: eligibility is decided by the availability clock
     # (<prefix>_ts, i.e. local receive time), never by processing or

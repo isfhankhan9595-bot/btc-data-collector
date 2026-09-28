@@ -8,6 +8,7 @@ one observed now.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import pytest
 
 from collector.collector.adapters.base import UnhandledReason
@@ -61,7 +62,7 @@ def test_a_carried_forward_field_is_marked_and_aged():
     event = adapter.normalize(_ticker(9000, {"markPrice": "105"}))[0]
 
     assert event.mark_price == 105.0
-    assert event.funding_rate == 0.0001
+    assert event.funding_rate == Decimal("0.0001")
     assert event.is_carried_forward("fundingRate") is True
     assert event.is_carried_forward("markPrice") is False
     assert event.age_of("fundingRate") == 8000

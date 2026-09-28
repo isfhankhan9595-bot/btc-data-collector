@@ -6,6 +6,7 @@ express or could not tell apart.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import dataclasses
 import json
 from itertools import combinations
@@ -220,7 +221,7 @@ def test_okx_index_tickers_are_not_stamped_with_the_swaps_identity():
     frame = {"arg": {"channel": "index-tickers", "instId": "BTC-USDT"},
              "data": [{"instId": "BTC-USDT", "idxPx": "65000.1", "ts": str(T)}]}
     (event,) = OKXAdapter().normalize(frame, local_receive_ts=T)
-    assert event.instrument is None and event.index_price == 65000.1
+    assert event.instrument is None and event.index_price == Decimal("65000.1")
 
 
 # ---------------------------------------------------------------------------

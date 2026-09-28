@@ -43,7 +43,7 @@ class CanonicalOrderBookEvent(CanonicalEvent):
 
 @dataclass(frozen=True)
 class CanonicalTradeEvent(CanonicalEvent):
-    trade_id: Optional[str] = None; price: float = 0.0; quantity: float = 0.0; side: Optional[str] = None; nq: Optional[float] = None
+    trade_id: Optional[str] = None; price: Decimal = Decimal(0); quantity: Decimal = Decimal(0); side: Optional[str] = None; nq: Optional[Decimal] = None
     venue_sequence: Optional[int] = None; block_trade: Optional[bool] = None; rpi: Optional[bool] = None
     #: Venue-native order-source flag (e.g. OKX's `trades-all.source`:
     #: "0" normal, "1" Enhanced Liquidity Program). No cross-venue meaning
@@ -60,12 +60,12 @@ class CanonicalOIEvent(CanonicalEvent):
     #: quantities per venue. Never compare across events without
     #: :func:`assert_comparable_oi`; use :func:`base_coin_oi` for a value that
     #: is safe to compare across venues.
-    open_interest: Optional[float] = None; source: OISource = OISource.WS_PUSH
+    open_interest: Optional[Decimal] = None; source: OISource = OISource.WS_PUSH
     #: OKX pushes three simultaneous OI representations (contracts/coin/USD).
     #: Only one can be the canonical `open_interest`; the other two are kept
     #: here rather than discarded. Both None for venues that push only one
     #: unit (Bybit, Binance).
-    oi_ccy: Optional[float] = None; oi_usd: Optional[float] = None
+    oi_ccy: Optional[Decimal] = None; oi_usd: Optional[Decimal] = None
     #: Fields carried forward from earlier messages rather than present in this one.
     carried_forward: tuple[str, ...] = ()
     #: Age in ms of each field at this event, as ``(field, age_ms)``. A field
@@ -109,7 +109,7 @@ def assert_comparable_oi(*events: "CanonicalOIEvent") -> OIUnit:
     return unit
 
 
-def base_coin_oi(event: "CanonicalOIEvent") -> Optional[float]:
+def base_coin_oi(event: "CanonicalOIEvent") -> Optional[Decimal]:
     """Open interest in the base coin, or ``None`` if it cannot be proven.
 
     The only cross-venue-safe accessor today: a venue that pushes a
@@ -124,7 +124,7 @@ def base_coin_oi(event: "CanonicalOIEvent") -> Optional[float]:
 
 @dataclass(frozen=True)
 class CanonicalMarkPriceEvent(CanonicalEvent):
-    mark_price: Optional[float] = None; index_price: Optional[float] = None; funding_rate: Optional[float] = None; next_funding_time: Optional[int] = None
+    mark_price: Optional[Decimal] = None; index_price: Optional[Decimal] = None; funding_rate: Optional[Decimal] = None; next_funding_time: Optional[int] = None
     #: Fields carried forward from earlier messages rather than present in this one.
     carried_forward: tuple[str, ...] = ()
     #: Age in ms of each field at this event, as ``(field, age_ms)``.
@@ -137,16 +137,16 @@ class CanonicalMarkPriceEvent(CanonicalEvent):
     #: existing fields would silently conflate current/next/settled periods.
     #: All None for venues that don't push them (Binance, Bybit).
     funding_time: Optional[int] = None
-    next_funding_rate: Optional[float] = None
-    sett_funding_rate: Optional[float] = None
+    next_funding_rate: Optional[Decimal] = None
+    sett_funding_rate: Optional[Decimal] = None
     sett_state: Optional[str] = None
-    premium: Optional[float] = None
-    interest_rate: Optional[float] = None
-    max_funding_rate: Optional[float] = None
-    min_funding_rate: Optional[float] = None
+    premium: Optional[Decimal] = None
+    interest_rate: Optional[Decimal] = None
+    max_funding_rate: Optional[Decimal] = None
+    min_funding_rate: Optional[Decimal] = None
     formula_type: Optional[str] = None
     method: Optional[str] = None
-    impact_value: Optional[float] = None
+    impact_value: Optional[Decimal] = None
 
     def is_carried_forward(self, field: str) -> bool:
         return field in self.carried_forward
@@ -155,14 +155,14 @@ class CanonicalMarkPriceEvent(CanonicalEvent):
         return dict(self.field_age_ms).get(field)
 @dataclass(frozen=True)
 class CanonicalLiquidationEvent(CanonicalEvent):
-    side: Optional[str] = None; price: Optional[float] = None; quantity: Optional[float] = None
+    side: Optional[str] = None; price: Optional[Decimal] = None; quantity: Optional[Decimal] = None
     #: OKX liquidation-orders fields with no existing slot. `price` above is
     #: populated from `bkPx` (bankruptcy/execution price) for OKX.
     #: `ccy` is preserved exactly as pushed, including an empty string --
     #: an empty string and "never sent" are not the same observation, so
     #: this is never coerced to None. `pos_side`/`inst_family`/`uly` are
     #: OKX-native attribution fields not present on Binance/Bybit.
-    bk_loss: Optional[float] = None
+    bk_loss: Optional[Decimal] = None
     ccy: Optional[str] = None
     pos_side: Optional[str] = None
     inst_family: Optional[str] = None

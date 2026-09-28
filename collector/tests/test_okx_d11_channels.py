@@ -9,6 +9,7 @@ directly documented, per the task's testing rule. No fixture claims to be
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import copy
 
 import pytest
@@ -43,7 +44,7 @@ def test_trades_channel_maps_seqid_to_venue_sequence():
     assert isinstance(event, CanonicalTradeEvent)
     assert event.stream == "trades"
     assert event.trade_id == "12345"
-    assert event.price == 50000.1
+    assert event.price == Decimal("50000.1")
     assert event.quantity == 0.5
     assert event.side == "buy"
     assert event.venue_sequence == 42
@@ -125,7 +126,7 @@ def test_mark_price_never_populates_index_or_funding():
     event = adapter.normalize(frame, local_receive_ts=1)[0]
     assert isinstance(event, CanonicalMarkPriceEvent)
     assert event.stream == "mark-price"
-    assert event.mark_price == 50123.4
+    assert event.mark_price == Decimal("50123.4")
     assert event.index_price is None
     assert event.funding_rate is None
 
@@ -135,7 +136,7 @@ def test_index_tickers_never_populates_mark_price():
     frame = _frame("index-tickers", [{"instId": "BTC-USDT", "idxPx": "50100.2", "ts": "1700000000000"}])
     event = adapter.normalize(frame, local_receive_ts=1)[0]
     assert event.stream == "index-tickers"
-    assert event.index_price == 50100.2
+    assert event.index_price == Decimal("50100.2")
     assert event.mark_price is None
 
 
@@ -159,17 +160,17 @@ OKX_FUNDING_RATE_EXAMPLE = {
 def test_funding_rate_real_example_keeps_current_next_settled_distinct():
     adapter = OKXAdapter()
     event = adapter.normalize(_frame("funding-rate", [copy.deepcopy(OKX_FUNDING_RATE_EXAMPLE)]), local_receive_ts=1)[0]
-    assert event.funding_rate == pytest.approx(0.0001875391284828)
+    assert event.funding_rate == Decimal("0.0001875391284828")
     assert event.funding_time == 1700726400000
     assert event.next_funding_time == 1700755200000
     assert event.next_funding_rate is None  # documented as often empty; "" -> None, never 0.0
-    assert event.sett_funding_rate == pytest.approx(0.0001699799259033)
+    assert event.sett_funding_rate == Decimal("0.0001699799259033")
     assert event.sett_state == "settled"
-    assert event.premium == pytest.approx(0.0001233824646391)
+    assert event.premium == Decimal("0.0001233824646391")
     assert event.interest_rate is None  # "" -> None
     assert event.impact_value is None
-    assert event.max_funding_rate == pytest.approx(0.00375)
-    assert event.min_funding_rate == pytest.approx(-0.00375)
+    assert event.max_funding_rate == Decimal("0.00375")
+    assert event.min_funding_rate == Decimal("-0.00375")
     assert event.formula_type == "noRate"
     assert event.method == "current_period"
     # The three funding values are genuinely different numbers -- proof
@@ -240,8 +241,8 @@ def test_liquidation_real_captured_frame_maps_every_field():
     assert event.uly == "DYDX-USDT"
     assert event.side == "sell"
     assert event.pos_side == "long"
-    assert event.price == pytest.approx(1.057)  # bkPx
-    assert event.quantity == pytest.approx(768.0)  # sz
+    assert event.price == Decimal("1.057")  # bkPx
+    assert event.quantity == Decimal("768.0")  # sz
     assert event.bk_loss == 0.0
     assert event.ccy == ""  # observed empty; preserved exactly, not None
     assert event.exchange_event_ts == 1723892524781

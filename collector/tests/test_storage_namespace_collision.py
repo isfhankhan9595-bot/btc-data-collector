@@ -11,6 +11,7 @@ OS processes. None of them merely compares stream-name strings.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import json
 import os
 import signal
@@ -596,7 +597,7 @@ def test_replay_reads_only_the_requested_venue_and_matches_each_venues_own_book(
     # non_book_events instead.
     assert okx.book_updates == []
     assert len(okx.non_book_events) == 2
-    assert [event.funding_rate for event in okx.non_book_events] == [0.0001, 0.0002]
+    assert [event.funding_rate for event in okx.non_book_events] == [Decimal("0.0001"), Decimal("0.0002")]
     assert all(event.exchange == "OKX" and event.stream == "funding-rate"
                for event in okx.non_book_events)
     with pytest.raises(ValueError):

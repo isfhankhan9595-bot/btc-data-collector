@@ -8,6 +8,7 @@ being useful once real evidence exists, not a substitute for that evidence.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import hashlib
 import json
 
@@ -416,7 +417,7 @@ def test_raw_converter_hashes_exact_payload_bytes_and_preserves_trade_fields():
     record = conversion.records[0]
     assert record.trade_id == "7"
     assert record.canonical_price == 100.0
-    assert record.canonical_quantity == 0.1
+    assert record.canonical_quantity == Decimal("0.1")
     assert record.canonical_side == "BUY"
     assert record.raw_payload_sha256 == hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

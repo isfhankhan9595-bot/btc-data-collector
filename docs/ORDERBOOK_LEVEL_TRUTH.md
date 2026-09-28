@@ -96,7 +96,7 @@ absence of an equivalent depth field there is ever found to matter.
 
 ## Not addressed here (separate P0s)
 
-- Float precision for prices/quantities is unchanged — that is P0-9's scope.
+- Float precision of prices/quantities was left alone by P0-8 and addressed separately by P0-9 (see `docs/NUMERIC_PRECISION.md`); the depth semantics here are unchanged by it.
 - Timestamp semantics are unchanged — that is P0-10/P0-11's scope.
 
 ## Tests

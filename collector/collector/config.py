@@ -450,3 +450,58 @@ SPOT_TRADES_SCHEMA = pa.schema([
              "note": "trade_id is the raw per-execution `t`, never aggTrade's `a` -- see adapters/binance_spot.py",
              "migration": "v1.1 adds nullable instrument_key; see spot_orderbook_raw v1.1 "
                           "note -- same per-event BinanceSpotAdapter.normalize() resolution"})
+
+
+# ---------------------------------------------------------------------------
+# P0-9: exact-text companions for venue-decimal evidence.
+#
+# The float64 columns above are DERIVED, approximate representations (~15-17
+# significant digits, binary rounding). For every venue-decimal field the
+# schema now also carries a nullable ``<field>_exact`` string: the venue's
+# exact decimal text, produced by ``numeric.column_value`` ONLY from exact
+# ``Decimal`` evidence -- never reconstructed from a float. Rows written before
+# this version have null companions (their float64 values may already be
+# lossy; that is documented, not repaired). See docs/NUMERIC_PRECISION.md.
+# ---------------------------------------------------------------------------
+def _with_exact(schema: pa.Schema, *names: str) -> pa.Schema:
+    fields = list(schema)
+    for name in names:
+        base = schema.field(name)
+        kind = pa.list_(pa.string()) if pa.types.is_list(base.type) else pa.string()
+        fields.append(pa.field(f"{name}_exact", kind))
+    metadata = dict(schema.metadata or {})
+    major, minor = metadata[b"schema_version"].decode().split(".")
+    version = f"{major}.{int(minor) + 1}"
+    previous = metadata.get(b"migration", b"").decode()
+    note = (f"v{version} (P0-9) adds nullable exact-text companions "
+            f"({', '.join(n + '_exact' for n in names)}): the venue's exact decimal text, "
+            f"populated only from exact Decimal evidence; the float64 columns are DERIVED "
+            f"approximations. Null on rows written before this version, never reconstructed "
+            f"from a float.")
+    metadata[b"schema_version"] = version.encode()
+    metadata[b"migration"] = ((previous + " ") if previous else "").encode() + note.encode()
+    return pa.schema(fields, metadata=metadata)
+
+
+_BOOK = ("bids_price", "bids_qty", "asks_price", "asks_qty")
+ORDERBOOK_SCHEMA = _with_exact(ORDERBOOK_SCHEMA, *_BOOK)
+TRADES_SCHEMA = _with_exact(TRADES_SCHEMA, "price", "quantity")
+BINANCE_TRADES_RAW_SCHEMA = _with_exact(BINANCE_TRADES_RAW_SCHEMA, "price", "quantity")
+MARKPRICE_SCHEMA = _with_exact(MARKPRICE_SCHEMA, "mark_price", "funding_rate")
+OPENINTEREST_SCHEMA = _with_exact(OPENINTEREST_SCHEMA, "open_interest")
+LIQUIDATION_SCHEMA = _with_exact(LIQUIDATION_SCHEMA, "price", "quantity")
+BYBIT_ORDERBOOK_SCHEMA = _with_exact(BYBIT_ORDERBOOK_SCHEMA, *_BOOK)
+BYBIT_TRADES_SCHEMA = _with_exact(BYBIT_TRADES_SCHEMA, "price", "quantity")
+BYBIT_MARKPRICE_SCHEMA = _with_exact(BYBIT_MARKPRICE_SCHEMA, "mark_price", "index_price", "funding_rate")
+BYBIT_OPENINTEREST_SCHEMA = _with_exact(BYBIT_OPENINTEREST_SCHEMA, "open_interest")
+BYBIT_LIQUIDATION_SCHEMA = _with_exact(BYBIT_LIQUIDATION_SCHEMA, "price", "quantity")
+OKX_TRADES_SCHEMA = _with_exact(OKX_TRADES_SCHEMA, "price", "quantity")
+OKX_TRADES_ALL_SCHEMA = _with_exact(OKX_TRADES_ALL_SCHEMA, "price", "quantity")
+OKX_MARKPRICE_SCHEMA = _with_exact(OKX_MARKPRICE_SCHEMA, "mark_price")
+OKX_INDEXTICKERS_SCHEMA = _with_exact(OKX_INDEXTICKERS_SCHEMA, "index_price")
+OKX_FUNDINGRATE_SCHEMA = _with_exact(
+    OKX_FUNDINGRATE_SCHEMA, "funding_rate", "next_funding_rate", "sett_funding_rate", "premium",
+    "interest_rate", "max_funding_rate", "min_funding_rate", "impact_value")
+OKX_OPENINTEREST_SCHEMA = _with_exact(OKX_OPENINTEREST_SCHEMA, "open_interest", "oi_ccy", "oi_usd")
+OKX_LIQUIDATION_SCHEMA = _with_exact(OKX_LIQUIDATION_SCHEMA, "price", "quantity", "bk_loss")
+SPOT_TRADES_SCHEMA = _with_exact(SPOT_TRADES_SCHEMA, "price", "quantity")

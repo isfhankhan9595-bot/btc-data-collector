@@ -51,6 +51,7 @@ OI_FIELDS = ("openInterest",)
 
 
 from ..instrument import BYBIT_LINEAR_BTCUSDT
+from ..numeric import dec
 
 class BybitAdapter(ExchangeAdapter):
     venue = "BYBIT"
@@ -119,7 +120,8 @@ class BybitAdapter(ExchangeAdapter):
 
     @staticmethod
     def _as_float(value):
-        return None if value is None else float(value)
+        # Historical name; returns an exact Decimal (P0-9), not a float.
+        return None if value is None else dec(value)
 
     # -- normalise ---------------------------------------------------------
 
@@ -132,8 +134,8 @@ class BybitAdapter(ExchangeAdapter):
         if route == "orderbook":
             return [CanonicalOrderBookEvent(
                 "BYBIT", "orderbook", ts, data.get("cts"), now,
-                bids=tuple((float(p), float(q)) for p, q in data.get("b", [])),
-                asks=tuple((float(p), float(q)) for p, q in data.get("a", [])),
+                bids=tuple((dec(p), dec(q)) for p, q in data.get("b", [])),
+                asks=tuple((dec(p), dec(q)) for p, q in data.get("a", [])),
                 update_id=data.get("u"), sequence=data.get("seq"),
                 is_snapshot=raw.get("type") == "snapshot")]
 
@@ -141,7 +143,7 @@ class BybitAdapter(ExchangeAdapter):
             return [CanonicalTradeEvent(
                 "BYBIT", "trades", ts, x.get("T"), now,
                 trade_id=str(x["i"]) if x.get("i") is not None else None,
-                price=float(x["p"]), quantity=float(x["v"]), side=x.get("S"),
+                price=dec(x["p"]), quantity=dec(x["v"]), side=x.get("S"),
                 venue_sequence=x.get("seq"), block_trade=x.get("BT"),
                 rpi=x.get("RPI")) for x in data]
 
@@ -188,7 +190,7 @@ class BybitAdapter(ExchangeAdapter):
         if route == "liquidation":
             return [CanonicalLiquidationEvent(
                 "BYBIT", "liquidation", x.get("T", ts), None, now,
-                side=x.get("S"), price=float(x["p"]), quantity=float(x["v"]))
+                side=x.get("S"), price=dec(x["p"]), quantity=dec(x["v"]))
                 for x in data]
 
         if raw.get("op") or raw.get("success") is not None:
