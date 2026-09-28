@@ -97,35 +97,7 @@ class CollectorApp:
         # straight to Parquet, already fsync'd per event since
         # segment_rows=1 above -- see quality_wal.py's own docstring for
         # why that makes a *second* durability layer unnecessary there).
-        wal_dir = self.quality_writer.stream_dir / "wal"
-        self._quality_wal_recovery_error = None
-        resume_seq = QualityEventWAL.highest_recovered_seq(wal_dir)
-        try:
-            recovered_events = QualityEventWAL.recover(wal_dir)
-        except QualityWALCorruption as exc:
-            # A corrupted WAL must be loud, never silently treated as
-            # healthy -- but it must also not prevent the collector from
-            # starting, since market-data capture is the primary mission
-            # and the corrupted file is preserved on disk for forensic
-            # inspection (never deleted here). Reported as a durable
-            # quality event as soon as quality_writer exists, below.
-            recovered_events = []
-            self._quality_wal_recovery_error = str(exc)
-        self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
-        if self._quality_wal_recovery_error is not None:
-            self._persist_quality_event({
-                "stream": "quality_events", "event_type": QualityEventType.ERROR,
-                "reason": f"quality_wal_corruption_on_startup:{self._quality_wal_recovery_error}",
-                "rows_lost": None})
-        for recovered in recovered_events:
-            # Exact prior content, not a "something was pending" marker --
-            # this is the entire point of P0-2. quality_event_id flows
-            # through so a WAL-recovered row and any row that (impossibly,
-            # given checkpoint-then-delete ordering, but defensively)
-            # duplicates it can be reconciled by ID at research time.
-            self._persist_quality_event(recovered)
-        if recovered_events:
-            self._quality_wal.checkpoint(up_to_seq=max(r["seq"] for r in recovered_events))
+        self._recover_quality_wal(self.quality_writer.stream_dir / "wal")
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_book_writer = ParquetWriter("binance_orderbook_raw", BINANCE_ORDERBOOK_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
@@ -314,6 +286,63 @@ class CollectorApp:
             logger.error("Validation spike detected: >0.1% failures in 60s window")
             send_telegram_alert("Validation spike detected: >0.1% failures in 60s window")
 
+    def _recover_quality_wal(self, wal_dir) -> None:
+        """Startup recovery: discover the WAL, recover exact event content
+        not yet checkpointed, replay it into Parquet, and checkpoint only
+        the contiguous prefix that actually succeeded. Extracted as its
+        own method (called once, from __init__) so it is directly
+        testable against the real code path rather than a reimplementation
+        of its logic.
+        """
+        self._quality_wal_recovery_error = None
+        resume_seq = QualityEventWAL.highest_recovered_seq(wal_dir)
+        try:
+            recovered_events = QualityEventWAL.recover(wal_dir)
+        except QualityWALCorruption as exc:
+            # A corrupted WAL must be loud, never silently treated as
+            # healthy -- but it must also not prevent the collector from
+            # starting, since market-data capture is the primary mission
+            # and the corrupted file is preserved on disk for forensic
+            # inspection (never deleted here). Reported as a durable
+            # quality event as soon as quality_writer exists, below.
+            recovered_events = []
+            self._quality_wal_recovery_error = str(exc)
+        self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
+        if self._quality_wal_recovery_error is not None:
+            self._persist_quality_event({
+                "stream": "quality_events", "event_type": QualityEventType.ERROR,
+                "reason": f"quality_wal_corruption_on_startup:{self._quality_wal_recovery_error}",
+                "rows_lost": None})
+        # Persist recovered events, but only checkpoint the CONTIGUOUS
+        # prefix that actually succeeded (Area 4 / Area 14: checkpointing
+        # seq N must prove every seq <= N is durably in Parquet -- if
+        # event 7 fails to persist while 8/9 (say) would have succeeded,
+        # checkpointing past 7 would falsely mark it durable). recover()
+        # returns events in strict seq order, so the first failure is the
+        # correct place to stop advancing the checkpoint; the failed event
+        # and everything after it remain in the WAL, recoverable on the
+        # next restart (potentially re-persisted as a reconcilable
+        # duplicate, per this module's own accepted design).
+        highest_contiguous_ok_seq = None
+        for recovered in recovered_events:
+            # Exact prior content, not a "something was pending" marker --
+            # this is the entire point of P0-2. quality_event_id flows
+            # through so a WAL-recovered row and any row that (impossibly,
+            # given checkpoint-then-delete ordering, but defensively)
+            # duplicates it can be reconciled by ID at research time.
+            try:
+                self._persist_quality_event(recovered)
+            except Exception:
+                # Loud, never silent -- but market-data capture is still
+                # the primary mission, so startup continues rather than
+                # crashing over one bad quality-event row. This event and
+                # everything after it stay uncheckpointed.
+                logger.error("quality_event_recovery_persist_failed", seq=recovered.get("seq"))
+                break
+            highest_contiguous_ok_seq = recovered["seq"]
+        if highest_contiguous_ok_seq is not None:
+            self._quality_wal.checkpoint(up_to_seq=highest_contiguous_ok_seq)
+
     def _websocket_quality_event(self, event_type, reason, connection_id=None, stream_group="websocket"):
         """Websocket hot path: bounded non-blocking enqueue only, never parquet I/O.
 
@@ -347,7 +376,25 @@ class CollectorApp:
                 # fsync'd, via quality_writer's segment_rows=1) rather
                 # than silently dropped.
                 logger.error("quality_wal_append_failed", reason=reason)
-                self._persist_quality_event(event)
+                try:
+                    self._persist_quality_event(event)
+                except Exception:
+                    # Both the WAL and the direct Parquet fallback failed
+                    # -- a genuine double failure (most plausibly a real
+                    # disk-full or permissions catastrophe), not merely
+                    # "the WAL is unavailable". This event may actually be
+                    # lost, and that must never be silently claimed
+                    # otherwise -- but this method is called synchronously
+                    # from the websocket receive/processing path, so
+                    # letting the exception propagate would crash far more
+                    # than this one quality event (the whole connection's
+                    # consume/processing task). Logged loudly and
+                    # distinctly from the single-failure case, then
+                    # swallowed here deliberately: market-data capture
+                    # remains the primary mission even when the
+                    # quality-event durability mechanism has doubly
+                    # failed.
+                    logger.error("quality_event_double_failure_possible_loss", reason=reason)
                 return
         try:
             self._quality_queue.put_nowait(event)
@@ -361,15 +408,37 @@ class CollectorApp:
 
     async def _quality_persistence_loop(self):
         wal = getattr(self, "_quality_wal", None)
+        # Area 4 / Area 13: once a persist fails, checkpointing must never
+        # advance again this process's lifetime -- seq values arrive here
+        # strictly sequentially (single producer: _websocket_quality_event's
+        # own WAL-append-then-enqueue path is the only source of
+        # _wal_seq-carrying items), so a skipped seq would otherwise leave
+        # an undetectable gap under whatever the next successful
+        # checkpoint(N) claims. The failed event, and everything the WAL
+        # ever holds from this point on, stays recoverable and gets
+        # reconciled (as a duplicate-but-same-quality_event_id row where
+        # applicable) on the next restart instead.
+        checkpoint_blocked = False
         while self.running or not self._quality_queue.empty():
             try:
                 event=await asyncio.wait_for(self._quality_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 continue
-            self._persist_quality_event(event)
+            try:
+                self._persist_quality_event(event)
+            except Exception:
+                # This task must survive one bad event -- an unhandled
+                # exception here would silently kill the persistence loop
+                # for the rest of the process's life (nothing awaits this
+                # background task while it's running), leaving the queue
+                # to accept items forever with nothing draining them.
+                logger.error("quality_event_persist_failed", event_type=event.get("event_type"))
+                checkpoint_blocked = True
+                self._quality_queue.task_done()
+                continue
             self._quality_queue.task_done()
             wal_seq = event.get("_wal_seq")
-            if wal is not None and wal_seq is not None:
+            if wal is not None and wal_seq is not None and not checkpoint_blocked:
                 wal.checkpoint(up_to_seq=wal_seq)
                 wal.maybe_rotate_for_size()
         if self._quality_overflow:
