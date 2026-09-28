@@ -134,6 +134,30 @@ def test_checkpoint_cannot_move_backwards(tmp_path):
     assert json.loads((tmp_path / CHECKPOINT_FILENAME).read_text())["checkpointed_seq"] == 5
 
 
+def test_start_seq_alone_does_not_imply_anything_was_checkpointed(tmp_path):
+    """Independent audit finding: __init__'s start_seq resumes the ID
+    counter only -- it must never be read as 'everything below this was
+    already checkpointed'. A WAL constructed with start_seq=10 (e.g.
+    because 10 events were previously written to disk) but with NO
+    checkpoint.json on disk must still accept and honor a checkpoint call
+    for any of those lower seqs -- the checkpoint() guard must not
+    silently no-op just because seq < start_seq."""
+    first = QualityEventWAL(tmp_path, process_start_marker="p1")
+    for _ in range(10):
+        first.append(_event())
+    first.close()
+    assert not (tmp_path / CHECKPOINT_FILENAME).exists()   # nothing checkpointed yet, genuinely
+
+    resumed = QualityEventWAL(tmp_path, process_start_marker="p2", start_seq=10)
+    resumed.checkpoint(up_to_seq=3)   # must NOT silently no-op
+    resumed.close()
+    checkpoint = json.loads((tmp_path / CHECKPOINT_FILENAME).read_text())
+    assert checkpoint["checkpointed_seq"] == 3
+    recovered = QualityEventWAL.recover(tmp_path)
+    assert len(recovered) == 7          # seqs 4-10 remain pending
+    assert min(r["seq"] for r in recovered) == 4
+
+
 # ---------------------------------------------------------------------------
 # Test 6: partial final record -- a normal, expected crash artifact.
 # ---------------------------------------------------------------------------
@@ -223,6 +247,25 @@ def test_checkpoint_deletes_only_fully_covered_wal_files_not_the_active_one(tmp_
     wal.close()
     recovered = QualityEventWAL.recover(tmp_path)
     assert [r["reason"] for r in recovered] == ["r2"]
+
+
+def test_checkpoint_never_deletes_the_active_file_even_when_fully_covered(tmp_path):
+    """Independent audit finding (Area 10): a checkpoint that happens to
+    cover every seq the currently-active file holds must NOT delete that
+    file -- it is still open for appending. Deleting an open file out
+    from under an active writer is exactly the kind of catastrophic
+    corruption this module's own single active-file exclusion exists to
+    prevent; this test targets the case where checkpointed_seq reaches
+    the active file's own max seq, not just an older, already-closed
+    one."""
+    wal = QualityEventWAL(tmp_path, process_start_marker="p1")
+    wal.append(_event(reason="only"))    # the one and only event, in the (only) active file
+    wal.checkpoint(up_to_seq=1)          # covers everything the active file holds
+    assert wal._active_path.exists()     # must survive -- it's still open
+    wal.append(_event(reason="second"))  # must still be appendable afterward
+    wal.close()
+    recovered = QualityEventWAL.recover(tmp_path)
+    assert [r["reason"] for r in recovered] == ["second"]   # "only" correctly checkpointed away
 
 
 # ---------------------------------------------------------------------------
