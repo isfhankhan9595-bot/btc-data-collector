@@ -137,6 +137,32 @@ def test_full_startup_recovery_path_matches_constructor_logic(tmp_path):
     assert rows[0]["connection_id"] == "c9"
 
 
+def test_recover_quality_wal_resumes_sequence_correctly_no_id_reuse(tmp_path):
+    """Independent audit finding: the WAL-primitive-level test for ID
+    stability across a restart manually passes start_seq=resume_seq --
+    it does not prove _recover_quality_wal (the real method __init__
+    calls) actually wires that correctly itself. This does."""
+    app = _minimal_app(tmp_path)
+    app._websocket_quality_event(QualityEventType.CONNECT, "before_restart")
+    old_id = app._quality_queue.get_nowait()["quality_event_id"]
+    app._quality_wal.close()
+
+    wal_dir = app._quality_wal.wal_dir
+    fresh = CollectorApp.__new__(CollectorApp)
+    fresh.binance_book = LocalBook("BINANCE")
+    fresh.quality_writer = app.quality_writer
+    fresh._quality_queue = asyncio.Queue(maxsize=1024)
+    fresh._recover_quality_wal(wal_dir)   # the real startup path
+
+    fresh._websocket_quality_event(QualityEventType.CONNECT, "after_restart")
+    new_id = fresh._quality_queue.get_nowait()["quality_event_id"]
+
+    assert old_id != new_id
+    new_seq = int(new_id.rsplit("-", 1)[-1])
+    old_seq = int(old_id.rsplit("-", 1)[-1])
+    assert new_seq > old_seq   # strictly resumed past the recovered high-water mark, never reused
+
+
 def test_wal_write_failure_falls_back_to_direct_synchronous_persist(tmp_path, monkeypatch):
     """If the WAL append itself fails, the event must still reach Parquet
     directly rather than being silently dropped (Step 11)."""
@@ -151,3 +177,99 @@ def test_wal_write_failure_falls_back_to_direct_synchronous_persist(tmp_path, mo
     rows = _quality_rows(tmp_path)
     assert len(rows) == 1
     assert rows[0]["reason"] == "disk_trouble"
+
+
+def test_double_failure_wal_and_parquet_both_fail_does_not_crash_caller(tmp_path, monkeypatch, caplog):
+    """Hostile Area 2: WAL append fails AND the direct-persist fallback
+    also fails. _websocket_quality_event is called synchronously from the
+    websocket receive/processing path -- an uncaught exception here would
+    crash far more than this one event. Must not raise, and the double
+    failure must be logged distinctly (not silently folded into the
+    single-failure log line) -- checked directly via caplog, not merely
+    inferred from 'the call didn't raise'."""
+    import logging
+    app = _minimal_app(tmp_path)
+    monkeypatch.setattr(app._quality_wal, "append",
+                        lambda event: (_ for _ in ()).throw(OSError("wal disk full")))
+    monkeypatch.setattr(app, "_persist_quality_event",
+                        lambda event: (_ for _ in ()).throw(RuntimeError("parquet also broken")))
+
+    with caplog.at_level(logging.ERROR):
+        # Must not raise -- half the point of this test.
+        app._websocket_quality_event(QualityEventType.ERROR, "catastrophe")
+
+    messages = [r.message for r in caplog.records]
+    assert any("quality_event_double_failure_possible_loss" in m for m in messages)
+
+
+def test_persist_failure_in_the_loop_never_advances_checkpoint_past_it(tmp_path):
+    """Hostile Area 4/14: if event N fails to persist but event N+1 (say)
+    would have succeeded, checkpointing must never advance past N -- doing
+    so would falsely claim N is durable in Parquet when it never landed.
+    Drives the real _quality_persistence_loop coroutine, not a
+    reimplementation of its logic."""
+    import asyncio
+
+    app = _minimal_app(tmp_path)
+    app._websocket_quality_event(QualityEventType.CONNECT, "ok_1")
+    app._websocket_quality_event(QualityEventType.SEQUENCE_GAP, "fails")
+    app._websocket_quality_event(QualityEventType.CONNECT, "ok_2")
+
+    real_persist = app._persist_quality_event
+
+    def _selectively_broken(event):
+        if event.get("reason") == "fails":
+            raise RuntimeError("simulated parquet failure")
+        real_persist(event)
+    app._persist_quality_event = _selectively_broken
+    app.running = False   # loop exits once the queue drains, since nothing re-enqueues
+
+    asyncio.run(app._quality_persistence_loop())
+
+    # seq 1 (ok_1) legitimately checkpointed; seq 2 (fails) and seq 3
+    # (ok_2, even though it individually succeeded) must remain
+    # recoverable, since checkpointing 3 would wrongly imply 2 is durable.
+    recovered = QualityEventWAL.recover(app._quality_wal.wal_dir)
+    recovered_reasons = {r["reason"] for r in recovered}
+    assert "fails" in recovered_reasons
+    assert "ok_2" in recovered_reasons
+    assert "ok_1" not in recovered_reasons   # correctly checkpointed, no longer pending
+    rows = _quality_rows(tmp_path)
+    assert {r["reason"] for r in rows} == {"ok_1", "ok_2"}   # ok_2 DID land in Parquet -- just not checkpointed
+
+
+def test_startup_recovery_stops_checkpointing_at_first_persist_failure(tmp_path):
+    """Hostile Area 4/14 at the startup-recovery call site specifically:
+    the real CollectorApp._recover_quality_wal method (the same one
+    __init__ calls) must not checkpoint past a recovered event that fails
+    to persist, even when later recovered events in the same batch would
+    have succeeded."""
+    app = _minimal_app(tmp_path)
+    app._websocket_quality_event(QualityEventType.CONNECT, "r1")
+    app._websocket_quality_event(QualityEventType.SEQUENCE_GAP, "r2_fails")
+    app._websocket_quality_event(QualityEventType.CONNECT, "r3")
+    app._quality_wal.close()   # simulate crash: nothing drained, nothing checkpointed
+
+    wal_dir = app._quality_wal.wal_dir
+
+    fresh = CollectorApp.__new__(CollectorApp)
+    fresh.binance_book = LocalBook("BINANCE")
+    fresh.quality_writer = app.quality_writer
+    real_persist = fresh._persist_quality_event
+
+    def _selectively_broken(event):
+        if event.get("reason") == "r2_fails":
+            raise RuntimeError("simulated parquet failure during recovery")
+        real_persist(event)
+    fresh._persist_quality_event = _selectively_broken
+
+    fresh._recover_quality_wal(wal_dir)   # the real code path __init__ calls
+
+    # Only r1 (the contiguous prefix before the failure) is checkpointed.
+    # r2 (failed) and r3 (never even attempted, since recovery stops at
+    # the first failure) both remain recoverable.
+    still_pending = QualityEventWAL.recover(wal_dir)
+    pending_reasons = {r["reason"] for r in still_pending}
+    assert pending_reasons == {"r2_fails", "r3"}
+    rows = _quality_rows(tmp_path)
+    assert {r["reason"] for r in rows} == {"r1"}
