@@ -99,14 +99,31 @@ than invisible.
 
 ## Known limitations (not claimed fixed by this correction)
 
-- **Raw-capture failure handling is unaudited beyond "log and continue."**
-  `_consume`'s `on_raw_frame` call is wrapped in a bare
-  `except Exception: logger.warning(...)`, unchanged from the original
-  merge. Whether an `OSError` from a full disk should instead escalate
-  (stop the collector, raise a durable ERROR quality event distinct from
-  a warning, or something else) was identified but not resolved — fixing
-  it would mean auditing `ParquetWriter`'s own failure semantics, which is
-  outside this file and outside this correction's scope.
+- **Raw-capture failure handling (audited in the final P0-1 pass).** There
+  are two distinct layers, and they fail differently:
+  - *Writer failure* (`OSError`, disk full, serialization error) is caught
+    inside `RawCapture.capture_wire`, which increments its own
+    `capture_failures`, returns `False`, and emits a durable `DATA_DROP`
+    quality event (`raw_capture_failed:wire:<ExcType>`, `rows_lost: 1`) **per
+    lost frame**. Covered by `test_raw_capture.py::
+    test_writer_failure_fails_open_and_emits_a_quality_event`. Ingestion
+    continues; raw completeness is broken and *stated in the data*, not
+    silently.
+  - *Callback failure* (a bug in a runner's `_capture_raw_frame`, before it
+    reaches `RawCapture`) was previously a log line only. It is now counted
+    (`raw_capture_callback_failures`) and reported as one `ERROR` quality
+    event per failure streak (not per frame), with a recovery log when it
+    clears. A frame is never dropped from processing because of either.
+  - **Judgement, not proof:** failing *open* is kept deliberately (stopping
+    would lose every frame, not only the raw copy). It means a consumer must
+    treat any `raw_capture` `DATA_DROP` or `raw_capture_callback_failed`
+    event as a raw-completeness break for that window. There is no separate
+    persistent "degraded" flag beyond those events. INFERENCE: sufficient,
+    since the events are durable and per-loss; NOT VERIFIED against a real
+    disk-full condition.
+  - **Not covered:** a failure at a *periodic or shutdown flush* outside
+    `capture_wire`'s `try` (e.g. `ParquetWriter.close()`), which this pass did
+    not trace.
 - **No dedicated crash-window integration test** exercises an actual
   process kill; the guarantees above are argued from reading the code
   paths involved (this file, plus `ParquetWriter`'s buffering/flush
@@ -116,8 +133,8 @@ than invisible.
   real message rates or real processing latency on the production
   collector. `UNVERIFIED` — this requires measurement on the actual AWS
   deployment, not something derivable from this offline environment.
-- **Disk-full behavior specifically** was not simulated or tested in this
-  correction.
+- **Disk-full behavior specifically** was not simulated: the writer-failure
+  path is tested with an injected `OSError`, not a full filesystem.
 
 ## Live verification status
 
@@ -125,3 +142,21 @@ than invisible.
 the original P0-1 work or this correction. Every guarantee above is
 argued from the source and demonstrated by tests against synthetic
 fixtures, not observed against real exchange traffic.
+
+## Final audit additions
+
+- **Drain timeout is now accounted for.** When shutdown's bounded drain
+  (`shutdown_drain_timeout_s`, default 30 s) gives up, the frames still queued
+  are added to `frames_abandoned_at_shutdown` and an `ERROR` quality event
+  `ingest_queue_drain_timeout:<n>` is emitted; previously this was a log line
+  only, unlike the sibling QueueFull-at-shutdown path. Raw capture precedes the
+  enqueue, so these frames lose *processing* in this run, not raw evidence.
+  `qsize()` excludes an item the worker is mid-way through.
+- **Test additions** pin invariants that mutation testing showed were
+  unguarded: the arrival timestamp (never processing time) reaches
+  `on_message` on *both* dispatch paths; one worker and FIFO order survive a
+  real reconnect through `start()`; the `BACKPRESSURE` quality event is emitted
+  once per stall; callback failures and drain timeouts are counted.
+- **Still true:** backpressure blocks the receive loop rather than dropping
+  frames; a slow `on_raw_frame` (e.g. a Parquet rollover) blocks receive
+  directly; the default queue size of 2000 is unvalidated against real traffic.

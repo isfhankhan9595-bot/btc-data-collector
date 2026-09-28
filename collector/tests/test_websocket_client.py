@@ -440,6 +440,254 @@ async def test_frame_abandoned_at_shutdown_still_reached_raw_capture():
 
 
 # ---------------------------------------------------------------------------
+# Final P0-1 audit: callback-level raw-capture failures and drain-timeout loss
+# must be counted and reported, never a log line only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_raw_capture_callback_failure_is_counted_reported_once_per_streak_and_never_drops_the_frame():
+    """A bug in a runner's on_raw_frame callback (before it ever reaches
+    RawCapture, which handles its own writer failures and emits DATA_DROP)
+    used to be a warning log only: raw capture silently disabled for every
+    frame. Ingestion must continue (stopping loses every frame, not just the
+    raw copy), but the failure must be counted, and reported once per failure
+    streak -- not per frame, which would flood."""
+    events = []
+
+    def broken_callback(msg, **kwargs):
+        raise RuntimeError("callback bug")
+
+    client = WebSocketClient(
+        "ws://localhost:9999", lambda *a, **k: None, on_raw_frame=broken_callback,
+        on_quality_event=lambda *a: events.append(a), ingest_queue_maxsize=10,
+    )
+    client.running = True
+    await client._consume(_FakeSocket(['{"n":1}', '{"n":2}', '{"n":3}']))
+
+    assert client.raw_capture_callback_failures == 3
+    assert client.raw_capture_callback_degraded is True
+    assert client._ingest_queue.qsize() == 3, "a raw-capture failure must not drop the frame from processing"
+    failure_events = [e for e in events if str(e[1]).startswith("raw_capture_callback_failed")]
+    assert len(failure_events) == 1 and failure_events[0][0] == "ERROR"
+    assert failure_events[0][1] == "raw_capture_callback_failed:RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_raw_capture_callback_recovery_resets_the_streak_so_a_new_failure_is_reported_again():
+    events = []
+    calls = {"n": 0}
+
+    def flaky(msg, **kwargs):
+        calls["n"] += 1
+        if calls["n"] in (1, 3):
+            raise ValueError("flaky")
+
+    client = WebSocketClient(
+        "ws://localhost:9999", lambda *a, **k: None, on_raw_frame=flaky,
+        on_quality_event=lambda *a: events.append(a), ingest_queue_maxsize=10,
+    )
+    client.running = True
+    await client._consume(_FakeSocket(['{"n":1}', '{"n":2}', '{"n":3}']))   # fail, ok, fail
+
+    assert client.raw_capture_callback_failures == 2
+    assert client.raw_capture_callback_degraded is True
+    assert len([e for e in events if str(e[1]).startswith("raw_capture_callback_failed")]) == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_counts_the_abandoned_frames_and_reports_a_quality_event():
+    """The sibling shutdown path (QueueFull while stopping) already counted
+    abandoned frames; the drain-timeout path logged `remaining` only. Raw
+    capture precedes the enqueue, so this is lost *processing*, not lost raw
+    evidence -- but it must still be explicit."""
+    events = []
+    client = WebSocketClient(
+        "ws://localhost:9999", lambda *a, **k: None, on_quality_event=lambda *a: events.append(a),
+        ingest_queue_maxsize=10,
+    )
+    client.shutdown_drain_timeout_s = 0.05
+    client.running = True
+    await client._consume(_FakeSocket(['{"n":1}', '{"n":2}', '{"n":3}']))
+    client.running = False
+
+    async def wedged_worker():
+        await asyncio.Event().wait()          # never takes an item, never finishes
+
+    client._worker_task = asyncio.ensure_future(wedged_worker())
+    await asyncio.wait_for(client._drain_and_stop_worker(), timeout=2.0)
+
+    assert client.frames_abandoned_at_shutdown == 3
+    assert client._worker_task is None
+    assert [e[1] for e in events if str(e[1]).startswith("ingest_queue_drain_timeout")] == ["ingest_queue_drain_timeout:3"]
+
+
+@pytest.mark.asyncio
+async def test_drain_that_completes_in_time_abandons_nothing_and_reports_nothing():
+    events = []
+    processed = []
+
+    async def on_message(data, ts, **kwargs):
+        processed.append(data)
+
+    client = WebSocketClient(
+        "ws://localhost:9999", on_message, on_quality_event=lambda *a: events.append(a), ingest_queue_maxsize=10,
+    )
+    client.running = True
+    await client._consume(_FakeSocket(['{"n":1}', '{"n":2}']))
+    client.running = False
+    client._worker_task = asyncio.ensure_future(client._process_queue())
+    await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
+
+    assert processed == [{"n": 1}, {"n": 2}]
+    assert client.frames_abandoned_at_shutdown == 0
+    assert not any("drain_timeout" in str(e[1]) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_on_message_receives_the_arrival_timestamp_not_the_processing_timestamp():
+    """Research eligibility is `local_receive_ts <= observation_ts`. A frame
+    that arrives at T1 and is processed at T2 must reach on_message stamped
+    T1: queueing delay must never rewrite when the data was actually
+    available. The clock is controlled, so a regression that re-reads the
+    clock at processing time is a hard, deterministic failure."""
+    from collector.collector import websocket_client as wsc
+    clock = {"t": 1000.000}
+    seen = []
+
+    async def on_message(data, ts, connection_id=None):
+        seen.append(ts)
+
+    client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
+    client.running = True
+    with patch.object(wsc.time, "time", new=lambda: clock["t"]):
+        await client._consume(_FakeSocket(['{"n":1}']))     # arrives at t=1000.000 s
+        clock["t"] = 1005.000                                # 5 s of queueing delay passes
+        client._worker_task = asyncio.ensure_future(client._process_queue())
+        client.running = False
+        await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
+
+    assert seen == [1_000_000], f"on_message got {seen}; processing time leaked into the receive timestamp"
+
+
+@pytest.mark.asyncio
+async def test_receive_timestamp_also_holds_for_handlers_that_take_no_connection_id():
+    """on_message is dispatched through two different call sites depending on
+    whether the handler accepts connection_id. The timestamp invariant must
+    hold on both; the first version of the test above only covered one."""
+    from collector.collector import websocket_client as wsc
+    clock = {"t": 2000.000}
+    seen = []
+
+    async def on_message(data, ts):                 # no connection_id parameter
+        seen.append(ts)
+
+    client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
+    assert client._on_message_takes_connection is False
+    client.running = True
+    with patch.object(wsc.time, "time", new=lambda: clock["t"]):
+        await client._consume(_FakeSocket(['{"n":1}']))
+        clock["t"] = 2009.000
+        client._worker_task = asyncio.ensure_future(client._process_queue())
+        client.running = False
+        await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
+    assert seen == [2_000_000]
+
+
+@pytest.mark.asyncio
+async def test_backpressure_emits_one_quality_event_per_stall_and_still_drops_nothing():
+    """The counter is observable in metrics, but the durable, in-data signal
+    is the BACKPRESSURE quality event. Emitted once per stall (not per poll
+    tick), and the stalled frame must still be delivered once room appears."""
+    events = []
+    client = WebSocketClient(
+        "ws://localhost:9999", lambda *a, **k: None,
+        on_quality_event=lambda *a: events.append(a), ingest_queue_maxsize=1,
+    )
+    client.running = True
+    await client._consume(_FakeSocket(['{"n":1}']))          # queue now full
+    assert client._ingest_queue.qsize() == 1
+
+    stalled = asyncio.ensure_future(client._consume(_FakeSocket(['{"n":2}'])))
+    await asyncio.sleep(0.05)                                 # several poll ticks while stalled
+    assert not stalled.done()
+    client._ingest_queue.get_nowait()                         # worker frees a slot
+    client._ingest_queue.task_done()
+    await asyncio.wait_for(stalled, timeout=2.0)
+
+    backpressure = [e for e in events if e[0] == "BACKPRESSURE"]
+    assert len(backpressure) == 1 and backpressure[0][1] == "ingest_queue_full:1"
+    assert client.queue_backpressure_events == 1
+    assert client.frames_enqueued == 2 and client._ingest_queue.qsize() == 1, "the stalled frame must not be dropped"
+
+
+class _FakeConnection:
+    """Async context manager standing in for `websockets.connect(url)`."""
+    def __init__(self, frames, on_exhausted=None):
+        self._frames, self._on_exhausted = frames, on_exhausted
+
+    async def __aenter__(self):
+        frames, on_exhausted = self._frames, self._on_exhausted
+
+        class _WS:
+            async def send(self, _):
+                return None
+
+            def __aiter__(self):
+                async def gen():
+                    for frame in frames:
+                        yield frame
+                    if on_exhausted:
+                        on_exhausted()
+                return gen()
+        return _WS()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_start_across_a_reconnect_keeps_one_worker_fifo_order_and_per_connection_attribution():
+    """Drives the real start() through TWO connections. The worker is created
+    inside the reconnect loop behind a done() guard; a regression to
+    "one worker per connection" would put two consumers on one FIFO queue and
+    break strict per-stream ordering. Also pins that every frame is attributed
+    to the connection it arrived on, even when processed after the reconnect."""
+    processed, worker_starts = [], []
+    real_sleep = asyncio.sleep
+
+    async def on_message(data, ts, connection_id=None):
+        processed.append((data["n"], connection_id))
+
+    client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
+    original_worker = client._process_queue
+
+    async def counting_worker():
+        worker_starts.append(1)
+        await original_worker()
+    client._process_queue = counting_worker
+
+    connections = iter([
+        _FakeConnection(['{"n":1}', '{"n":2}']),
+        _FakeConnection(['{"n":3}', '{"n":4}'], on_exhausted=lambda: setattr(client, "running", False)),
+    ])
+
+    async def fast_sleep(delay):
+        await real_sleep(0)
+
+    with patch("collector.collector.websocket_client.websockets.connect", new=lambda url, **k: next(connections)):
+        with patch("collector.collector.websocket_client.asyncio.sleep", new=fast_sleep):
+            await asyncio.wait_for(client.start(), timeout=10.0)
+
+    assert [n for n, _ in processed] == [1, 2, 3, 4], "FIFO order must hold across a reconnect"
+    assert len(worker_starts) == 1, "exactly one worker for the client's lifetime, not one per connection"
+    first_id, second_id = processed[0][1], processed[2][1]
+    assert first_id != second_id
+    assert processed[1][1] == first_id and processed[3][1] == second_id
+    assert client._worker_task is None
+
+
+# ---------------------------------------------------------------------------
 # Real mutation testing against the actual source (M1, M9).
 # ---------------------------------------------------------------------------
 
