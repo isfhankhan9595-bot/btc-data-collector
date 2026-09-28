@@ -70,6 +70,8 @@ from collector.collector.config import (
     BYBIT_PUBLIC_WS_URL,
     BYBIT_TRADES_SCHEMA,
     QUALITY_EVENTS_SCHEMA,
+    QUALITY_SEGMENT_ROWS,
+    QUALITY_SEGMENT_SECONDS,
     SYMBOL,
 )
 from collector.collector.backoff import ExponentialBackoff
@@ -102,7 +104,7 @@ class BybitCollectorApp:
         self.url = url
         self.quality_writer = ParquetWriter(
             "bybit_quality_events", QUALITY_EVENTS_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", segment_rows=1, segment_seconds=1)
+            exchange="BYBIT", segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=QUALITY_SEGMENT_SECONDS)
         self.raw_wire_writer = ParquetWriter(
             "bybit_raw_wire", RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="BYBIT", quality_event_sink=self._persist_quality_event)

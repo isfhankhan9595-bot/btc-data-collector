@@ -143,11 +143,10 @@ def test_update_id_decrease_is_detected_and_recorded(tmp_path):
     _drive(app, [snapshot, decreased])
 
     assert app.book.state.state is not BookQuality.VALID
-    import pyarrow.parquet as pq
-    segment_dir = tmp_path / "raw" / "bybit_quality_events"
-    rows = []
-    for f in segment_dir.glob("*.seg"):
-        rows.extend(pq.read_table(f).to_pylist())
+    # Quality events now batch (QUALITY_SEGMENT_ROWS/_SECONDS), so a single
+    # event sits in .buffer rather than an immediately-published segment --
+    # check the buffered row directly.
+    rows = app.quality_writer.buffer
     assert any(r["stream"] == "bybit_orderbook" and r["new_state"] != BookQuality.VALID.value
               for r in rows), "a decreasing update_id must be recorded, not silently absorbed"
 
@@ -219,16 +218,9 @@ def test_keepalive_does_not_wire_an_unrecognisable_reply_expectation(tmp_path):
 
 
 def test_writers_attribute_their_own_events_to_bybit_not_binance(tmp_path):
-    import pyarrow.parquet as pq
-
     app = _app(tmp_path)
     app._persist_quality_event({"stream": "bybit_orderbook", "event_type": "SEQUENCE_GAP",
                                 "reason": "test"})
-    # bybit_quality_events uses segment_rows=1/segment_seconds=1 (matching the
-    # Binance quality writer's own settings), so the row is already flushed to
-    # a closed segment rather than sitting in .buffer -- read it back.
-    segment_dir = tmp_path / "raw" / "bybit_quality_events"
-    files = list(segment_dir.glob("*.seg"))
-    assert files, f"no published segment found under {segment_dir}"
-    table = pq.read_table(files[0])
-    assert table.column("exchange").to_pylist() == ["BYBIT"]
+    # Quality events now batch (QUALITY_SEGMENT_ROWS/_SECONDS), so a single
+    # event sits in .buffer rather than an immediately-published segment.
+    assert app.quality_writer.buffer[-1]["exchange"] == "BYBIT"

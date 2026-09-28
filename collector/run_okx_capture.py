@@ -27,7 +27,9 @@ import signal
 import time
 
 from collector.collector.adapters.okx import OKXAdapter
-from collector.collector.config import QUALITY_EVENTS_SCHEMA, RAW_WIRE_SCHEMA
+from collector.collector.config import (
+    QUALITY_EVENTS_SCHEMA, QUALITY_SEGMENT_ROWS, QUALITY_SEGMENT_SECONDS, RAW_WIRE_SCHEMA,
+)
 from collector.collector.okx_capture import (
     OKX_BTC_SWAP_INST_ID,
     OKX_PUBLIC_WS_URL,
@@ -49,7 +51,8 @@ class OKXCaptureApp:
         # not attributed to Binance (the ParquetWriter default).
         self.quality_writer = ParquetWriter(
             venue_stream("OKX", "quality_events"), QUALITY_EVENTS_SCHEMA,
-            base_dir=data_dir, exchange="OKX", segment_rows=1, segment_seconds=1)
+            base_dir=data_dir, exchange="OKX",
+            segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=QUALITY_SEGMENT_SECONDS)
         self.raw_wire_writer = ParquetWriter(
             venue_stream("OKX", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="OKX", quality_event_sink=self._persist_quality_event)
