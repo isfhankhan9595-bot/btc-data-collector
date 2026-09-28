@@ -216,3 +216,76 @@ fix's scope depended on.
   stream-directory lock already enforces for Parquet segments, unchanged
   by this work).
 - P0-3 through P0-12 are explicitly out of scope and untouched.
+
+## Independent hostile audit (second pass)
+
+A second, adversarial review of the branch found and fixed real defects;
+the first-pass document above overclaimed in places, corrected here.
+
+### Defects found and fixed
+
+1. **HIGH -- `QualityEventWAL.__init__` inferred checkpoint state from
+   `start_seq`** (`quality_wal.py`): `_checkpointed_seq = start_seq - 1`
+   conflated "where the ID counter resumes" with "what is durably
+   checkpointed". Checkpointing any seq below `start_seq - 1` silently
+   no-oped. Masked before because startup always checkpointed exactly the
+   max recovered seq. Now reads the real on-disk checkpoint.
+2. **HIGH -- persistence loop died on any Parquet error**
+   (`_quality_persistence_loop`): an unhandled exception killed the
+   background task silently (nothing awaits it while running), leaving
+   the queue undrained for the rest of the process. Now logged loudly,
+   the loop survives, and checkpointing latches off after the first
+   failure so a later success can never checkpoint past a failed seq.
+3. **HIGH -- startup recovery checkpointed `max(seq)` unconditionally**
+   (`_recover_quality_wal`, extracted from `__init__` so it is testable):
+   a failed persist mid-batch would still be checkpointed over. Now
+   stops at the first failure and checkpoints only the contiguous
+   successful prefix.
+4. **HIGH -- WAL failure + direct-persist failure crashed the caller**
+   (`_websocket_quality_event`): the fallback persist was unguarded; a
+   double failure raised into the websocket path. Now logged distinctly
+   (`quality_event_double_failure_possible_loss`) and not raised. In
+   this double-failure case the event MAY BE LOST -- stated plainly.
+5. **DOC -- "globally unique" overclaim** for `quality_event_id`:
+   uniqueness rests on `process_start_marker` (ms timestamp + PID)
+   not colliding; PID 1 is common in containers. Docstring narrowed.
+
+### Mutation testing (real source, restored, `cmp` byte-identical)
+
+| Mutation | Caught? | Test |
+|---|---|---|
+| revert checkpoint-from-`start_seq` inference | Yes (2) | `test_start_seq_alone_does_not_imply_anything_was_checkpointed`, `test_startup_recovery_stops_checkpointing_at_first_persist_failure` |
+| remove `checkpoint_blocked` guard in loop | Yes | `test_persist_failure_in_the_loop_never_advances_checkpoint_past_it` |
+| swallow double failure w/o distinct log | Yes, **after** strengthening (first run: NOT caught) | `test_double_failure_...` (now asserts via caplog) |
+| allow deleting the active WAL file | Yes, **after** adding a test (first run: NOT caught) | `test_checkpoint_never_deletes_the_active_file_even_when_fully_covered` |
+| ignore `resume_seq` on restart | Yes, **after** adding a test (first run: NOT caught) | `test_recover_quality_wal_resumes_sequence_correctly_no_id_reuse` |
+
+Only these five were run. The task's list of 20 was **not** fully
+executed; the other 15 (e.g. remove fsync/flush, queue-before-WAL,
+ignore malformed middle record, treat corrupt checkpoint as fully
+checkpointed) are NOT VERIFIED by fresh mutation this pass -- the
+first-pass tests cover several of them but that was not re-proven.
+
+### Known limitations (not fixed)
+
+- Invalid UTF-8 in a WAL file raises `UnicodeDecodeError` from
+  `recover()` rather than `QualityWALCorruption`, so startup would fail
+  loudly instead of following the corruption policy. Torn multibyte tails
+  are not realistic (`json.dumps` escapes non-ASCII, so lines are pure
+  ASCII); genuine media corruption is the only trigger.
+- `default=str` in `append()` can change value types (e.g. non-JSON
+  objects become strings); "exact original content" holds for JSON-native
+  types only. Not audited field by field.
+- Sync `fsync` inside `_websocket_quality_event` runs on the caller's
+  thread; whether that can stall the receive path depends on P0-1
+  (separate branch, deliberately not addressed here).
+- Multiple processes sharing one WAL directory are NOT supported (the
+  `threading.Lock` is in-process only).
+- Total WAL directory size is not bounded: only per-file size is; old
+  files persist until checkpointed.
+- Duplicates after a crash between Parquet write and checkpoint are
+  expected; they carry the same `quality_event_id`.
+- No live/production verification of any of this.
+
+Test count: baseline 1267 -> 1273 (+6). Verdict: COMPLETE WITH
+DOCUMENTED LIMITATIONS.
