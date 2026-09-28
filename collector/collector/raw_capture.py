@@ -53,6 +53,8 @@ __all__ = [
     "RawWireRecord",
     "RawRestRecord",
     "RAW_WIRE_SCHEMA",
+    "CAUSAL_RAW_WIRE_COLUMN",
+    "NON_CAUSAL_RAW_WIRE_COLUMNS",
     "RAW_REST_SCHEMA",
     "RawCapture",
     "DEFAULT_MAX_PAYLOAD_BYTES",
@@ -63,12 +65,33 @@ __all__ = [
 DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 
 
+#: The only raw-wire column that may decide whether information was available
+#: to the collector at a given time (P0-6/P0-10 causal contract).
+CAUSAL_RAW_WIRE_COLUMN = "local_receive_ts"
+
+#: Raw-wire columns that are provenance/diagnostics only. They record *when
+#: something else happened* (row construction), not when the information
+#: became known, so no causal path may read them. Enforced by
+#: tests/test_p0_10_receive_time_semantics.py.
+NON_CAUSAL_RAW_WIRE_COLUMNS = frozenset({"local_capture_ts"})
+
 RAW_WIRE_SCHEMA = pa.schema(
     [
         # Canonical ordering timestamp for the segment writer.
         ("timestamp", pa.timestamp("ms", tz="UTC")),
         # Lineage: captured before decoding wherever technically possible.
+        # local_receive_ts is the ONE causal clock: the instant the frame
+        # became available to the collector (WebSocketClient._consume,
+        # before decode/capture/enqueue). It equals ``timestamp`` above.
         ("local_receive_ts", pa.timestamp("ms", tz="UTC")),
+        # LEGACY / NON-AUTHORITATIVE (P0-10). A wall-clock reading taken when
+        # this raw *row was built* -- after JSON decode, before persistence.
+        # It is NOT receive time, NOT exchange time, NOT persistence time and
+        # NOT a feature-availability time; never use it for eligibility,
+        # ordering, joins, staleness or splits. The column name is kept only
+        # because renaming a persisted column would create mixed-schema raw
+        # segments (daily compaction) for a column nothing reads. See
+        # NON_CAUSAL_RAW_WIRE_COLUMNS and docs/RAW_CAPTURE.md.
         ("local_capture_ts", pa.timestamp("ms", tz="UTC")),
         ("venue", pa.string()),
         ("market_type", pa.string()),
@@ -157,10 +180,16 @@ class RawWireRecord:
     update_id: Optional[int] = None
     first_update_id: Optional[int] = None
     previous_update_id: Optional[int] = None
+    #: LEGACY / NON-AUTHORITATIVE row-construction wall clock (see
+    #: RAW_WIRE_SCHEMA). ``None`` means "stamp it when the row is built",
+    #: which is still row-build time, never receive time. It can never
+    #: influence ``timestamp`` / ``local_receive_ts`` below.
     local_capture_ts: Optional[int] = None
 
     def to_row(self, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> dict[str, Any]:
         stored, original, truncated = _truncate(self.payload, max_payload_bytes)
+        # Row-build wall clock only (legacy provenance). Deliberately never
+        # substituted for local_receive_ts, which is a required field.
         capture_ts = (
             self.local_capture_ts
             if self.local_capture_ts is not None

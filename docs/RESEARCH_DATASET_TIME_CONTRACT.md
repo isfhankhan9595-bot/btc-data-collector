@@ -188,3 +188,27 @@ leakage, exchange/processing-timestamp substitution, instrument isolation,
 no silent unit conversion, liquidation dedup, OI tie-resolution),
 `tests/test_run_collector_routing.py`
 (`test_liquidation_local_timestamp_is_receive_time_not_processing_time`).
+
+## Timestamp field inventory (P0-10)
+
+Traced from repository source, not from names.
+
+| Field | Meaning | Actual source | Used for | Causal? |
+|---|---|---|---|---|
+| `exchange_timestamp` / `exchange_event_ts` | venue clock | parsed from payload by adapters | descriptive | No |
+| `local_receive_ts` / `local_timestamp` | instant the frame became available to the collector | `WebSocketClient._consume`, first statement after the frame arrives (before decode, raw capture, queue) | **the** causal availability clock; replay's frame clock; alignment/assembler eligibility | **Yes** |
+| raw wire `timestamp` | equals `local_receive_ts` | `RawWireRecord.to_row` | segment ordering | Yes (same value) |
+| `local_process_ts` / canonical `timestamp` | when application code handled the event | `time.time()` in the runner handlers | diagnostics, processing latency | No |
+| `local_capture_ts` | **legacy**: when the raw row was built | `time.time()` in `run_collector._capture_raw_frame` or `RawWireRecord.to_row` fallback | nothing (write-only provenance) | **No** |
+| persistence time | when Parquet was written | not recorded per row | n/a | No |
+
+Queue delay never touches `local_receive_ts`: the value is stamped before
+the frame is enqueued and travels inside the `IngestItem`; the worker's
+later `time.time()` calls only feed processing-time fields.
+
+Known, documented, not changed by P0-10: adapters and
+`run_collector.handle_message` fall back to `time.time()` when a direct
+caller passes no `local_receive_ts`. The live path (`WebSocketClient`) and
+replay always supply one, so the fallback only affects ad-hoc direct
+calls; it is a fabrication risk for such callers and is recorded as a
+remaining issue rather than widened into this change.
