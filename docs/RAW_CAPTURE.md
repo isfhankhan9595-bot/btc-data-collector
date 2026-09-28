@@ -32,8 +32,9 @@ transformation.
 | `payload_bytes` | true byte length (of the original, even when truncated) |
 | `truncated` | payload exceeded the cap and was clipped |
 | `decode_ok` / `decode_error` | whether `json.loads` succeeded, and why not |
-| `local_receive_ts` | captured before decoding |
-| `local_capture_ts` | when the capture row was built |
+| `timestamp` | equals `local_receive_ts` (the segment writer's ordering column) |
+| `local_receive_ts` | **the causal clock**: captured at frame arrival in `WebSocketClient._consume`, before decoding, raw capture and queueing; immutable afterwards |
+| `local_capture_ts` | **LEGACY, NON-AUTHORITATIVE (P0-10).** Wall clock read when this raw *row was built* (after JSON decode, before persistence). Not receive time, not exchange time, not persistence time, not feature availability. Never use it for eligibility, ordering, joins, staleness or splits. Name kept only to avoid mixed-schema segments; nothing in the repository reads it. |
 | `connection_id`, `connection_generation` | which socket, which connection |
 | `venue`, `market_type`, `symbol`, `channel`, `stream` | routing lineage |
 | `exchange_event_ts`, `update_id`, `first_update_id`, `previous_update_id` | venue-native identifiers, copied verbatim, never derived |
