@@ -43,6 +43,9 @@ def _values_for_field(stream, field, timestamps, offset=0):
     if pa.types.is_timestamp(field.type):
         return [_dt(ts if name == "timestamp" else ts + 10) for ts in timestamps]
     if pa.types.is_list(field.type):
+        if pa.types.is_string(field.type.value_type):
+            # P0-9: <field>_exact companions are exact venue text.
+            return [[str(100000 + offset), str(99999 + offset)] for _ in range(n)]
         return [[100000.0 + offset, 99999.0 + offset] for _ in range(n)]
     if pa.types.is_boolean(field.type):
         return [False for _ in range(n)]
@@ -51,6 +54,9 @@ def _values_for_field(stream, field, timestamps, offset=0):
             # A real identity: compaction now rejects any non-null value that is not
             # the stream's own (a filler string here was silently copied through).
             return [BINANCE_USDM_BTCUSDT.key for _ in range(n)]
+        if name.endswith("_exact"):
+            # P0-9: exact venue text companion (a plain, exactly-representable value).
+            return ["1.5" for _ in range(n)]
         return ["FILLED" if name == "order_status" else "GTC" for _ in range(n)]
     if pa.types.is_int64(field.type):
         if name == "trade_id":

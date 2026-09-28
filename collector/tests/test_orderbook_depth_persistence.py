@@ -51,7 +51,10 @@ def test_thin_book_round_trips_through_the_real_writer_without_padding(tmp_path)
 def test_persisted_schema_declares_depth_columns_as_nullable():
     for name in ("bid_depth", "ask_depth", "obi_level_3", "obi_level_5"):
         assert ORDERBOOK_SCHEMA.field(name).nullable
-    assert ORDERBOOK_SCHEMA.metadata[b"schema_version"] == b"1.2"
+    # depth fields arrived in v1.2; later additive bumps (e.g. P0-9's exact
+    # companions) must not invalidate them, so assert "at least", not equality.
+    major, minor = ORDERBOOK_SCHEMA.metadata[b"schema_version"].decode().split(".")
+    assert (int(major), int(minor)) >= (1, 2)
 
 
 def test_assembler_propagates_null_level_obi_as_missing_not_zero(tmp_path):

@@ -21,6 +21,7 @@ once the actual client machinery was exercised:
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import asyncio
 import json
 import time
@@ -172,11 +173,11 @@ def test_trade_ticker_and_liquidation_messages_persist_to_their_own_streams(tmp_
     assert len(app.trades_writer.buffer) == 1
     assert app.trades_writer.buffer[0]["price"] == 50000.5
     assert len(app.mark_writer.buffer) == 1
-    assert app.mark_writer.buffer[0]["funding_rate"] == 0.0001
+    assert app.mark_writer.buffer[0]["funding_rate"] == Decimal("0.0001")
     assert len(app.oi_writer.buffer) == 1
-    assert app.oi_writer.buffer[0]["open_interest"] == 12345.6
+    assert app.oi_writer.buffer[0]["open_interest"] == Decimal("12345.6")
     assert len(app.liq_writer.buffer) == 1
-    assert app.liq_writer.buffer[0]["quantity"] == 1.2
+    assert app.liq_writer.buffer[0]["quantity"] == Decimal("1.2")
 
 
 def test_pong_control_frame_produces_no_events_and_does_not_raise(tmp_path):

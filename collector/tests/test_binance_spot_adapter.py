@@ -43,7 +43,7 @@ def test_trade_maps_official_example_and_is_explicitly_spot():
     assert event.market_type == "spot"           # ...market_type is the differentiator
     assert event.stream == "spot_trades"
     assert event.trade_id == "12345"             # raw `t`, never the aggregate `a`
-    assert event.price == 0.001
+    assert event.price == Decimal("0.001")
     assert event.quantity == 100.0
     assert event.side == "SELL"                  # m=true -> buyer is maker -> seller is aggressor
     assert event.exchange_event_ts == 1672515782136   # E

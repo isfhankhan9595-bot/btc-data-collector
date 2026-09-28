@@ -106,8 +106,8 @@ def _side_volumes(trades):
     still counts toward the caller's own trade_count, so a caller comparing
     ``buy_volume + sell_volume`` against ``trade_count`` can detect this
     case rather than silently losing that trade's volume with no trace."""
-    buy_volume = sum(t.quantity for t in trades if (t.side or "").upper() == "BUY")
-    sell_volume = sum(t.quantity for t in trades if (t.side or "").upper() == "SELL")
+    buy_volume = sum(float(t.quantity) for t in trades if (t.side or "").upper() == "BUY")
+    sell_volume = sum(float(t.quantity) for t in trades if (t.side or "").upper() == "SELL")
     return buy_volume, sell_volume
 
 

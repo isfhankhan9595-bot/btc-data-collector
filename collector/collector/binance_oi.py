@@ -46,6 +46,7 @@ from typing import Optional
 
 from .canonical import CanonicalOIEvent, OISource, OIUnit
 from .instrument import MARKET_LINEAR_PERPETUAL, resolve_instrument
+from .numeric import dec
 
 __all__ = ["normalize_binance_oi", "BinanceOIParseError"]
 
@@ -85,7 +86,7 @@ def normalize_binance_oi(
     if raw_oi is None:
         raise BinanceOIParseError("response has no 'openInterest' field")
     try:
-        open_interest = float(raw_oi)
+        open_interest = dec(raw_oi)
     except (TypeError, ValueError) as exc:
         raise BinanceOIParseError(f"non-numeric openInterest: {raw_oi!r}") from exc
     if open_interest <= 0 or open_interest != open_interest:  # NaN check

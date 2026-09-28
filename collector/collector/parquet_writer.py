@@ -11,6 +11,7 @@ from typing import IO, Any, Callable, Dict, List, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .numeric import column_value
 from .utils import logger
 from .storage_layout import (
     SegmentKind, check_stream_namespace, iter_segments, parse_segment_name, segment_path,
@@ -354,7 +355,7 @@ class ParquetWriter:
         if not self.buffer:
             return
         assert self.writer is not None
-        columns = {field.name: [record.get(field.name) for record in self.buffer] for field in self.schema}
+        columns = {field.name: [column_value(field.name, record) for record in self.buffer] for field in self.schema}
         self.writer.write_table(pa.Table.from_pydict(columns, schema=self.schema))
         self.record_count += len(self.buffer)
         self.buffer.clear()

@@ -20,6 +20,7 @@ changes here).
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import json
 
 from collector.collector.adapters.binance import BinanceAdapter
@@ -236,8 +237,8 @@ def test_okx_funding_rate_channel_survives_replay():
     result = ReplayEngine(venue="OKX").run(ReplaySource([frame]))
     assert len(result.non_book_events) == 1
     event = result.non_book_events[0]
-    assert event.stream == "funding-rate" and event.funding_rate == 0.0001
-    assert event.sett_funding_rate == 0.00005 and event.sett_state == "settled"
+    assert event.stream == "funding-rate" and event.funding_rate == Decimal("0.0001")
+    assert event.sett_funding_rate == Decimal("0.00005") and event.sett_state == "settled"
 
 
 def test_okx_open_interest_preserves_all_three_units():

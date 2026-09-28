@@ -1724,3 +1724,23 @@ timestamp semantics (P0-10/P0-11) intentionally untouched; rows written
 before this fix keep their historical padding artifact and have null depth
 fields (never fabricated). Bybit's separate book path was checked and has no
 padding.
+
+### P0-9 — Preserve native numeric precision — **COMPLETE, VERIFIED**
+
+First loss point: the adapters (`adapters/{binance,bybit,okx,binance_spot}.py`,
+`binance_oi.py`) and `feature_computer.py` parsed venue decimal *strings* with
+`float()`. The Binance local book was already exact (`Decimal`), and raw
+capture already stored the wire text verbatim, so the loss was introduced in
+canonical parsing and the feature layer, not in capture. Fix: canonical
+fields are `Decimal`; one boundary module (`collector/numeric.py`) parses
+exactly, and `ParquetWriter` writes nullable `<field>_exact` text companions
+beside the (now derived) float64 columns. Legacy rows keep null companions and
+are never "repaired". Full contract, field list, measured cost and the
+historical-data limitation: `docs/NUMERIC_PRECISION.md`.
+
+Found along the way: `compact_daily` hard-failed on any legacy hourly segment
+missing a newer column. On untouched `origin/main` this already affected
+pre-P0-8 segments (`bid_depth`/`ask_depth`); it is fixed here, together with
+the new `_exact` columns, under the existing "absent nullable column -> nulls"
+policy. Measured cost is a real slowdown (trade write path 0.59x) and is
+reported, not hidden. Out of scope and untouched: P0-10/P0-11/P0-4/P0-2/P0-3.

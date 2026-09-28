@@ -6,6 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pa_parquet
 import pandas as pd
 from collector.collector.parquet_writer import ParquetWriter
+from collector.collector.numeric import column_value
 from collector.collector.instrument import BINANCE_USDM_BTCUSDT
 
 @pytest.fixture
@@ -104,8 +105,9 @@ def _trade_record(timestamp_ms=1770000000000):
 def test_trades_schema_casts_integer_ms_to_utc_timestamps():
     from collector.collector.config import TRADES_SCHEMA
 
+    record = _trade_record()
     table = pa.Table.from_pydict(
-        {key: [value] for key, value in _trade_record().items()},
+        {f.name: [column_value(f.name, record)] for f in TRADES_SCHEMA},
         schema=TRADES_SCHEMA,
     )
 
@@ -163,8 +165,9 @@ def _liquidation_record(timestamp_ms=1770000000000):
 def test_openinterest_schema_casts_integer_ms_to_utc_timestamps():
     from collector.collector.config import OPENINTEREST_SCHEMA
 
+    record = _openinterest_record()
     table = pa.Table.from_pydict(
-        {key: [value] for key, value in _openinterest_record().items()},
+        {f.name: [column_value(f.name, record)] for f in OPENINTEREST_SCHEMA},
         schema=OPENINTEREST_SCHEMA,
     )
 
@@ -178,8 +181,9 @@ def test_openinterest_schema_casts_integer_ms_to_utc_timestamps():
 def test_liquidation_schema_casts_integer_ms_to_utc_timestamps():
     from collector.collector.config import LIQUIDATION_SCHEMA
 
+    record = _liquidation_record()
     table = pa.Table.from_pydict(
-        {key: [value] for key, value in _liquidation_record().items()},
+        {f.name: [column_value(f.name, record)] for f in LIQUIDATION_SCHEMA},
         schema=LIQUIDATION_SCHEMA,
     )
 
