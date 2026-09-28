@@ -58,6 +58,11 @@ def _values_for_field(stream, field, timestamps, offset=0):
         return [int(ts + 3600000) for ts in timestamps]
     if pa.types.is_int8(field.type):
         return [1 for _ in range(n)]
+    if pa.types.is_int32(field.type):
+        # P0-8: bid_depth/ask_depth -- count of real observed levels.
+        # This fixture always synthesizes a full 10-level book (see the
+        # list-type branch above), so 10 is the truthful depth here.
+        return [10 for _ in range(n)]
     if pa.types.is_float64(field.type):
         if stream == "orderbook":
             mapping = {

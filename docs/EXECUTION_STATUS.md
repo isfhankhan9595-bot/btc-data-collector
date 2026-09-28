@@ -1705,3 +1705,22 @@ introduced; no raw evidence discarded beyond this labeled, narrow risk.
 Re-ran the full suite, targeted P0-7/P0-6/replay/OI tests, compileall, and
 `git diff --check` after these doc-only edits; all still pass/clean (see PR
 completion report for exact figures).
+
+### P0-8 — Eliminate fabricated order-book levels — **COMPLETE, VERIFIED**
+
+`feature_computer.compute_orderbook_features()` padded any side with fewer
+than 10 real levels up to 10 by repeating the last real price with a
+fabricated `0.0` quantity, and computed `obi_level_3`/`obi_level_5` as if
+those levels existed. It is production-active: `_handle_binance_orderbook`
+calls it with the authoritative *reconstructed* book (not a partial diff), so
+short arrays meant the true book was genuinely thin. (The other caller,
+`_handle_orderbook`, is dead code reachable only from a test.) Fixed by
+never padding (arrays hold only real levels, top-10 truncation retained),
+adding nullable `bid_depth`/`ask_depth` (`ORDERBOOK_SCHEMA` v1.2, additive;
+the list columns were already variable-length), and making `obi_level_3`/
+`obi_level_5` `None` unless N real levels exist on both sides. Contract and
+evidence: `docs/ORDERBOOK_LEVEL_TRUTH.md`. Float precision (P0-9) and
+timestamp semantics (P0-10/P0-11) intentionally untouched; rows written
+before this fix keep their historical padding artifact and have null depth
+fields (never fabricated). Bybit's separate book path was checked and has no
+padding.

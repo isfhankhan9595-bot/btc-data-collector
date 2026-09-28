@@ -16,16 +16,20 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     except (ValueError, TypeError):
         return {}
 
-    while len(bids_price) < 10:
-        bids_price.append(bids_price[-1])
-        bids_qty.append(0.0)
-    while len(asks_price) < 10:
-        asks_price.append(asks_price[-1])
-        asks_qty.append(0.0)
+    # P0-8: NEVER fabricate a missing price level. Truncate to the top 10
+    # REAL levels when more are available; never pad past however many are
+    # actually present -- a missing level is represented by the array
+    # simply being shorter, never by repeating the last real price with a
+    # synthetic zero quantity (that made a nonexistent level indistinguishable
+    # from a real one at the same price with genuinely zero size). bid_depth/
+    # ask_depth make the true observed depth explicit and queryable without
+    # relying on callers to notice array length -- see ORDERBOOK_SCHEMA v1.2.
     bids_price = bids_price[:10]
     bids_qty = bids_qty[:10]
     asks_price = asks_price[:10]
     asks_qty = asks_qty[:10]
+    bid_depth = len(bids_price)
+    ask_depth = len(asks_price)
 
     best_bid = bids_price[0]
     best_ask = asks_price[0]
@@ -48,19 +52,33 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     if total_bid_qty + total_ask_qty == 0:
         return {}
+    # Aggregate OBI over however many real levels are actually present (up
+    # to the top-10 truncation above) -- semantically valid as a running
+    # aggregate, and bid_depth/ask_depth make clear it is not always a
+    # full-10-level figure.
     obi = (total_bid_qty - total_ask_qty) / (total_bid_qty + total_ask_qty)
 
     tbq_1 = bids_qty[0]
     taq_1 = asks_qty[0]
     obi_level_1 = (tbq_1 - taq_1) / (tbq_1 + taq_1) if tbq_1 + taq_1 > 0 else 0.0
 
-    tbq_3 = sum(bids_qty[:3])
-    taq_3 = sum(asks_qty[:3])
-    obi_level_3 = (tbq_3 - taq_3) / (tbq_3 + taq_3) if tbq_3 + taq_3 > 0 else 0.0
+    # P0-8: a level-N OBI is only a truthful level-N observation when at
+    # least N real levels were actually observed on BOTH sides. Fewer real
+    # levels than the metric name claims -> None (missing/invalid), never
+    # silently computed over whatever partial depth exists under that name.
+    if bid_depth >= 3 and ask_depth >= 3:
+        tbq_3 = sum(bids_qty[:3])
+        taq_3 = sum(asks_qty[:3])
+        obi_level_3 = (tbq_3 - taq_3) / (tbq_3 + taq_3) if tbq_3 + taq_3 > 0 else 0.0
+    else:
+        obi_level_3 = None
 
-    tbq_5 = sum(bids_qty[:5])
-    taq_5 = sum(asks_qty[:5])
-    obi_level_5 = (tbq_5 - taq_5) / (tbq_5 + taq_5) if tbq_5 + taq_5 > 0 else 0.0
+    if bid_depth >= 5 and ask_depth >= 5:
+        tbq_5 = sum(bids_qty[:5])
+        taq_5 = sum(asks_qty[:5])
+        obi_level_5 = (tbq_5 - taq_5) / (tbq_5 + taq_5) if tbq_5 + taq_5 > 0 else 0.0
+    else:
+        obi_level_5 = None
 
     timestamp = int(time.time() * 1000)
     exchange_timestamp = msg.get("E", timestamp)
@@ -73,6 +91,8 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
         "bids_qty": bids_qty,
         "asks_price": asks_price,
         "asks_qty": asks_qty,
+        "bid_depth": bid_depth,
+        "ask_depth": ask_depth,
         "best_bid": best_bid,
         "best_ask": best_ask,
         "mid_price": mid_price,
