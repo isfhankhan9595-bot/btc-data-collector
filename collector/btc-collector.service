@@ -1,18 +1,42 @@
+# BTCUSDT market-data collector -- systemd unit (P0-12).
+#
+# ASSUMED, NOT VERIFIED against a live host: EC2 login user `ec2-user`, repo
+# cloned at /home/ec2-user/btc-data-collector, venv at .venv inside it. If the
+# host differs, edit User/Group/WorkingDirectory/ExecStart together
+# (see docs/DEPLOYMENT.md). Secrets never live in this file.
+
 [Unit]
-Description=BTCUSDT Perpetual ML Training Data Collector
-After=network.target
+Description=BTCUSDT market-data collector (btc-data-collector)
+# network-online, not network: the first WebSocket connect happens at startup.
+After=network-online.target
+Wants=network-online.target
+# A bad deployment (wrong path/user/env file) must end in `failed`, visible to
+# `systemctl status`, instead of crash-looping forever behind Restart=always.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/path/to/Btc-bot
-Environment="TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN"
+User=ec2-user
+Group=ec2-user
+# Repo root: `-m collector.run_collector` resolves the `collector` package from
+# here, and DATA_DIR/LOGS_DIR ("data", "logs") are relative to it. The service
+# user must be able to write here.
+WorkingDirectory=/home/ec2-user/btc-data-collector
+# Required (no leading "-"): a missing/unreadable file fails the start loudly.
+# May be empty; may set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. Mode 0600.
 EnvironmentFile=/etc/btc-collector.env
-ExecStart=/usr/bin/python3 -m collector.run_collector
+# The venv interpreter: system python3 does not have requirements.txt installed.
+ExecStart=/home/ec2-user/btc-data-collector/.venv/bin/python -m collector.run_collector
 Restart=always
 RestartSec=5
-# Give the system time to cleanly flush parquets on stop
+# The collector handles SIGTERM itself (asyncio signal handler). Stop must
+# outlast the websocket ingest-queue drain (30 s, websocket_client.start)
+# plus quality-queue flush and Parquet close, or systemd SIGKILLs mid-flush.
+KillSignal=SIGTERM
 TimeoutStopSec=60
+# Nothing here needs privilege escalation.
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
