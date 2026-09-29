@@ -160,3 +160,29 @@ fixtures, not observed against real exchange traffic.
 - **Still true:** backpressure blocks the receive loop rather than dropping
   frames; a slow `on_raw_frame` (e.g. a Parquet rollover) blocks receive
   directly; the default queue size of 2000 is unvalidated against real traffic.
+
+## Unresolved design fork: overflow policy (block vs drop-newest)
+
+Three P0-1 branches exist. `p0-1-websocket-receive-processing-decoupling` is
+the original P0-1 and is already merged (nothing unique remains).
+`p0-1-receive-processing-isolation` is a **separate, unmerged** implementation
+from an older base (5 unique commits) and makes a *different* overflow choice:
+
+| | this file (merged) | `p0-1-receive-processing-isolation` (unmerged) |
+|---|---|---|
+| Queue full | **blocks** the receive loop (shutdown-aware polling) | **drops the newest** item (`put_nowait`) |
+| Live processing loss | none | counted (`processing_queue_overflow`), `DATA_DROP` event |
+| Raw evidence | captured before the enqueue | captured before the enqueue |
+| Receive loop under sustained overload | can stall | never stalls |
+| Book state | never sees a gap from this cause | a dropped diff is a sequence gap -> recovery |
+
+FACT: both capture raw before the queue. INFERENCE (not verified against real
+traffic): under *sustained* overload a blocked receive loop could exceed the
+venue's ping/keepalive tolerance, causing a disconnect and frames that are
+never received or raw-captured at all -- a loss of **raw** truth -- whereas
+drop-newest trades that for a loss of **live processing** that raw replay can
+recover. Which is preferable depends on real message rates and processing
+latency, which are NOT VERIFIED offline. This is a design decision for a
+human, not something this correction resolves; the other branch also lacks
+this file's queue-size validation, shutdown accounting, backpressure event and
+worker guard, so it must not be merged as-is.
