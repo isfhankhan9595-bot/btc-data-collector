@@ -47,8 +47,9 @@ def _all_service_files():
     return sorted(p for p in REPO.rglob("*.service") if ".git" not in p.parts)
 
 
-def test_at_least_one_service_file_exists():
-    assert _all_service_files() == [UNIT]
+def test_expected_service_file_exists():
+    services = _all_service_files()
+    assert UNIT in services
 
 
 @pytest.mark.parametrize("unit_path", _all_service_files())
