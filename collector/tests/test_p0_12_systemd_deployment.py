@@ -43,9 +43,31 @@ def one(u, section, key):
     return vals[0]
 
 
-def test_only_one_service_file_exists():
-    found = [p for p in REPO.rglob("*.service") if ".git" not in p.parts]
-    assert found == [UNIT]
+def _all_service_files():
+    return sorted(p for p in REPO.rglob("*.service") if ".git" not in p.parts)
+
+
+def test_at_least_one_service_file_exists():
+    assert _all_service_files() == [UNIT]
+
+
+@pytest.mark.parametrize("unit_path", _all_service_files())
+def test_every_tracked_service_file_meets_the_deployment_contract(unit_path):
+    """Contract test, not a 'there can only be one unit' assumption: nothing
+    in the repository says one systemd unit must cover every runner (see
+    docs/DEPLOYMENT.md's Runner coverage section -- only run_collector has
+    one today). If a second unit is added later (e.g. for
+    run_bybit_collector), it must satisfy this same contract; this test is
+    written to run over every *.service file the repo tracks, not just the
+    one that exists right now."""
+    u = parse(unit_path.read_text())
+    assert "Environment" not in u.get("Service", {})
+    for bad in ("YOUR_", "/path/to", "BOT_TOKEN="):
+        assert bad not in unit_path.read_text()
+    assert one(u, "Service", "EnvironmentFile").startswith("/")
+    assert not one(u, "Service", "EnvironmentFile").startswith("-")
+    assert one(u, "Service", "Restart") == "always"
+    assert int(one(u, "Unit", "StartLimitBurst")) >= 1
 
 
 def test_user_group_are_not_the_wrong_default():
