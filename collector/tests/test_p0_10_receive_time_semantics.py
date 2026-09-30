@@ -23,6 +23,18 @@ from collector.collector.raw_capture import (
 )
 from collector.collector.websocket_client import WebSocketClient
 
+def _stamp_at(seconds, mono_ns=0):
+    """Deterministic ReceiveStamp for a given wall-clock second value.
+
+    P0-11 moved the receive-boundary clock read from a direct
+    ``time.time()`` call into ``collector.collector.clock.capture_receive_stamp``.
+    These tests mock the receive stamp itself rather than the underlying
+    clock, since that is now the actual seam websocket_client calls.
+    """
+    from collector.collector.clock import ReceiveStamp
+    return ReceiveStamp(wall_ns=int(seconds * 1_000_000_000), mono_ns=mono_ns)
+
+
 PKG = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -58,7 +70,7 @@ async def test_queue_delay_does_not_change_receive_time():
     import time as replay_time
     client = WebSocketClient("ws://x", on_message, ingest_queue_maxsize=10)
     client.running = True
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=1.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(1.0)):
         await client._consume(_Socket(['{"n":1}']))          # arrives at 1000 ms
     client.running = False
     with mock.patch.object(replay_time, "time", return_value=5.0):  # worker runs at 5000 ms
@@ -80,7 +92,7 @@ async def test_receive_time_is_stamped_before_capture_and_before_enqueue():
 
     client = WebSocketClient("ws://x", on_message, on_raw_frame=on_raw, ingest_queue_maxsize=10)
     client.running = True
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=2.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(2.0)):
         await client._consume(_Socket(['{"n":1}']))
     client.running = False
     await client._process_queue()
@@ -97,7 +109,7 @@ async def test_rapid_frames_and_same_millisecond_keep_arrival_order():
 
     client = WebSocketClient("ws://x", on_message, ingest_queue_maxsize=10)
     client.running = True
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=3.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(3.0)):
         await client._consume(_Socket([f'{{"n":{i}}}' for i in range(4)]))
     client.running = False
     await client._process_queue()
@@ -114,10 +126,10 @@ async def test_reconnect_generation_keeps_its_own_receive_time():
     client = WebSocketClient("ws://x", lambda *a, **k: None, on_raw_frame=on_raw, ingest_queue_maxsize=10)
     client.running = True
     client._connection_serial = 1
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=1.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(1.0)):
         await client._consume(_Socket(['{"a":1}']))
     client._connection_serial = 2
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=9.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(9.0)):
         await client._consume(_Socket(['{"a":2}']))
     assert seen == [(1, 1000), (2, 9000)]
 
@@ -135,7 +147,7 @@ async def test_exchange_timestamp_earlier_or_later_never_replaces_receive():
     client = WebSocketClient("ws://x", lambda *a, **k: None, on_raw_frame=on_raw, ingest_queue_maxsize=10)
     client.running = True
     frames = ['{"E":1}', '{"E":99999999999999}']     # far past / far future exchange ts
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=7.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(7.0)):
         await client._consume(_Socket(frames))
     assert got == [7000, 7000]
 
@@ -240,7 +252,7 @@ async def test_receive_time_survives_queue_delay_for_callbacks_without_connectio
 
     client = WebSocketClient("ws://x", on_message, ingest_queue_maxsize=10)
     client.running = True
-    with mock.patch("collector.collector.websocket_client.time.time", return_value=1.0):
+    with mock.patch("collector.collector.websocket_client.capture_receive_stamp", return_value=_stamp_at(1.0)):
         await client._consume(_Socket(['{"n":1}']))
     client.running = False
     with mock.patch.object(_t, "time", return_value=5.0):
