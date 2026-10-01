@@ -168,7 +168,8 @@ class BinanceSpotCollectorApp:
 
     def _capture_raw_frame(self, payload, *, local_receive_ts, connection_id=None,
                            connection_generation=None, decode_ok=True,
-                           decode_error=None, parsed=None, control_frame=False):
+                           decode_error=None, parsed=None, control_frame=False,
+                           local_receive_ns=None, receive_mono_ns=None):
         """Persist the exact frame before any lossy transformation.
 
         ``control_frame`` exists because ``WebSocketClient._consume()`` calls
@@ -191,7 +192,8 @@ class BinanceSpotCollectorApp:
             if isinstance(stream, str):
                 channel = self.adapter.route_message(parsed)
         self.raw_capture.capture_wire(RawWireRecord(
-            local_receive_ts=local_receive_ts,
+            local_receive_ts=local_receive_ts, local_receive_ns=local_receive_ns,
+            receive_mono_ns=receive_mono_ns,
             payload=payload if isinstance(payload, str) else str(payload),
             venue=VENUE, connection_id=connection_id,
             connection_generation=connection_generation, channel=channel,

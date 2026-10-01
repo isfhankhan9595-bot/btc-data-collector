@@ -73,6 +73,7 @@ from .adapters.bybit import BybitAdapter
 from .adapters.okx import OKXAdapter
 from .book_engine import LocalBook
 from .canonical import CanonicalOrderBookEvent
+from .clock import effective_ns, ms_from_ns, require_epoch_ns
 from .quality_events import BookQuality, QualityEventType
 from .storage_layout import StorageCollisionError, iter_segments, read_streams
 from .utils import logger
@@ -116,10 +117,21 @@ class ReplayFrame:
     decode_ok: bool = True
     http_ok: bool = True
     endpoint: Optional[str] = None
+    #: P0-11: the RECORDED historical local receive time in epoch ns (never
+    #: the replay-time clock, never file-read time). None for legacy rows,
+    #: which only ever had ms precision.
+    receive_ns: Optional[int] = None
+    #: Recorded monotonic ns; meaningful only relative to other frames of the
+    #: same connection lineage in the same process run. Never an epoch value.
+    receive_mono_ns: Optional[int] = None
 
     @property
     def order_key(self) -> tuple[int, int, int]:
-        return (self.timestamp_ms, _KIND_RANK.get(self.kind, 9), self.source_index)
+        # Ordered by recorded ns when present, else by ms expressed in ns.
+        # Ties stay ties: no offset is added to break them; the secondary
+        # keys are the existing evidence-based kind rank and recorded order.
+        return (effective_ns(self.timestamp_ms, self.receive_ns),
+                _KIND_RANK.get(self.kind, 9), self.source_index)
 
 
 @dataclass(frozen=True)
@@ -247,12 +259,22 @@ class ReplaySource:
         frames: list[ReplayFrame] = []
         index = 0
         for row in wire_rows:
+            recv_ms = _as_ms(row.get("local_receive_ts") or row.get("timestamp"))
+            recv_ns = _optional_ns(row.get("local_receive_ns"), "local_receive_ns")
+            if recv_ns is not None and ms_from_ns(recv_ns) != recv_ms:
+                # Two clock reads that disagree mean domains were mixed at
+                # capture; refuse rather than silently pick one.
+                raise ValueError(
+                    f"recorded local_receive_ts ({recv_ms}) disagrees with "
+                    f"local_receive_ns ({recv_ns}) at wire row {index}")
             frames.append(ReplayFrame(
-                timestamp_ms=_as_ms(row.get("local_receive_ts") or row.get("timestamp")),
+                timestamp_ms=recv_ms,
                 kind=FrameKind.WIRE, source_index=index,
                 payload=row.get("payload") or "",
                 connection_id=row.get("connection_id"),
                 decode_ok=bool(row.get("decode_ok", True)),
+                receive_ns=recv_ns,
+                receive_mono_ns=_optional_ns(row.get("receive_mono_ns"), "receive_mono_ns", epoch=False),
             ))
             index += 1
         for row in rest_rows:
@@ -313,7 +335,9 @@ class ReplaySource:
                     ) from exc
                 for path in sorted(paths):
                     frame = pd.read_parquet(path)
-                    for row in frame.to_dict("records"):
+                    records = frame.to_dict("records")
+                    _restore_exact_ns_columns(path, records)
+                    for row in records:
                         row_venue = _row_venue(row)
                         if row_venue != venue_key:
                             key = row_venue or "<unattributed>"
@@ -327,6 +351,52 @@ class ReplaySource:
         if skipped:
             logger.warning("replay_skipped_foreign_venue_rows", venue=venue_key, skipped=skipped)
         return source
+
+
+_EXACT_INT_COLUMNS = ("local_receive_ns", "receive_mono_ns")
+
+
+def _restore_exact_ns_columns(path: str, records: list[dict]) -> None:
+    """Overwrite the ns columns with exact Python ints read straight from
+    Arrow. pandas turns an int64 column containing any null into float64,
+    and a float64 cannot hold an epoch-nanosecond (~1.7e18 > 2**53) exactly:
+    without this the sub-millisecond distinctions P0-11 preserves would be
+    silently rounded away on the way back in. Legacy files lack the columns
+    and are left untouched.
+    """
+    import pyarrow.parquet as pq
+
+    names = pq.read_schema(path).names
+    present = [c for c in _EXACT_INT_COLUMNS if c in names]
+    if not present:
+        return
+    table = pq.read_table(path, columns=present)
+    for column in present:
+        exact = table.column(column).to_pylist()
+        if len(exact) != len(records):
+            raise ValueError(f"row count mismatch reading {column} from {path}")
+        for record, value in zip(records, exact):
+            record[column] = value
+
+
+def _optional_ns(value, name: str, *, epoch: bool = True):
+    """None/NaN/NA -> None (a missing stamp stays missing); otherwise an
+    exact int. bool and float are rejected: a float cannot carry an
+    epoch-ns exactly, so accepting one would hide precision loss."""
+    if value is None:
+        return None
+    try:
+        if value != value:  # NaN
+            return None
+    except (TypeError, ValueError):
+        pass
+    if type(value).__name__ == "NAType":
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an exact int or missing, got {type(value).__name__}: {value!r}")
+    if epoch:
+        return require_epoch_ns(value, name)
+    return value
 
 
 def _row_venue(row: dict) -> str:

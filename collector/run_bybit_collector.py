@@ -143,7 +143,8 @@ class BybitCollectorApp:
 
     def _capture_raw_frame(self, frame, *, local_receive_ts, connection_id=None,
                            connection_generation=None, decode_ok=True,
-                           decode_error=None, parsed=None, control_frame=False):
+                           decode_error=None, parsed=None, control_frame=False,
+                           local_receive_ns=None, receive_mono_ns=None):
         """Persist the exact frame before any lossy transformation.
 
         Signature matches run_collector.CollectorApp._capture_raw_frame,
@@ -154,7 +155,8 @@ class BybitCollectorApp:
         if self.raw_capture is None:
             return
         record = RawWireRecord(
-            local_receive_ts=local_receive_ts, payload=frame, venue="BYBIT",
+            local_receive_ts=local_receive_ts, local_receive_ns=local_receive_ns,
+            receive_mono_ns=receive_mono_ns, payload=frame, venue="BYBIT",
             connection_id=connection_id, connection_generation=connection_generation,
             symbol=SYMBOL, market_type="linear_perpetual",
             decode_ok=decode_ok, decode_error=decode_error,

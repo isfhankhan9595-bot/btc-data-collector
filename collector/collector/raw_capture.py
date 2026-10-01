@@ -49,6 +49,13 @@ from typing import Any, Callable, Mapping, Optional
 
 import pyarrow as pa
 
+from .clock import (
+    EXCHANGE_TS_PRECISION,
+    local_receive_precision_for,
+    ms_from_ns,
+    require_epoch_ns,
+)
+
 __all__ = [
     "RawWireRecord",
     "RawRestRecord",
@@ -111,9 +118,24 @@ RAW_WIRE_SCHEMA = pa.schema(
         ("update_id", pa.int64()),
         ("first_update_id", pa.int64()),
         ("previous_update_id", pa.int64()),
+        # --- schema 1.1 (P0-11), additive and nullable -------------------
+        # Legacy 1.0 files lack these columns entirely; a reader must treat
+        # absence/null as "millisecond precision only", never as zero.
+        # Epoch nanoseconds, local wall clock, taken at the receive boundary
+        # before decode/capture/queue. int64 (not timestamp[ns]) so pandas
+        # cannot silently round-trip it through float64.
+        ("local_receive_ns", pa.int64()),
+        # Local monotonic ns: valid only as a difference within one process
+        # run (same connection_id lineage). NOT an epoch value; never
+        # comparable across restarts.
+        ("receive_mono_ns", pa.int64()),
+        # Precision *provenance*, so nanosecond-typed storage cannot be read
+        # as nanosecond-measured exchange data.
+        ("local_receive_precision", pa.string()),
+        ("exchange_event_ts_precision", pa.string()),
     ],
     metadata={
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "stream_name": "raw_wire",
         "contract": "payload is the exact frame text; capture precedes parsing",
     },
@@ -185,11 +207,24 @@ class RawWireRecord:
     #: which is still row-build time, never receive time. It can never
     #: influence ``timestamp`` / ``local_receive_ts`` below.
     local_capture_ts: Optional[int] = None
+    #: P0-11: receive-boundary stamps (see collector.clock). Optional so
+    #: legacy callers keep working; absence is recorded as ms-only precision.
+    local_receive_ns: Optional[int] = None
+    receive_mono_ns: Optional[int] = None
 
     def to_row(self, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> dict[str, Any]:
         stored, original, truncated = _truncate(self.payload, max_payload_bytes)
-        # Row-build wall clock only (legacy provenance). Deliberately never
-        # substituted for local_receive_ts, which is a required field.
+        if self.local_receive_ns is not None:
+            require_epoch_ns(self.local_receive_ns, "local_receive_ns")
+            # The legacy ms column and the ns column come from ONE clock
+            # read; a mismatch means two clock domains were mixed.
+            if ms_from_ns(self.local_receive_ns) != self.local_receive_ts:
+                raise ValueError(
+                    "local_receive_ts (ms) disagrees with local_receive_ns: "
+                    f"{self.local_receive_ts} != {ms_from_ns(self.local_receive_ns)}"
+                )
+        # Row-build wall clock only (legacy provenance, P0-10). Deliberately
+        # never substituted for local_receive_ts, which is a required field.
         capture_ts = (
             self.local_capture_ts
             if self.local_capture_ts is not None
@@ -215,6 +250,14 @@ class RawWireRecord:
             "update_id": self.update_id,
             "first_update_id": self.first_update_id,
             "previous_update_id": self.previous_update_id,
+            "local_receive_ns": self.local_receive_ns,
+            "receive_mono_ns": self.receive_mono_ns,
+            "local_receive_precision": local_receive_precision_for(self.local_receive_ns),
+            # Every supported venue stamps exchange time in ms; recorded only
+            # when there is an exchange timestamp to qualify.
+            "exchange_event_ts_precision": (
+                EXCHANGE_TS_PRECISION if self.exchange_event_ts is not None else None
+            ),
         }
 
 

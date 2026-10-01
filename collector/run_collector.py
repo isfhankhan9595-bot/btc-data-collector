@@ -165,7 +165,8 @@ class CollectorApp:
 
     def _capture_raw_frame(self, frame, *, local_receive_ts, connection_id=None,
                            connection_generation=None, decode_ok=True,
-                           decode_error=None, parsed=None, control_frame=False):
+                           decode_error=None, parsed=None, control_frame=False,
+                           local_receive_ns=None, receive_mono_ns=None):
         """Persist the exact frame before any lossy transformation.
 
         Venue-native identifiers are copied verbatim when the frame decoded;
@@ -197,7 +198,8 @@ class CollectorApp:
                 first_update_id = payload.get("U")
                 previous_update_id = payload.get("pu")
         capture.capture_wire(RawWireRecord(
-            local_receive_ts=local_receive_ts,
+            local_receive_ts=local_receive_ts, local_receive_ns=local_receive_ns,
+            receive_mono_ns=receive_mono_ns,
             payload=frame if isinstance(frame, str) else str(frame),
             venue="BINANCE", connection_id=connection_id,
             connection_generation=connection_generation,
