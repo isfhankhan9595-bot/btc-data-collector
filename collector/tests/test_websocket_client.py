@@ -552,7 +552,8 @@ async def test_on_message_receives_the_arrival_timestamp_not_the_processing_time
     available. The clock is controlled, so a regression that re-reads the
     clock at processing time is a hard, deterministic failure."""
     from collector.collector import websocket_client as wsc
-    clock = {"t": 1000.000}
+    from collector.collector.clock import ReceiveStamp
+    clock = {"t_ns": 1_000_000_000_000}        # 1000.000 s, in ns (wall clock domain)
     seen = []
 
     async def on_message(data, ts, connection_id=None):
@@ -560,9 +561,10 @@ async def test_on_message_receives_the_arrival_timestamp_not_the_processing_time
 
     client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
     client.running = True
-    with patch.object(wsc.time, "time", new=lambda: clock["t"]):
+    with patch.object(wsc, "capture_receive_stamp",
+                      new=lambda: ReceiveStamp(wall_ns=clock["t_ns"], mono_ns=0)):
         await client._consume(_FakeSocket(['{"n":1}']))     # arrives at t=1000.000 s
-        clock["t"] = 1005.000                                # 5 s of queueing delay passes
+        clock["t_ns"] = 1_005_000_000_000                    # 5 s of queueing delay passes
         client._worker_task = asyncio.ensure_future(client._process_queue())
         client.running = False
         await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
@@ -576,7 +578,8 @@ async def test_receive_timestamp_also_holds_for_handlers_that_take_no_connection
     whether the handler accepts connection_id. The timestamp invariant must
     hold on both; the first version of the test above only covered one."""
     from collector.collector import websocket_client as wsc
-    clock = {"t": 2000.000}
+    from collector.collector.clock import ReceiveStamp
+    clock = {"t_ns": 2_000_000_000_000}
     seen = []
 
     async def on_message(data, ts):                 # no connection_id parameter
@@ -585,9 +588,10 @@ async def test_receive_timestamp_also_holds_for_handlers_that_take_no_connection
     client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
     assert client._on_message_takes_connection is False
     client.running = True
-    with patch.object(wsc.time, "time", new=lambda: clock["t"]):
+    with patch.object(wsc, "capture_receive_stamp",
+                      new=lambda: ReceiveStamp(wall_ns=clock["t_ns"], mono_ns=0)):
         await client._consume(_FakeSocket(['{"n":1}']))
-        clock["t"] = 2009.000
+        clock["t_ns"] = 2_009_000_000_000
         client._worker_task = asyncio.ensure_future(client._process_queue())
         client.running = False
         await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
