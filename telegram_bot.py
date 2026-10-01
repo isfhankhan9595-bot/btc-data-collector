@@ -20,10 +20,6 @@ except Exception as _requests_import_error:  # Telegram is optional/fail-open.
     requests = None  # type: ignore[assignment]
     logger.warning("requests unavailable; Telegram disabled: %s", _requests_import_error)
 
-TELEGRAM_BOT_TOKEN = "8719899776:AAHj7Tl-SuUU0CecRYU3sRyssCIRwThv3yY"
-TELEGRAM_CHAT_ID = "8578163822"
-BOT_TOKEN = TELEGRAM_BOT_TOKEN
-CHAT_ID = TELEGRAM_CHAT_ID
 TELEGRAM_TEST_MESSAGE = "✅ BTC Bot Telegram Test Message"
 TELEGRAM_MODULE_FILE_PATH = str(Path(__file__).resolve())
 TELEGRAM_FUNCTION_NAMES = (
@@ -84,8 +80,8 @@ class TelegramConfigManager:
                 return cls._config or TelegramConfig(token="", chat_id="", enabled=False)
 
             cls._load_dotenv_once()
-            resolved_token = token if token is not None else os.getenv("TELEGRAM_BOT_TOKEN", BOT_TOKEN)
-            resolved_chat_id = chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID", CHAT_ID)
+            resolved_token = token if token is not None else os.getenv("TELEGRAM_BOT_TOKEN")
+            resolved_chat_id = chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID")
             resolved_token = (resolved_token or "").strip()
             resolved_chat_id = (resolved_chat_id or "").strip()
             enabled = bool(resolved_token and resolved_chat_id and requests is not None)
@@ -94,9 +90,9 @@ class TelegramConfigManager:
             if not enabled:
                 reason = []
                 if not resolved_token:
-                    reason.append("missing token")
+                    reason.append("missing TELEGRAM_BOT_TOKEN")
                 if not resolved_chat_id:
-                    reason.append("missing chat_id")
+                    reason.append("missing TELEGRAM_CHAT_ID")
                 if requests is None:
                     reason.append("requests unavailable")
                 logger.warning("Telegram disabled (%s); trading continues", ", ".join(reason) or "unknown reason")
@@ -305,7 +301,7 @@ def validate_telegram_startup() -> TelegramConfig:
     """Load Telegram config once, warn on failure, and always allow startup."""
     config = load_telegram_config(validate=False)
     print("Telegram Bot Config Loaded" if config.enabled else "Telegram Disabled; continuing startup")
-    print(f"Telegram Chat ID: {config.chat_id or '<missing>'}")
+    print(f"Telegram Chat ID: {'<configured>' if config.chat_id else '<missing>'}")
     logger.info("[BOOT] Telegram optional subsystem enabled=%s", config.enabled)
     try:
         run_telegram_startup_test()
