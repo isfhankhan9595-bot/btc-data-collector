@@ -1042,18 +1042,44 @@ class CollectorApp:
             task.cancel()
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
-        self.ob_writer.close()
-        self.raw_book_writer.close()
-        self.trades_writer.close()
-        self.raw_trades_writer.close()
-        self.mark_writer.close()
-        self.oi_writer.close()
-        self.liq_writer.close()
-        for raw_writer_name in ("raw_wire_writer", "raw_rest_writer"):
-            raw_writer = getattr(self, raw_writer_name, None)
-            if raw_writer is not None:
-                raw_writer.close()
-        self.quality_writer.close()
+        # Hostile-audit finding (this session): none of these close() calls
+        # were guarded. _close_segment's flush/pyarrow-close/fsync/rename have
+        # no failure handling of their own (only the metadata sidecar step
+        # does), so any of them raising -- a real disk-full/fsync/rename
+        # failure, exactly what this audit traces -- would propagate straight
+        # out of shutdown() and abort every writer still left in this list,
+        # including quality_writer itself. One writer's finalization failure
+        # must never silently cost every OTHER writer's still-buffered data.
+        for writer_name in ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
+                            "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer", "raw_rest_writer"):
+            self._close_writer_reporting_failure(writer_name)
+        self._close_writer_reporting_failure("quality_writer")
+
+    def _close_writer_reporting_failure(self, writer_name: str) -> None:
+        """Close one writer; on failure, report it and still return.
+
+        Never lets one writer's close() raise past this point: shutdown must
+        finalize every OTHER writer regardless. The failure is reported
+        through quality_writer -- itself still open at this point for every
+        writer_name except "quality_writer", which is always closed last.
+        """
+        writer = getattr(self, writer_name, None)
+        if writer is None:
+            return
+        try:
+            writer.close()
+        except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
+            logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
+            if writer_name != "quality_writer":
+                try:
+                    self._persist_quality_event({
+                        "exchange": "BINANCE", "stream": getattr(writer, "stream_name", writer_name),
+                        "event_type": "ERROR",
+                        "reason": f"storage_shutdown_close_failed:{writer_name}:{type(exc).__name__}",
+                    })
+                except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
+                    logger.error("storage_shutdown_close_failure_report_failed",
+                                 writer=writer_name, error=str(sink_exc))
         msg = "Collector Application Shutdown"
         logger.info(msg)
         send_telegram_alert(msg)
