@@ -130,6 +130,8 @@ class ParquetWriter:
         quality_event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         exchange: str = "BINANCE",
         on_segment_published: Optional[Callable[[Tuple[str, int], Path], None]] = None,
+        segment_footer_metadata: Optional[Callable[[], Dict[str, str]]] = None,
+        segment_publish_hook: Optional[Callable[[Path, int], None]] = None,
     ) -> None:
         if segment_rows <= 0 or segment_seconds <= 0:
             raise ValueError("segment_rows and segment_seconds must be positive")
@@ -152,6 +154,19 @@ class ParquetWriter:
         try:
             self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
             self.quality_event_sink = quality_event_sink
+            #: P0-3 (both default None = unchanged behaviour). ``segment_footer_metadata``
+            #: is called as a segment closes and its str->str result is stored in that
+            #: Parquet file's own footer, so the metadata is atomic with the published
+            #: file. ``segment_publish_hook`` is called after the segment is durably
+            #: published (rename + directory fsync); a failure in it never un-publishes.
+            self._segment_footer_metadata = segment_footer_metadata
+            #: P0-3, distinct from the P0-4 ``on_segment_published`` public
+            #: attribute above -- same closing moment (right after the
+            #: atomic rename + directory fsync), different callers, and a
+            #: different call signature (``(final_path, record_count)``
+            #: rather than ``((hour, seq), final_path)``). Renamed to avoid
+            #: colliding with it.
+            self._segment_publish_hook = segment_publish_hook
             self.buffer: List[Dict[str, Any]] = []
             self.current_hour = self._get_current_hour_str()
             self.writer: Optional[pq.ParquetWriter] = None
@@ -386,6 +401,10 @@ class ParquetWriter:
             return
         self.flush()
         final, tmp, counter = self._segment_paths()
+        if self._segment_footer_metadata is not None:
+            extra = self._segment_footer_metadata()
+            if extra:
+                self.writer.add_key_value_metadata({str(k): str(v) for k, v in extra.items()})
         self.writer.close()
         self.writer = None
         with tmp.open("rb") as handle:
@@ -399,6 +418,11 @@ class ParquetWriter:
         finally:
             os.close(parent_fd)
         counter.unlink(missing_ok=True)
+        if self._segment_publish_hook is not None:
+            try:
+                self._segment_publish_hook(final, self.record_count)
+            except Exception as exc:  # the segment is already durable; never un-publish it
+                logger.error("segment_publish_hook_failed", file=str(final), error=f"{type(exc).__name__}: {exc}")
         # The segment is already durably published above. A metadata failure
         # must therefore never propagate: it would kill the ingest task over a
         # sidecar hint while the data itself is safely on disk. Surface it as a
@@ -435,6 +459,32 @@ class ParquetWriter:
         if open_next:
             self._seq += 1
             self._open_segment()
+
+    def publish_open_segment(self) -> None:
+        """Publish the open segment now (if it holds any rows) and open the next.
+
+        A no-op when nothing is buffered or written, so an idle stream never
+        produces an empty segment."""
+        if self.writer is None or (self.record_count == 0 and not self.buffer):
+            return
+        self._close_segment(open_next=True)
+
+    def abandon(self) -> None:
+        """Release the stream lock WITHOUT publishing: the crash-equivalent exit.
+
+        The unpublished ``.seg.tmp`` is left for ``_recover_orphans`` on the next
+        open, exactly as after a process kill. Used to discard a writer whose
+        state is no longer trustworthy after a failure."""
+        try:
+            if self.writer is not None:
+                try:
+                    self.writer.close()
+                except Exception:
+                    pass
+                self.writer = None
+        finally:
+            self._closed = True
+            self._release_lock()
 
     def close(self) -> None:
         """Publish the open segment and release the stream directory lock."""

@@ -1744,3 +1744,38 @@ pre-P0-8 segments (`bid_depth`/`ask_depth`); it is fixed here, together with
 the new `_exact` columns, under the existing "absent nullable column -> nulls"
 policy. Measured cost is a real slowdown (trade write path 0.59x) and is
 reported, not hidden. Out of scope and untouched: P0-10/P0-11/P0-4/P0-2/P0-3.
+
+### P0-3 — Eliminate quality-event tiny-file explosion — **COMPLETE, VERIFIED**
+
+`segment_rows=1, segment_seconds=1` on the quality writer made every
+`write()` also publish its own 1-row Parquet file (file count = event
+count). Traced to a deliberate but now-superseded rationale: before P0-2's
+`QualityEventWAL` existed, per-event fsync was the writer's only durability
+mechanism; P0-2 made the WAL authoritative for the real loss window
+(the async queue), but the old segment size was never revisited.
+
+Fixed: `segment_rows=500, segment_seconds=30`, plus (the actual hard part)
+moving WAL-checkpoint-advancement from *immediately after `write()`* to
+*only after the segment holding that write is durably published*
+(`ParquetWriter.on_segment_published`, two small additive hooks, default
+`None` so every other stream is unaffected). Found and fixed the same latent
+bug independently in `_recover_quality_wal` (startup recovery checkpointed
+immediately after re-`write()`-ing recovered rows, before they were
+necessarily published) — a second crash right after recovery would have
+permanently lost rows recovery had just replayed. `docs/QUALITY_EVENT_STORAGE.md`
+has the full durability/crash/shutdown/memory contract and measurements.
+
+19 new adversarial tests, including two that directly simulate a crash
+(`ParquetWriter.abandon()`, a new method: releases the writer lock without
+publishing) and verify WAL replay loses nothing. 14 required mutations
+applied to real source (A-N), all caught; one (H: shutdown discarding
+pending events via `abandon()` instead of `close()`) was **not** caught
+initially — none of the other tests exercised the real `shutdown()` method
+itself — closed by adding a source-inspection test of `shutdown()` directly.
+Measured: 100/1,000/5,000 events → 100/1,000/5,000 files before, 1/2/10
+after; fsyncs and disk bytes drop by the same ~100-500x; full-stream read
+time drops ~80-480x.
+
+Out of scope, untouched: P0-1/2/4/5/6/7/8/9/10/11/12. `quality_events` is
+not in `compact_daily`'s `STREAM_SCHEMAS`, so no compaction-path change was
+needed.

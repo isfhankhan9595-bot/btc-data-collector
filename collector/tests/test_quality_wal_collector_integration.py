@@ -27,12 +27,21 @@ from collector.collector.quality_wal import QualityEventWAL
 CollectorApp = _run_collector.CollectorApp
 
 
-def _minimal_app(tmp_path, *, wal_dir=None):
-    """A real quality_writer + real WAL, nothing else from __init__."""
+def _minimal_app(tmp_path, *, wal_dir=None, segment_rows=1, segment_seconds=1):
+    """A real quality_writer + real WAL, nothing else from __init__.
+
+    Default segment_rows=1/segment_seconds=1 (pre-P0-3 durability model):
+    every write() is also an immediate publish, so
+    _on_quality_segment_published fires every time and checkpoint-on-publish
+    is equivalent to the old checkpoint-on-write these tests assert on.
+    """
     app = CollectorApp.__new__(CollectorApp)
     app.binance_book = LocalBook("BINANCE")
+    app._quality_pending_max_wal_seq = None
+    app._quality_checkpoint_blocked = False
     app.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, base_dir=str(tmp_path),
-                                       segment_rows=1, segment_seconds=1)
+                                       segment_rows=segment_rows, segment_seconds=segment_seconds,
+                                       segment_publish_hook=app._on_quality_segment_published)
     wal_dir = wal_dir or (app.quality_writer.stream_dir / "wal")
     app._quality_wal = QualityEventWAL(wal_dir)
     app._quality_queue = asyncio.Queue(maxsize=1024)
@@ -150,7 +159,10 @@ def test_recover_quality_wal_resumes_sequence_correctly_no_id_reuse(tmp_path):
     wal_dir = app._quality_wal.wal_dir
     fresh = CollectorApp.__new__(CollectorApp)
     fresh.binance_book = LocalBook("BINANCE")
+    fresh._quality_pending_max_wal_seq = None
+    fresh._quality_checkpoint_blocked = False
     fresh.quality_writer = app.quality_writer
+    fresh.quality_writer._segment_publish_hook = fresh._on_quality_segment_published
     fresh._quality_queue = asyncio.Queue(maxsize=1024)
     fresh._recover_quality_wal(wal_dir)   # the real startup path
 
@@ -254,7 +266,10 @@ def test_startup_recovery_stops_checkpointing_at_first_persist_failure(tmp_path)
 
     fresh = CollectorApp.__new__(CollectorApp)
     fresh.binance_book = LocalBook("BINANCE")
+    fresh._quality_pending_max_wal_seq = None
+    fresh._quality_checkpoint_blocked = False
     fresh.quality_writer = app.quality_writer
+    fresh.quality_writer._segment_publish_hook = fresh._on_quality_segment_published
     real_persist = fresh._persist_quality_event
 
     def _selectively_broken(event):
