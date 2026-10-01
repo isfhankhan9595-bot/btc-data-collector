@@ -159,6 +159,20 @@ class WebSocketClient:
         #: rather than either hanging shutdown forever or pretending the
         #: frame was fully processed.
         self.frames_abandoned_at_shutdown = 0
+        #: Failures of the on_raw_frame *callback itself* (a bug in a runner's
+        #: _capture_raw_frame before it ever reaches RawCapture.capture_wire).
+        #: A writer failure is NOT counted here: RawCapture already catches
+        #: those, counts them in its own capture_failures, and emits a durable
+        #: DATA_DROP quality event per lost frame. This counter exists for the
+        #: layer above that, which used to swallow with only a log line.
+        #: Upper bound on how long shutdown waits for the worker to drain the
+        #: ingest queue. Firing is counted, not just logged.
+        self.shutdown_drain_timeout_s = 30.0
+        self.raw_capture_callback_failures = 0
+        #: True from the first callback failure until the next success. One
+        #: quality event per failure *streak*, not per frame: a callback that
+        #: is broken fails on every frame, and a per-frame event would flood.
+        self.raw_capture_callback_degraded = False
 
     @staticmethod
     def _accepts_connection_id(callback) -> bool:
@@ -285,12 +299,31 @@ class WebSocketClient:
         # keeps a stuck worker (e.g. a wedged downstream write) from
         # hanging shutdown forever -- the timeout firing is itself an
         # observable, logged condition, not a silent hang.
+        await self._drain_and_stop_worker()
+
+    async def _drain_and_stop_worker(self) -> None:
+        """Drain the ingest queue (bounded), then stop the worker.
+
+        Extracted from start() unchanged in behaviour so the timeout path is
+        testable; the timeout is an attribute instead of a literal.
+        """
         if self._worker_task is not None:
             try:
-                await asyncio.wait_for(self._ingest_queue.join(), timeout=30.0)
+                await asyncio.wait_for(self._ingest_queue.join(), timeout=self.shutdown_drain_timeout_s)
             except asyncio.TimeoutError:
-                logger.error("ingest_queue_drain_timeout",
-                             remaining=self._ingest_queue.qsize())
+                # Frames still queued when the drain gives up will not reach
+                # on_message in this run. Their raw copy already exists (raw
+                # capture precedes the enqueue), so this is lost *processing*,
+                # not lost raw evidence -- but it was logged only, uncounted,
+                # unlike the sibling shutdown-abandonment path. qsize() does
+                # not include an item the worker is mid-way through.
+                remaining = self._ingest_queue.qsize()
+                self.frames_abandoned_at_shutdown += remaining
+                logger.error("ingest_queue_drain_timeout", remaining=remaining)
+                if self.on_quality_event:
+                    self.on_quality_event(
+                        "ERROR", f"ingest_queue_drain_timeout:{remaining}",
+                        self.connection_id, self.stream_group)
             self._worker_task.cancel()
             try:
                 await self._worker_task
@@ -387,8 +420,29 @@ class WebSocketClient:
                         parsed=data,
                         control_frame=is_control,
                     )
-                except Exception as exc:  # noqa: BLE001 - capture fails open
-                    logger.warning("raw_frame_capture_failed", error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - fails open, but never silently
+                    # Ingestion continues (stopping would lose every frame,
+                    # not just the raw copy), but this is a raw-evidence
+                    # failure that used to be a log line only: no counter,
+                    # no quality event. If a runner's callback broke, raw
+                    # capture was disabled for every frame with nothing in
+                    # the data to say so.
+                    self.raw_capture_callback_failures += 1
+                    if not self.raw_capture_callback_degraded:
+                        self.raw_capture_callback_degraded = True
+                        logger.error("raw_capture_callback_failed",
+                                     error=str(exc), stream_group=self.stream_group)
+                        if self.on_quality_event:
+                            self.on_quality_event(
+                                "ERROR",
+                                f"raw_capture_callback_failed:{type(exc).__name__}",
+                                self.connection_id, self.stream_group)
+                else:
+                    if self.raw_capture_callback_degraded:
+                        self.raw_capture_callback_degraded = False
+                        logger.warning("raw_capture_callback_recovered",
+                                       failures=self.raw_capture_callback_failures,
+                                       stream_group=self.stream_group)
 
             item = IngestItem(
                 msg=msg, local_receive_ts=local_receive_ts,
