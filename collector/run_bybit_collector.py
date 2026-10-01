@@ -302,9 +302,41 @@ class BybitCollectorApp:
     async def shutdown(self) -> None:
         self.running = False
         await self.client.stop()
-        for writer in (self.quality_writer, self.raw_wire_writer, self.ob_writer,
-                       self.trades_writer, self.mark_writer, self.oi_writer, self.liq_writer):
+        self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
+        self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
+        self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")
+        self._close_writer_reporting_failure(self.mark_writer, "mark_writer", "BYBIT")
+        self._close_writer_reporting_failure(self.oi_writer, "oi_writer", "BYBIT")
+        self._close_writer_reporting_failure(self.liq_writer, "liq_writer", "BYBIT")
+        self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BYBIT")
+
+    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> None:
+        """Close one writer; on failure, report it and still return.
+
+        Hostile-audit finding (this session): none of these close() calls
+        were guarded, so one writer's finalization failure (a real
+        disk-full/fsync/rename failure -- _close_segment's core publish
+        steps have no failure handling of their own, only the metadata
+        sidecar step does) would propagate out of shutdown() and abort
+        every writer still left to close, including quality_writer.
+        Reported through quality_writer -- still open at this point for
+        every writer except quality_writer itself, which is always closed
+        last precisely so this reporting path works.
+        """
+        try:
             writer.close()
+        except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
+            logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
+            if writer_name != "quality_writer":
+                try:
+                    self._persist_quality_event({
+                        "exchange": exchange, "stream": getattr(writer, "stream_name", writer_name),
+                        "event_type": "ERROR",
+                        "reason": f"storage_shutdown_close_failed:{writer_name}:{type(exc).__name__}",
+                    })
+                except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
+                    logger.error("storage_shutdown_close_failure_report_failed",
+                                 writer=writer_name, error=str(sink_exc))
 
 
 async def _main(data_dir: str, url: str) -> None:
