@@ -131,11 +131,18 @@ def test_bad_deployment_fails_loudly_start_limit_and_restart_policy():
 
 
 def test_stop_timeout_outlasts_the_p0_1_websocket_drain():
-    drain = re.search(r"wait_for\(self\._ingest_queue\.join\(\), timeout=(\d+(?:\.\d+)?)\)",
-                      (PKG / "collector" / "websocket_client.py").read_text())
-    assert drain, "P0-1 drain timeout not found; shutdown contract changed"
+    ws_source = (PKG / "collector" / "websocket_client.py").read_text()
+    # The drain timeout is now a named attribute (shutdown_drain_timeout_s),
+    # not an inline literal passed straight to wait_for -- matches the
+    # repository's current shape, re-verified against source rather than
+    # assumed unchanged.
+    drain_attr = re.search(r"self\.shutdown_drain_timeout_s = (\d+(?:\.\d+)?)", ws_source)
+    assert drain_attr, "P0-1 drain timeout attribute not found; shutdown contract changed"
+    assert "timeout=self.shutdown_drain_timeout_s" in ws_source, (
+        "drain wait no longer uses the shutdown_drain_timeout_s attribute; re-check this test"
+    )
     u = parse()
-    assert int(one(u, "Service", "TimeoutStopSec")) > float(drain.group(1))
+    assert int(one(u, "Service", "TimeoutStopSec")) > float(drain_attr.group(1))
     assert one(u, "Service", "KillSignal") == "SIGTERM"
     # the runner really handles SIGTERM itself
     assert "signal.SIGTERM" in (PKG / "run_collector.py").read_text()
