@@ -186,3 +186,47 @@ latency, which are NOT VERIFIED offline. This is a design decision for a
 human, not something this correction resolves; the other branch also lacks
 this file's queue-size validation, shutdown accounting, backpressure event and
 worker guard, so it must not be merged as-is.
+
+## Shutdown/finalization closure audit
+
+Traced the real production path: `CollectorApp.shutdown()` -> each
+`ParquetWriter.close()` -> `_finalize_segment()` -> `_close_segment()` ->
+`flush()` / the underlying pyarrow writer's `close()` / `os.fsync` / the
+segment's `os.replace` -> the metadata sidecar step.
+
+**Two real findings, one fixed here, one documented as a remaining gap:**
+
+1. **FIXED.** None of the four runners' `writer.close()` calls in `shutdown()`
+   were guarded. `_close_segment`'s core publish steps (flush, the pyarrow
+   writer's own close, the tmp-file fsync, the segment's `os.replace`) have no
+   failure handling of their own -- only the metadata sidecar step does, with
+   its own established pattern (catch, log, emit a quality event, never
+   propagate). So a real disk-full/fsync/rename failure on any ONE writer's
+   close would propagate straight out of `shutdown()` and silently abort
+   every OTHER writer still left to close, including `quality_writer`. All
+   three async runners also closed `quality_writer` FIRST, which would have
+   made reporting any other writer's failure through it impossible even with
+   a guard. Fixed uniformly across all four runners: each writer is now
+   closed through `_close_writer_reporting_failure`, which catches, logs, and
+   reports a `storage_shutdown_close_failed:<writer>:<ExcType>` `ERROR`
+   quality event (through `quality_writer`, reordered to close **last**
+   everywhere) -- then continues to the next writer regardless. Proven with a
+   real `CollectorApp`/`ParquetWriter` and a real injected `OSError` at the
+   exact segment-rename call (`os.replace`, ".seg.tmp" -> ".seg"), not a mock
+   of the runner's own logic. Mutation-checked: removing the guard fails 3 of
+   4 new tests.
+2. **NOT FIXED here, documented.** `_close_segment`'s core publish steps
+   themselves still have no per-step quality-event reporting of their own --
+   only the metadata sidecar does. A failure there is now *contained* (the
+   fix above stops it from cascading to other writers, and the caller does
+   log it), but there is still no in-data record, comparable to the metadata
+   step's own pattern, of exactly which step failed for *that* writer's
+   segment. Fixing this would mean touching `ParquetWriter._close_segment`
+   itself, which this audit's scope (a minimal fix, not a `ParquetWriter`
+   redesign) deliberately did not do. `QualityEventWAL` (websocket-originated
+   events) and the direct `quality_event_sink` path (storage-originated
+   events from inside `ParquetWriter`) remain two different mechanisms with
+   different failure semantics; this was traced but not reconciled here.
+
+Periodic (non-shutdown) rollover shares the same `_close_segment` code path
+and so shares finding 2, but was not separately re-verified this session.
