@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Optional
 
 from ..canonical import CanonicalEvent, CanonicalTradeEvent
+from ..segment_dedup import dedup_identity_key
 from ..instrument import InstrumentId, InstrumentIdError
 
 #: Bounded so a misbehaving venue cannot grow this without limit.
@@ -188,13 +189,28 @@ class ExchangeAdapter(ABC):
             key = (event.exchange, event.market_type,
                    event.instrument.key if event.instrument is not None else _UNIDENTIFIED,
                    event.stream, event.trade_id)
-            if key in self._seen_trade_ids:
+            if self._trade_dedup is not None:
+                # P0-4 segment-granularity backend: RAM holds only the open
+                # segment; history is the persistent index. The lifetime set
+                # below is NOT touched (no unbounded RAM). A DedupStateError
+                # propagates -- never mapped to "new" or "duplicate".
+                is_new = self._trade_dedup.check_and_admit(dedup_identity_key(*key))
+            else:
+                is_new = key not in self._seen_trade_ids
+                if is_new:
+                    self._seen_trade_ids.add(key)
+            if not is_new:
                 self.unhandled(UnhandledReason.DUPLICATE_TRADE, detail=event.trade_id,
                                 channel=event.stream, local_receive_ts=event.local_receive_ts)
                 continue
-            self._seen_trade_ids.add(key)
             kept.append(event)
         return kept
+
+    def set_trade_dedup(self, backend: Any) -> None:
+        """Install a segment-granularity dedup backend (``check_and_admit(key)
+        -> bool``). Default (never called) keeps the legacy exact in-memory set,
+        so production behaviour is unchanged until a runner opts in."""
+        self._trade_dedup = backend
 
     def __init__(self) -> None:
         self._unhandled: deque[UnhandledMessage] = deque(maxlen=UNHANDLED_BUFFER_MAX)
@@ -204,6 +220,7 @@ class ExchangeAdapter(ABC):
         #: See _dedupe_trades's docstring for the identity key, lifetime,
         #: and unbounded-growth caveat.
         self._seen_trade_ids: set[tuple] = set()
+        self._trade_dedup: Any = None
 
     # -- unhandled plumbing ----------------------------------------------
 
