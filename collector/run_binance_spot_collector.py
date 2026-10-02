@@ -79,6 +79,7 @@ import signal
 import time
 
 from collector.collector.adapters.binance_spot import BinanceSpotAdapter
+from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
 from collector.collector.backoff import ExponentialBackoff
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent, CanonicalTradeEvent
@@ -109,7 +110,8 @@ VENUE = "BINANCE_SPOT"
 
 class BinanceSpotCollectorApp:
     def __init__(self, data_dir: str = "data", url: str = BINANCE_SPOT_WS_URL,
-                 snapshot_url: str = BINANCE_SPOT_DEPTH_SNAPSHOT_URL) -> None:
+                 snapshot_url: str = BINANCE_SPOT_DEPTH_SNAPSHOT_URL,
+                 enable_segment_dedup: bool = True) -> None:
         self.url = url
         self.snapshot_url = snapshot_url
 
@@ -134,6 +136,12 @@ class BinanceSpotCollectorApp:
 
         self.adapter = BinanceSpotAdapter()
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
+        # P0-4: trades_writer is this runner's ONLY trade writer.
+        self.segment_dedup = None
+        if enable_segment_dedup:
+            self.segment_dedup = attach_segment_dedup(self.adapter, [
+                StreamSpec("spot_trades", self.trades_writer, "BINANCE", "spot"),
+            ])
         self.book = LocalBook(VENUE)
         self._book_lock = asyncio.Lock()
         self._recovery_task: asyncio.Task | None = None
@@ -285,7 +293,10 @@ class BinanceSpotCollectorApp:
                 # generic ExchangeAdapter.__init_subclass__ mechanism (see
                 # adapters/base.py) -- not re-derived here.
                 "instrument_key": event.instrument.key if event.instrument is not None else None,
-            })
+            }, bind=bind_arg(getattr(self, "segment_dedup", None), event))
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
             self.stream_counters["trades"]["written"] += 1
             return
 

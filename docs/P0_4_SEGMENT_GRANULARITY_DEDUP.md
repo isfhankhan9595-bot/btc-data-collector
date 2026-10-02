@@ -125,3 +125,105 @@ concrete next step rather than rushed here.
 - Concurrent-process access to one `SegmentDedupIndex` file (single-writer
   design; each runner owns its own stream's index file, so cross-process
   sharing was never intended and is not tested here).
+
+## Production wiring (this revision)
+
+All four live runners now construct their coordinator(s) via
+`attach_segment_dedup` inside `__init__` (before `start()` is ever
+awaited, so reconciliation always completes before websocket ingestion
+can begin) and install the result via the existing `set_trade_dedup()`
+seam, which now also accepts a `{event_stream: coordinator}` dict for
+runners with more than one trade stream.
+
+| Runner | Trade stream(s) | Anchor writer | Identity scope |
+|---|---|---|---|
+| `run_collector.py` (USD-M) | `trades` | `raw_trades_writer` (receives every admitted trade unconditionally; `trades_writer` additionally depends on validator success and can miss a row the raw writer got) | `BINANCE` / `linear_perpetual` |
+| `run_bybit_collector.py` | `trades` | `trades_writer` (only trade writer) | `BYBIT` / `linear_perpetual` |
+| `run_okx_collector.py` | `trades`, `trades-all` | `trades_writer`, `trades_all_writer` respectively — two independent coordinators, never merged (unresolved overlap question, see `adapters/okx.py`) | `OKX` / `linear_perpetual` |
+| `run_binance_spot_collector.py` | `spot_trades` | `trades_writer` (only trade writer) | `BINANCE` / `spot` |
+
+Each coordinator's SQLite file lives at
+`{writer.base_dir}/dedup_state/{writer.stream_name}.sqlite3` — one file per
+stream, not shared across runners or venues (confirmed: USD-M's raw writer
+`stream_name` is `binance_trades_raw`, Bybit's is `bybit_trades`, OKX's are
+`okx_trades`/`okx_trades_all`, Spot's is `spot_trades` — none collide).
+
+`enable_segment_dedup: bool = True` is a constructor parameter on all four
+runners (production default: on). `False` preserves the exact pre-this-
+revision behavior (the legacy lifetime `_seen_trade_ids` set), kept for
+test isolation and as an explicit rollback switch, not as the intended
+production configuration.
+
+### Mutation testing of the wiring itself (not just the component)
+
+13 mutations (A–M, the task's own list) applied to the real production
+files (`run_collector.py`, `run_bybit_collector.py`, `adapters/base.py`,
+`segment_dedup.py`, `replay.py`), run, and restored — `diff` confirmed
+byte-identical for all six touched files afterward.
+
+| Mutation | Result |
+|---|---|
+| A: remove `set_trade_dedup()` install | 5 failures |
+| B: construct coordinator, never install on adapter | 3 failures |
+| C: install coordinator, never pass publication hook | **0 on first pass** — genuine finding, see below |
+| D: skip `startup_reconcile()` | **0 on first pass** — genuine finding, see below |
+| E: reorder reconcile after adapter install | 0 (mutation itself was a no-op as constructed — reconciliation already happens per-spec before the shared dict is installed; no meaningful reordering existed to make) |
+| F: remove `bind=` from one writer | 1 failure |
+| G: bind identity to the wrong segment | 1 failure |
+| H: re-enable the lifetime set as authoritative even with a backend installed | 1 failure |
+| I: release RAM before index commit | 1 failure |
+| J: swallow index commit failure (pretend success) | 1 failure |
+| K: swallow startup reconciliation failure | **0 on first pass** — genuine finding, see below |
+| L: install one index across two unrelated venues | investigated, not newly fixed — see below |
+| M: make `ReplayEngine` install a live dedup backend | 1 failure (mutated `replay.py` directly to prove this, since no such code path exists today to mutate otherwise) |
+
+**C, D, K — genuine null results, investigated, not hidden.** All three
+existed because the *existing* restart tests accidentally exercised a
+different code path than the one each mutation targeted:
+
+- **C** (no publication hook): the restart tests always *also* closed the
+  writer, which fires the live hook — by the time app2's own
+  `startup_reconcile` ran, the identity was already committed, masking
+  whether the live hook itself had fired. The real, detectable consequence
+  of C is RAM never being released across *many rotations within one
+  continuous run* (not a restart scenario at all) — closed with
+  `test_usdm_ram_is_released_across_many_real_segment_rotations` (peak RAM
+  bounded by segment size over 200 trades / ~40 rotations), which now
+  catches it (0 → 1 failure).
+- **D** (skip `startup_reconcile`): identical root cause — the existing
+  restart test's segment was already committed via the live hook, so
+  reconciliation had nothing left to do and its absence went unnoticed.
+  Closed with `test_usdm_startup_reconciliation_specifically_recovers_a_commit_the_live_hook_never_made`,
+  which removes the live hook before publishing (simulating a crash
+  between publish and commit) so *only* reconciliation can recover it
+  (0 → 1 failure).
+- **K** (swallow reconciliation failure): the only existing unreadable-
+  segment test called `coordinator.startup_reconcile()` directly, never
+  through `attach_segment_dedup`'s own call site. A first attempt at a
+  runner-level test corrupted an *already-reconciled* segment (safe,
+  never re-read — correct behavior, not a gap), which is why it initially
+  still showed 0 failures even after adding a new test; fixed by
+  corrupting a *published-but-unreconciled* segment instead (live hook
+  removed before close, matching D's isolation technique). Now catches
+  it (0 → 1 failure) via
+  `test_usdm_startup_fails_closed_when_a_published_segment_is_unreadable`.
+
+**L — investigated, no new test added, existing coverage sufficient.**
+The mutation as implemented (relabeling Bybit's `StreamSpec` exchange
+string to `"BINANCE"`) didn't actually create index-sharing — each
+runner's SQLite file path is keyed by `writer.stream_name`, which never
+collides across venues regardless of the exchange label passed in, so the
+mutation only mislabeled an identity rather than testing shared-index
+isolation. The invariant L actually cares about — two venues' identities
+never colliding *even inside one shared index* — is structurally
+guaranteed by `identity_key`'s length-prefixed encoding embedding the
+exchange as its first component, and is already directly proven by
+`test_identity_isolation_across_every_component` (component-level) without
+needing index sharing to be artificially constructed at the runner level.
+
+### What remains unverified
+
+Target-EC2 throughput for the wired path (one SQLite transaction per
+segment close per stream, i.e. up to 7 independent transactions roughly
+every 30s across all streams in the busiest runner) — **NOT VERIFIED**
+against real hardware, same caveat as the component-level benchmark.
