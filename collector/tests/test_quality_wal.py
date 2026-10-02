@@ -344,7 +344,10 @@ def test_append_failure_is_visible_not_silently_swallowed(tmp_path):
     wal.close()   # closes the underlying file handle
 
     assert wal.write_failed is False
-    with pytest.raises(ValueError):   # writing to a closed file handle raises
+    # Append after close is an explicit OSError (previously an incidental
+    # ValueError from the closed file object), so the collector's single
+    # "WAL could not durably record this" failure path handles it.
+    with pytest.raises(OSError, match="closed"):
         wal.append(_event(reason="after close"))
 
 
