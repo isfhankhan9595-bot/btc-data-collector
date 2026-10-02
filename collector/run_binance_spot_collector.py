@@ -86,6 +86,8 @@ from collector.collector.config import (
     BINANCE_SPOT_DEPTH_SNAPSHOT_URL,
     BINANCE_SPOT_WS_URL,
     QUALITY_EVENTS_SCHEMA,
+    QUALITY_SEGMENT_ROWS,
+    QUALITY_SEGMENT_SECONDS,
     SPOT_ORDERBOOK_RAW_SCHEMA,
     SPOT_TRADES_SCHEMA,
     SYMBOL,
@@ -115,7 +117,8 @@ class BinanceSpotCollectorApp:
 
         self.quality_writer = ParquetWriter(
             venue_stream(VENUE, "quality_events"), QUALITY_EVENTS_SCHEMA,
-            base_dir=data_dir, exchange="BINANCE_SPOT", segment_rows=1, segment_seconds=1)
+            base_dir=data_dir, exchange="BINANCE_SPOT",
+            segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=QUALITY_SEGMENT_SECONDS)
         self.raw_wire_writer = ParquetWriter(
             venue_stream(VENUE, "raw_wire"), RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="BINANCE_SPOT", quality_event_sink=self._persist_quality_event)

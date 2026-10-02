@@ -56,6 +56,8 @@ from collector.collector.config import (
     OKX_TRADES_ALL_SCHEMA,
     OKX_TRADES_SCHEMA,
     QUALITY_EVENTS_SCHEMA,
+    QUALITY_SEGMENT_ROWS,
+    QUALITY_SEGMENT_SECONDS,
 )
 from collector.collector.okx_capture import (
     OKX_BTC_INDEX_INST_ID,
@@ -93,7 +95,8 @@ class OKXCollectorApp:
         # attributed to Binance/Bybit (ParquetWriter's default).
         self.quality_writer = ParquetWriter(
             venue_stream("OKX", "quality_events"), QUALITY_EVENTS_SCHEMA,
-            base_dir=data_dir, exchange="OKX", segment_rows=1, segment_seconds=1)
+            base_dir=data_dir, exchange="OKX",
+            segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=QUALITY_SEGMENT_SECONDS)
         self.raw_wire_writer = ParquetWriter(
             venue_stream("OKX", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="OKX", quality_event_sink=self._persist_quality_event)
