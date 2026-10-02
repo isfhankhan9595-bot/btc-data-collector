@@ -1744,3 +1744,67 @@ pre-P0-8 segments (`bid_depth`/`ask_depth`); it is fixed here, together with
 the new `_exact` columns, under the existing "absent nullable column -> nulls"
 policy. Measured cost is a real slowdown (trade write path 0.59x) and is
 reported, not hidden. Out of scope and untouched: P0-10/P0-11/P0-4/P0-2/P0-3.
+
+### P0-3 — Eliminate quality-event tiny-file explosion — **COMPLETE, VERIFIED**
+
+`segment_rows=1, segment_seconds=1` on the quality writer made every
+`write()` also publish its own 1-row Parquet file (file count = event
+count). Traced to a deliberate but now-superseded rationale: before P0-2's
+`QualityEventWAL` existed, per-event fsync was the writer's only durability
+mechanism; P0-2 made the WAL authoritative for the real loss window
+(the async queue), but the old segment size was never revisited.
+
+Fixed: `segment_rows=500, segment_seconds=30`, plus (the actual hard part)
+moving WAL-checkpoint-advancement from *immediately after `write()`* to
+*only after the segment holding that write is durably published*
+(`ParquetWriter.on_segment_published`, two small additive hooks, default
+`None` so every other stream is unaffected). Found and fixed the same latent
+bug independently in `_recover_quality_wal` (startup recovery checkpointed
+immediately after re-`write()`-ing recovered rows, before they were
+necessarily published) — a second crash right after recovery would have
+permanently lost rows recovery had just replayed. `docs/QUALITY_EVENT_STORAGE.md`
+has the full durability/crash/shutdown/memory contract and measurements.
+
+19 new adversarial tests, including two that directly simulate a crash
+(`ParquetWriter.abandon()`, a new method: releases the writer lock without
+publishing) and verify WAL replay loses nothing. 14 required mutations
+applied to real source (A-N), all caught; one (H: shutdown discarding
+pending events via `abandon()` instead of `close()`) was **not** caught
+initially — none of the other tests exercised the real `shutdown()` method
+itself — closed by adding a source-inspection test of `shutdown()` directly.
+Measured: 100/1,000/5,000 events → 100/1,000/5,000 files before, 1/2/10
+after; fsyncs and disk bytes drop by the same ~100-500x; full-stream read
+time drops ~80-480x.
+
+Out of scope, untouched: P0-1/2/4/5/6/7/8/9/10/11/12. `quality_events` is
+not in `compact_daily`'s `STREAM_SCHEMAS`, so no compaction-path change was
+needed.
+
+### P0-3 corrective — closed a durability regression P0-3 itself introduced
+
+A hostile audit of PR #76, before merge, found that P0-3's batching change
+left ~12 direct `_persist_quality_event` call sites (adapter-unhandled,
+malformed/unrouted frames, instrument mismatch, OI errors, book-quality
+transitions, overflow counter, startup-recovery-error reporting, and more)
+with no WAL protection: before P0-3, `segment_rows=1` made every direct
+`write()` an immediate durable publish, so they never needed the WAL; after
+batching, an event from any of them could sit only in RAM until the next
+publish. Confirmed correct by audit.
+
+Fixed by making `_persist_quality_event` itself the single WAL-durable
+choke point for every quality event (direct or queue-drained): any event
+without existing WAL provenance is now WAL-appended there before it ever
+reaches the batched writer. Same bug, found and fixed independently, also
+existed in startup recovery's own checkpoint call. 8 new adversarial tests
+using the real production call sites; of the 6 specifically requested
+mutations, 4 reachable and caught, 1 architecturally inapplicable under the
+unified design, 1 proven structurally unreachable (documented, not faked).
+Also found and disclosed: the original P0-3 report's claim that the
+"unbounded queue" mutation was caught was false — closed with a direct
+test. A separate, unrelated name collision in `ParquetWriter` (P0-4's own
+`on_segment_published` attribute) was found during the required rebase onto
+current main and resolved by renaming P0-3's hook to `segment_publish_hook`;
+P0-4's code was not touched. Full detail: `docs/QUALITY_EVENT_STORAGE.md`.
+
+Branch `p0-3-quality-tiny-file-explosion`, PR #76 (still open, draft, not
+merged). No other P0 was started or modified.
