@@ -90,17 +90,33 @@ def test_normal_drain_persists_to_parquet_and_checkpoints_the_wal(tmp_path):
 
 
 def test_crash_before_checkpoint_can_duplicate_but_is_reconcilable_by_id(tmp_path):
-    """Test 4's essence: WAL -> Parquet succeeds -> CRASH before checkpoint
-    -> restart. The event is legitimately replayed again (a duplicate
-    Parquet row IS possible in this narrow window, and the task
-    explicitly permits that) -- but both rows carry the identical
-    quality_event_id, which is what makes the duplicate reconcilable
-    rather than silently ambiguous. No event is ever silently lost."""
-    app = _minimal_app(tmp_path)
+    """Test 4's essence: WAL -> Parquet publish succeeds -> the checkpoint
+    fsync itself fails/crashes right at that point -> restart. The event is
+    legitimately replayed again (a duplicate Parquet row IS possible in
+    this narrow window, and the task explicitly permits that) -- but both
+    rows carry the identical quality_event_id, which is what makes the
+    duplicate reconcilable rather than silently ambiguous. No event is
+    ever silently lost.
+
+    Exercises the REAL production path: _persist_quality_event (which
+    itself WAL-appends, tracks the pending seq, and writes) and
+    ParquetWriter's real on_segment_published callback -- only the WAL's
+    own checkpoint() call is made to fail, simulating a crash/fsync
+    failure landing in exactly that narrow window. ParquetWriter already
+    catches and logs an on_segment_published exception rather than
+    un-publishing the segment (see parquet_writer.py's _close_segment),
+    so the Parquet row is durably published while the checkpoint is not --
+    the exact race this test proves survives.
+    """
+    app = _minimal_app(tmp_path)  # segment_rows=1: write() == immediate publish
+    real_checkpoint = app._quality_wal.checkpoint
+    app._quality_wal.checkpoint = lambda **kw: (_ for _ in ()).throw(OSError("simulated crash"))
+
     app._websocket_quality_event(QualityEventType.RESYNC, "startup_resync")
     event = app._quality_queue.get_nowait()
-    app._persist_quality_event(event)   # Parquet write succeeds...
-    # ...but no checkpoint() call -- simulates the crash landing exactly there.
+    app._persist_quality_event(event)   # Parquet write succeeds; checkpoint fails (caught, logged)
+
+    app._quality_wal.checkpoint = real_checkpoint  # "restart": a healthy WAL/checkpoint again
 
     # "Restart": a fresh WAL over the same directory recovers the
     # not-yet-checkpointed event and replays it, exactly as CollectorApp's
@@ -110,13 +126,11 @@ def test_crash_before_checkpoint_can_duplicate_but_is_reconcilable_by_id(tmp_pat
     assert len(recovered) == 1
     for r in recovered:
         app._persist_quality_event(r)
-    new_wal = QualityEventWAL(app._quality_wal.wal_dir, start_seq=resume_seq)
-    new_wal.checkpoint(up_to_seq=max(r["seq"] for r in recovered))
 
     rows = _quality_rows(tmp_path)
     assert len(rows) == 2                                    # the duplicate is real and expected here
     assert rows[0]["quality_event_id"] == rows[1]["quality_event_id"]   # but reconcilable: same ID
-    assert QualityEventWAL.recover(new_wal.wal_dir) == []     # and now fully checkpointed, no further replay
+    assert QualityEventWAL.recover(app._quality_wal.wal_dir) == []     # and now fully checkpointed, no further replay
 
 
 def test_full_startup_recovery_path_matches_constructor_logic(tmp_path):

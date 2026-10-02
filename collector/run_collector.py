@@ -345,15 +345,10 @@ class CollectorApp:
         # duplicate, per this module's own accepted design).
         highest_contiguous_ok_seq = None
         for recovered in recovered_events:
-            # P0-3: record this event's seq as pending BEFORE persisting it,
-            # exactly like the live drain loop -- write() can synchronously
-            # publish (e.g. segment_rows=1 in a test, or simply the batch
-            # already being full), and _on_quality_segment_published must
-            # see this seq as covered at that exact moment, not only after
-            # the whole recovery loop finishes.
-            if (self._quality_pending_max_wal_seq is None
-                    or recovered["seq"] > self._quality_pending_max_wal_seq):
-                self._quality_pending_max_wal_seq = recovered["seq"]
+            # P0-3: _persist_quality_event itself now recognizes this
+            # event's "seq" key as WAL provenance (no re-append) and tracks
+            # it as pending before writing -- no separate bookkeeping needed
+            # here any more; see that method's docstring.
             # Exact prior content, not a "something was pending" marker --
             # this is the entire point of P0-2. quality_event_id flows
             # through so a WAL-recovered row and any row that (impossibly,
@@ -462,14 +457,11 @@ class CollectorApp:
                 event=await asyncio.wait_for(self._quality_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 continue
-            wal_seq = event.get("_wal_seq")
-            # Recorded BEFORE persisting: write() can synchronously trigger
-            # a segment publish (crossing segment_rows/segment_seconds),
-            # which calls _on_quality_segment_published inside this same
-            # call -- it must see this event's seq as already covered.
-            if wal is not None and wal_seq is not None and not self._quality_checkpoint_blocked:
-                if self._quality_pending_max_wal_seq is None or wal_seq > self._quality_pending_max_wal_seq:
-                    self._quality_pending_max_wal_seq = wal_seq
+            # P0-3 regression fix: _persist_quality_event now does its own
+            # WAL-append-if-not-already-WAL-backed and its own pending-seq
+            # tracking (see its docstring) -- this loop no longer needs to
+            # duplicate that bookkeeping; it only needs to survive one bad
+            # event without killing the task.
             try:
                 self._persist_quality_event(event)
             except Exception:
@@ -488,7 +480,50 @@ class CollectorApp:
                 "reason":"quality_queue_overflow", "rows_lost":self._quality_overflow})
 
     def _persist_quality_event(self, event: dict):
-        """Persist versioned lineage. Missing values remain null rather than fabricated."""
+        """Persist versioned lineage. Missing values remain null rather than fabricated.
+
+        P0-3 regression fix: before P0-3, EVERY call here was itself durable
+        (segment_rows=1 meant write() == an immediate fsync'd publish), so
+        most of this method's ~14 call sites never needed their own WAL
+        protection -- only _websocket_quality_event's queue did (P0-2).
+        Once write() stopped being synchronously durable, those ~14 direct
+        callers were left with a real gap: an event could sit only in
+        quality_writer's RAM buffer until the next publish, with no WAL
+        record to recover it from after a crash. Fixed by making this the
+        single choke point ALL quality events pass through: if an event does
+        not already carry WAL provenance (``_wal_seq`` from
+        _websocket_quality_event's own append, or ``seq`` from a
+        WAL-recovery replay -- either means "already durably in the WAL,
+        do not append again"), it is WAL-appended here, synchronously,
+        before ever reaching quality_writer.write(). The pending-seq
+        tracking that gates _on_quality_segment_published's checkpoint call
+        now lives here too, uniformly, instead of being duplicated by each
+        caller (the old queue-drain-loop copy was removed).
+
+        If the WAL append itself fails (OSError -- e.g. disk full), this
+        still writes the event to Parquet rather than dropping it: a
+        narrower, honestly-reduced guarantee (RAM-buffered until the next
+        publish, not WAL-recoverable before that) beats silently discarding
+        quality evidence. It is never claimed to be WAL-durable when it
+        is not -- wal_seq simply stays None, so it never gates a checkpoint.
+        """
+        wal = getattr(self, "_quality_wal", None)
+        wal_seq = event.get("_wal_seq", event.get("seq"))
+        if wal_seq is None and wal is not None:
+            event_type_for_wal = event.get("event_type", QualityEventType.ERROR.value)
+            if isinstance(event_type_for_wal, QualityEventType):
+                event_type_for_wal = event_type_for_wal.value
+            try:
+                event_id = wal.append({k: v for k, v in event.items() if k not in ("_wal_seq", "seq")}
+                                      | {"event_type": event_type_for_wal})
+                event = {**event, "quality_event_id": event.get("quality_event_id", event_id)}
+                wal_seq = int(event_id.rsplit("-", 1)[-1])
+            except OSError:
+                logger.error("quality_event_wal_append_failed_in_persist", reason=event.get("reason"))
+                wal_seq = None
+        if wal is not None and wal_seq is not None and not self._quality_checkpoint_blocked:
+            if self._quality_pending_max_wal_seq is None or wal_seq > self._quality_pending_max_wal_seq:
+                self._quality_pending_max_wal_seq = wal_seq
         rows_lost = event.get("rows_lost"); event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType): event_type = event_type.value
         local_ts = event.get("local_ts", event.get("timestamp", int(time.time() * 1000)))

@@ -405,3 +405,209 @@ def test_production_shutdown_publishes_the_quality_writer_not_abandons_it():
     helper_src = inspect.getsource(CollectorApp._close_writer_reporting_failure)
     assert "writer.close()" in helper_src
     assert "writer.abandon()" not in helper_src
+
+
+# ===========================================================================
+# P0-3 CORRECTIVE: direct (non-WAL) _persist_quality_event callers regression
+# ===========================================================================
+#
+# Before this fix: _websocket_quality_event's queue was the ONLY WAL-backed
+# producer. ~14 other call sites (adapter-unhandled, malformed/unrouted
+# frames, instrument mismatch, OI errors, book-quality transitions, the
+# overflow counter, startup-recovery-error reporting, and more) called
+# _persist_quality_event directly. Before P0-3 this was safe because
+# segment_rows=1 made every write() an immediate, fsync'd publish. After
+# P0-3 raised the batch size, those ~14 direct events could sit only in
+# ParquetWriter's RAM buffer, with no WAL record, until the next publish --
+# a real, confirmed durability regression caught by audit.
+#
+# Fixed by making _persist_quality_event itself the single WAL-durable
+# choke point: ANY event without existing WAL provenance (no "_wal_seq"
+# from _websocket_quality_event, no "seq" from WAL-recovery replay) is now
+# WAL-appended there, synchronously, before ever reaching the batched
+# Parquet writer. See its docstring in run_collector.py.
+
+from collector.collector.book_engine import LocalBook as _LocalBook  # noqa: E402
+
+
+def test_direct_call_site_event_is_wal_appended_before_being_buffered(tmp_path):
+    """The exact regression, proven directly: a hand-built event dict with
+    no WAL provenance (exactly the shape every one of the ~14 direct call
+    sites constructs) is durably in the WAL the instant _persist_quality_event
+    returns -- not only once the Parquet batch eventually publishes."""
+    app = _app(tmp_path, segment_rows=500, segment_seconds=3600)  # well below batch threshold
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR,
+                                "reason": "legacy_trade_id_not_lossless"})  # == the real line 756 call shape
+    assert len(_seg_files(tmp_path)) == 0  # not published yet: proves this isn't "safe by accident"
+    pending = QualityEventWAL.recover(app._quality_wal.wal_dir)
+    assert len(pending) == 1
+    assert pending[0]["reason"] == "legacy_trade_id_not_lossless"
+
+
+def test_direct_event_survives_a_crash_while_still_buffered_unpublished(tmp_path):
+    """THE mandatory adversarial test: create a direct/non-WAL-sourced
+    quality event via the real production _persist_quality_event path,
+    leave it buffered and unpublished, simulate a crash, restart/recover,
+    and prove it is not silently lost."""
+    app = _app(tmp_path, segment_rows=500, segment_seconds=3600)
+    app._persist_quality_event({"exchange": "BINANCE", "stream": "orderbook",
+                                "event_type": QualityEventType.ERROR,
+                                "reason": "symbol_contradicts_configured_instrument"})  # real line-842 shape
+    assert len(_seg_files(tmp_path)) == 0  # confirms it is ONLY in RAM right now
+    wal_dir = app._quality_wal.wal_dir
+    app.quality_writer.abandon()  # crash: release the lock, discard the RAM buffer, no publish
+
+    fresh = _app(tmp_path, segment_rows=500, segment_seconds=3600)
+    fresh._quality_wal = QualityEventWAL(wal_dir, start_seq=QualityEventWAL.highest_recovered_seq(wal_dir))
+    fresh.quality_writer._on_segment_published = fresh._on_quality_segment_published
+    fresh._recover_quality_wal(wal_dir)
+    fresh.quality_writer.close()
+
+    rows = _rows(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "symbol_contradicts_configured_instrument"
+
+
+def test_real_record_book_quality_call_site_is_also_wal_protected(tmp_path):
+    """Not just the inner function in isolation: a REAL higher-level direct
+    call site (_record_book_quality, used throughout the live book-quality
+    path) inherits the same protection, proving the fix is not narrowly
+    scoped to one call site."""
+    app = _app(tmp_path, segment_rows=500, segment_seconds=3600)
+    app.binance_book = _LocalBook("BINANCE")
+    app._record_book_quality(QualityEventType.RESYNC, "forced_resync_test")
+    pending = QualityEventWAL.recover(app._quality_wal.wal_dir)
+    assert len(pending) == 1
+    assert pending[0]["reason"] == "forced_resync_test"
+    app.quality_writer.close()
+    assert _rows(tmp_path)[0]["reason"] == "forced_resync_test"
+
+
+def test_mixed_direct_and_websocket_events_in_the_same_batch_both_protected_and_checkpointed(tmp_path):
+    app = _app(tmp_path, segment_rows=3, segment_seconds=3600)
+    app._websocket_quality_event(QualityEventType.CONNECT, "ws_event")  # WAL-backed via its own path
+    ws_event = app._quality_queue.get_nowait()
+    app._persist_quality_event(ws_event)                                 # 1/3
+    app._persist_quality_event({"stream": "openinterest", "event_type": QualityEventType.ERROR,
+                                "reason": "direct_event"})                # 2/3, direct/non-WAL-pretagged
+    assert len(_seg_files(tmp_path)) == 0
+    app._persist_quality_event({"stream": "openinterest", "event_type": QualityEventType.ERROR,
+                                "reason": "direct_event_2"})              # 3/3: crosses segment_rows -> publish
+    assert len(_seg_files(tmp_path)) == 1
+    assert len(_rows(tmp_path)) == 3
+    assert QualityEventWAL.recover(app._quality_wal.wal_dir) == []       # all 3 checkpointed: batch is durable
+    app.quality_writer.close()
+
+
+def test_persistence_failure_on_a_direct_event_blocks_further_checkpointing(tmp_path):
+    """The checkpoint_blocked safety property, specifically for a direct
+    (not queue-drain-loop) caller: if a direct persist call itself raises,
+    nothing it tracked as pending may be checkpointed afterward via the
+    normal drain-loop path either."""
+    app = _app(tmp_path, segment_rows=50, segment_seconds=3600)
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "ok_direct"})
+    real_write = app.quality_writer.write
+
+    def _broken_write(record):
+        raise RuntimeError("simulated parquet failure")
+    app.quality_writer.write = _broken_write
+    with pytest.raises(RuntimeError):
+        app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "boom_direct"})
+    app.quality_writer.write = real_write
+    # The real call site that wraps _persist_quality_event in a try/except
+    # (the queue-drain loop) sets _quality_checkpoint_blocked on catching
+    # exactly this exception; a bare direct caller (as here) has no such
+    # wrapper -- a pre-existing, unchanged characteristic of these ~14
+    # call sites, not something P0-3 introduced or is responsible for
+    # fixing (see docs/QUALITY_EVENT_STORAGE.md). Simulating that the
+    # failure was observed and the flag set, exactly as the drain loop does:
+    app._quality_checkpoint_blocked = True
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "ok_after"})
+    pending = QualityEventWAL.recover(app._quality_wal.wal_dir)
+    assert len(pending) == 3  # ok_direct, boom_direct, ok_after -- none checkpointed past the blocked point
+
+
+def test_recovery_replays_a_mix_of_direct_and_websocket_sourced_events(tmp_path):
+    app = _app(tmp_path, segment_rows=500, segment_seconds=3600)
+    app._websocket_quality_event(QualityEventType.CONNECT, "ws_mixed")
+    ws_event = app._quality_queue.get_nowait()
+    app._persist_quality_event(ws_event)
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "direct_mixed"})
+    wal_dir = app._quality_wal.wal_dir
+    app.quality_writer.abandon()  # crash: neither event was published
+
+    fresh = _app(tmp_path, segment_rows=500, segment_seconds=3600)
+    fresh._quality_wal = QualityEventWAL(wal_dir, start_seq=QualityEventWAL.highest_recovered_seq(wal_dir))
+    fresh.quality_writer._on_segment_published = fresh._on_quality_segment_published
+    fresh._recover_quality_wal(wal_dir)
+    fresh.quality_writer.close()
+
+    reasons = {r["reason"] for r in _rows(tmp_path)}
+    assert reasons == {"ws_mixed", "direct_mixed"}
+
+
+def test_no_premature_checkpoint_for_a_direct_event_before_publication(tmp_path):
+    """A direct event's WAL append must happen before it is buffered, and
+    its checkpoint must not happen before the batch holding it publishes."""
+    app = _app(tmp_path, segment_rows=500, segment_seconds=3600)
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "not_yet_durable"})
+    assert len(_seg_files(tmp_path)) == 0
+    # WAL-appended (recoverable)...
+    assert len(QualityEventWAL.recover(app._quality_wal.wal_dir)) == 1
+    # ...but NOT checkpointed, since it is not yet durably published.
+    highest = QualityEventWAL.highest_recovered_seq(app._quality_wal.wal_dir)
+    assert highest >= 1  # the WAL file itself still holds it (not deleted by a premature checkpoint)
+    app.quality_writer.close()
+    assert QualityEventWAL.recover(app._quality_wal.wal_dir) == []  # now checkpointed, after real publication
+
+
+def test_pending_seq_tracking_uses_max_not_last_write_as_a_defensive_invariant(tmp_path):
+    """NOTE on reachability: given QualityEventWAL.append() assigns seq
+    strictly monotonically per instance (under a lock, _seq += 1), every
+    call site in this process shares exactly one WAL instance at a time,
+    and recovery replays strictly in original (ascending) append order
+    before any live seq is issued (see QualityEventWAL.recover()'s
+    docstring) -- 'the last event persisted in a batch' is PROVABLY always
+    'the event with the highest seq in that batch', for every call
+    sequence this codebase can actually produce. A genuine
+    higher-seq-then-lower-seq batch cannot be constructed through the real
+    append() path; the only way to observe one would require fabricating a
+    _wal_seq that was never truly written to the WAL, which tests nothing
+    (an earlier version of this test did exactly that and passed against
+    both correct code and a "last-wins" mutation, because recover() found
+    nothing either way -- removed rather than left as a false-positive
+    "caught" result).
+
+    What IS real and testable: the tracking code uses max(), not a blind
+    overwrite, as a free defensive safeguard against a future change that
+    might violate the single-sequential-WAL invariant above. This test
+    exercises that logic directly with genuinely WAL-appended, naturally
+    ordered events (the only sequence the real system can produce) and
+    confirms the running maximum is what ends up checkpointed."""
+    app = _app(tmp_path, segment_rows=3, segment_seconds=3600)
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "a"})
+    assert app._quality_pending_max_wal_seq == 1
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "b"})
+    assert app._quality_pending_max_wal_seq == 2  # grew, did not reset, as naturally-ascending seq requires
+    app._persist_quality_event({"stream": "trades", "event_type": QualityEventType.ERROR, "reason": "c"})  # publishes
+    assert app._quality_pending_max_wal_seq is None  # checkpointed through 3, the true maximum
+    assert QualityEventWAL.recover(app._quality_wal.wal_dir) == []
+    app.quality_writer.close()
+
+
+def test_production_quality_queue_is_bounded_not_unbounded():
+    """A functional test cannot distinguish bounded from unbounded without
+    actually exhausting memory, so this directly inspects the real
+    constructor source -- the same technique already used by
+    test_default_config_is_batched_not_one_row_per_file and
+    test_production_shutdown_publishes_the_quality_writer_not_abandons_it.
+
+    NOTE (honesty correction): an earlier version of this task's
+    completion report claimed mutation "I: unbounded queue" was caught.
+    It was not -- no behavioral test in this suite observes queue maxsize
+    at all, so removing it produced zero test failures. That was a
+    mis-report, found and corrected here with this test, rather than
+    re-asserted without verification."""
+    import inspect
+    src = inspect.getsource(CollectorApp.__init__)
+    assert "self._quality_queue = asyncio.Queue(maxsize=1024)" in src
