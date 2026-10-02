@@ -1779,3 +1779,32 @@ time drops ~80-480x.
 Out of scope, untouched: P0-1/2/4/5/6/7/8/9/10/11/12. `quality_events` is
 not in `compact_daily`'s `STREAM_SCHEMAS`, so no compaction-path change was
 needed.
+
+### P0-3 corrective — closed a durability regression P0-3 itself introduced
+
+A hostile audit of PR #76, before merge, found that P0-3's batching change
+left ~12 direct `_persist_quality_event` call sites (adapter-unhandled,
+malformed/unrouted frames, instrument mismatch, OI errors, book-quality
+transitions, overflow counter, startup-recovery-error reporting, and more)
+with no WAL protection: before P0-3, `segment_rows=1` made every direct
+`write()` an immediate durable publish, so they never needed the WAL; after
+batching, an event from any of them could sit only in RAM until the next
+publish. Confirmed correct by audit.
+
+Fixed by making `_persist_quality_event` itself the single WAL-durable
+choke point for every quality event (direct or queue-drained): any event
+without existing WAL provenance is now WAL-appended there before it ever
+reaches the batched writer. Same bug, found and fixed independently, also
+existed in startup recovery's own checkpoint call. 8 new adversarial tests
+using the real production call sites; of the 6 specifically requested
+mutations, 4 reachable and caught, 1 architecturally inapplicable under the
+unified design, 1 proven structurally unreachable (documented, not faked).
+Also found and disclosed: the original P0-3 report's claim that the
+"unbounded queue" mutation was caught was false — closed with a direct
+test. A separate, unrelated name collision in `ParquetWriter` (P0-4's own
+`on_segment_published` attribute) was found during the required rebase onto
+current main and resolved by renaming P0-3's hook to `segment_publish_hook`;
+P0-4's code was not touched. Full detail: `docs/QUALITY_EVENT_STORAGE.md`.
+
+Branch `p0-3-quality-tiny-file-explosion`, PR #76 (still open, draft, not
+merged). No other P0 was started or modified.

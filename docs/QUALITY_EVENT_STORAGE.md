@@ -19,14 +19,32 @@ weakened it.
 
 ## What changed since that rationale was written
 
-P0-2 added `QualityEventWAL`: `_websocket_quality_event`'s hot path now
-appends to a fsync'd WAL *before* the event is queued, and the queue-drain
-loop (`_quality_persistence_loop`) checkpoints the WAL once an event is
-durable. The WAL is the authoritative durability layer for the one loss
-window that matters (the in-process async queue between enqueue and
-drain) — so per-event Parquet durability is no longer the only thing
-standing between a crash and data loss, **provided the WAL checkpoint is
-tied to the same "durable" definition the WAL exists to protect.**
+P0-2 added `QualityEventWAL`: `_websocket_quality_event`'s hot path appends
+to a fsync'd WAL *before* the event is queued, and the queue-drain loop
+(`_quality_persistence_loop`) persists it once dequeued. That made
+per-event Parquet durability no longer the *only* thing standing between a
+crash and data loss, **but only for that one producer.**
+
+**Regression found by audit, after this document's first version shipped:**
+`_persist_quality_event` has roughly a dozen *other* call sites — adapter-
+unhandled frames, malformed/unrouted messages, instrument mismatches, OI
+errors, book-quality transitions, the queue-overflow counter, startup-
+recovery-error reporting, and more — that call it directly, synchronously,
+with no WAL involvement at all. Before this task, that was safe only as a
+side effect of `segment_rows=1`: every one of those direct `write()` calls
+was itself an immediate, fsync'd publish. Once batching removed that
+property, those dozen call sites were left with a real gap: their events
+could sit only in `ParquetWriter`'s RAM buffer, with no WAL record, until
+the next publish. **The fix below was revised to close this**, and the
+terms this document uses now mean exactly this:
+
+- **WAL-backed event** / **directly durable event** — obsolete distinction.
+  Both kinds of event now go through the identical mechanism (below); there
+  is no longer an architectural difference between them.
+- **Recoverable event** — appended to the WAL (by whichever caller) but not
+  yet in a published Parquet segment. Survives a crash via WAL replay.
+- **Published / durable event** — in a published Parquet segment. This is
+  the only state from which a checkpoint may ever be issued.
 
 ## The fix
 
@@ -46,42 +64,65 @@ publish*:
 
 - `ParquetWriter` gained two small, additive (default-`None`, so every
   other stream's behaviour is byte-for-byte unchanged) hooks:
-  `on_segment_published(path, record_count)` — called once a segment is
+  `segment_publish_hook(path, record_count)` (distinct from an unrelated, same-named P0-4 `ParquetWriter.on_segment_published` attribute with a different signature; renamed to avoid the collision) — called once a segment is
   durably published (rename + directory fsync complete) — and
   `publish_open_segment()` / `abandon()` — explicit force-publish and
   crash-equivalent-discard, used by recovery and tests respectively.
-- `run_collector.py` tracks `self._quality_pending_max_wal_seq`: the
-  highest WAL seq among events `write()`-ed since the last checkpoint. Set
-  *before* each `_persist_quality_event()` call (a `write()` can
-  synchronously trigger a publish inside that same call, once the batch
-  fills), so `_on_quality_segment_published` always sees the correct value
-  the moment it fires.
+- `_persist_quality_event` is now the **single WAL-durable choke point**
+  every quality event passes through, direct callers included. If an event
+  does not already carry WAL provenance (`_wal_seq` from
+  `_websocket_quality_event`'s own append, or `seq` from a WAL-recovery
+  replay — either means "already durably in the WAL, do not append again"),
+  it is WAL-appended right there, synchronously, before it ever reaches
+  `quality_writer.write()`. The dozen direct call sites needed zero changes
+  of their own; fixing the one shared function fixed all of them.
+- The same method also tracks `self._quality_pending_max_wal_seq` — the
+  highest WAL seq among events `write()`-ed since the last checkpoint —
+  *before* calling `quality_writer.write()` (a `write()` can synchronously
+  trigger a publish inside that same call, once the batch fills), so
+  `_on_quality_segment_published` (wired as the `segment_publish_hook`)
+  always sees the correct value the moment it fires. This bookkeeping used
+  to live separately in the queue-drain loop and in startup recovery; both
+  copies were removed once it moved into the shared chokepoint.
 - `_on_quality_segment_published` is the *only* place that calls
   `wal.checkpoint()` on the live path now. It checkpoints exactly the seq
   range that just became durable — never more, never speculatively.
-- `_recover_quality_wal` (startup recovery) had the **same bug**,
-  independently: it re-`write()`s recovered rows into the (now larger)
-  buffer and used to checkpoint immediately after the loop, regardless of
-  whether those rows were actually published. A second crash right after
-  recovery, before the next publish, would have permanently lost the very
-  rows recovery just replayed. Fixed the same way: the per-event pending-seq
-  tracking runs inside the recovery loop too, and `publish_open_segment()`
-  forces the recovered batch durable once (a one-time startup cost, not a
-  per-event one) before its callback checkpoints it.
-- `checkpoint_blocked` (renamed `self._quality_checkpoint_blocked`, an
-  instance attribute so the callback can see it) is unchanged in effect:
-  once any persist fails, checkpointing never advances again for the rest
-  of the process's life, at any batch size.
+- `_recover_quality_wal` (startup recovery) had the **same publish-before-
+  checkpoint bug**, independently: it re-persists recovered rows and used
+  to checkpoint immediately after the loop, regardless of whether those
+  rows were actually published. A second crash right after recovery, before
+  the next publish, would have permanently lost the very rows recovery just
+  replayed. Fixed the same way, and now via the same shared chokepoint:
+  `publish_open_segment()` forces the recovered batch durable once (a
+  one-time startup cost, not a per-event one) before its callback
+  checkpoints it.
+- `checkpoint_blocked` (`self._quality_checkpoint_blocked`, an instance
+  attribute so the callback can see it) is unchanged in effect: once any
+  persist fails, checkpointing never advances again for the rest of the
+  process's life, at any batch size. **Limitation, pre-existing and
+  unchanged by this task:** only the queue-drain loop's own try/except sets
+  this flag on a persist failure. A *direct* caller whose
+  `_persist_quality_event` call raises does not set it automatically — the
+  exception simply propagates to that caller, exactly as it did before
+  P0-3. This is not a new gap; it was true when every direct call was its
+  own synchronous fsync too.
 
 ## Durability semantics
 
-An event is **durable** once it is in a published Parquet segment; it is
-**recoverable** (via WAL replay) from the moment `_websocket_quality_event`
-appends it to the WAL until it becomes durable. The checkpoint boundary is
-exactly the durable boundary — never earlier. This is an equivalent
-guarantee to the pre-P0-3 design, not a weaker one: what changed is *how
-many events* may be "recoverable-but-not-yet-durable" at once (up to one
-batch, ~500 events / ≤30s), not *whether* every event is one or the other.
+An event is **published/durable** once it is in a published Parquet
+segment; it is **recoverable** (via WAL replay) from the moment it is
+WAL-appended — by `_websocket_quality_event` directly, or by
+`_persist_quality_event`'s own fallback append for every other caller —
+until it becomes durable. The checkpoint boundary is exactly the durable
+boundary — never earlier, for any caller. This guarantee now covers EVERY
+quality event uniformly, which is strictly broader than both the pre-P0-3
+design (direct callers were synchronously durable, never merely
+"recoverable") and this document's own first version (which, before the
+corrective fix below, only described this guarantee for
+`_websocket_quality_event`'s queue — the dozen direct callers had no WAL
+protection in that version at all). What changed from pre-P0-3 is *how many
+events* may be "recoverable-but-not-yet-durable" at once (up to one batch,
+~500 events / ≤30s), not *whether* every event is one or the other.
 
 ## Crash / restart semantics
 
@@ -103,7 +144,7 @@ batch, ~500 events / ≤30s), not *whether* every event is one or the other.
 ## Shutdown semantics
 
 `shutdown()` calls `quality_writer.close()` (unchanged call site), which
-publishes any open segment and, via the same `on_segment_published` hook,
+publishes any open segment and, via the same `segment_publish_hook`,
 checkpoints it — so a graceful shutdown always leaves the WAL with nothing
 pending. Verified directly against the real `shutdown()` source (not a
 reimplementation) by
@@ -170,3 +211,59 @@ compaction-path change was needed or made.
   no new disk-full-specific test was added, since none of P0-3's changes
   touch how a write failure is detected — only when a successful one is
   checkpointed.
+
+## Corrective fix: the direct-caller durability regression
+
+A hostile audit of this PR, before merge, found the gap described above
+(the "Regression found by audit" paragraph) in this document's first
+version. Summary of what changed to close it, kept here as the permanent
+record rather than only in commit messages:
+
+- `_persist_quality_event` became the single WAL-durable choke point for
+  every quality event (see "The fix" above) — no call site needed its own
+  changes.
+- 8 new adversarial tests specifically for this regression, including the
+  mandatory crash-with-a-real-direct-event-still-buffered scenario, using
+  the real `_persist_quality_event` and `_record_book_quality` production
+  call sites (not a reimplementation): `test_direct_call_site_event_is_wal_appended_before_being_buffered`,
+  `test_direct_event_survives_a_crash_while_still_buffered_unpublished`,
+  `test_real_record_book_quality_call_site_is_also_wal_protected`,
+  `test_mixed_direct_and_websocket_events_in_the_same_batch_both_protected_and_checkpointed`,
+  `test_persistence_failure_on_a_direct_event_blocks_further_checkpointing`,
+  `test_recovery_replays_a_mix_of_direct_and_websocket_sourced_events`,
+  `test_no_premature_checkpoint_for_a_direct_event_before_publication`.
+- Of the 6 mutations the audit specifically requested for this regression:
+  4 are reachable and were caught (bypass WAL for a direct event; checkpoint
+  a direct event before publication; recovery discarding replayed events
+  instead of re-persisting them; a real call site, `_record_book_quality`,
+  losing protection). One ("restore `segment_rows=1` only for direct
+  paths") is architecturally inapplicable now — there is only one quality
+  writer and one path, by design; there is no longer a separate "direct"
+  configuration to restore. One ("checkpoint mixed-batch WAL state
+  incorrectly" via last-seq-wins instead of max-seq) is **provably
+  unreachable**: `QualityEventWAL.append()` assigns seq strictly
+  monotonically per instance (under a lock), every call site shares exactly
+  one instance at a time, and WAL recovery replays strictly in original
+  (ascending) append order before any live seq is issued — so "the last
+  event persisted in a batch" is always "the event with the highest seq",
+  for every call sequence this codebase can actually produce. An initial
+  attempt at testing this mutation passed against both correct code and the
+  mutated code, because it used a fabricated `_wal_seq` that was never truly
+  written to the WAL — that test was invalid (proved nothing) and was
+  replaced with `test_pending_seq_tracking_uses_max_not_last_write_as_a_defensive_invariant`,
+  which documents the reachability finding and exercises the real
+  (always-monotonic) code path instead.
+- **Honesty correction, disclosed rather than quietly fixed:** this task's
+  first completion report claimed mutation "unbounded queue" was caught. It
+  was not — no test in the suite observed the queue's `maxsize` at all, so
+  removing it produced zero failures. Found while re-verifying all mutations
+  against the corrected source, disclosed, and closed with
+  `test_production_quality_queue_is_bounded_not_unbounded` (a direct
+  source-inspection test, the only tool that can catch this without
+  actually exhausting memory in a unit test).
+- `ParquetWriter`'s new `on_segment_published` hook (from this task's first
+  version) collided by name with an unrelated, already-merged P0-4
+  `on_segment_published` attribute (different signature:
+  `((hour, seq), final_path)` vs this task's `(final_path, record_count)`).
+  Renamed to `segment_publish_hook` during the rebase that discovered the
+  collision; P0-4's attribute and its own call site were untouched.
