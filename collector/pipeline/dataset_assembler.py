@@ -80,6 +80,19 @@ aligned with the exact same rule as every other stream: their own
   record persisted to prove it). This is not new to P0-7 -- it is the same
   assumption the trades aggregation already makes -- but it is called out
   explicitly here rather than silently inherited.
+* Both trades and liquidations carry a day-level ``<stream>_stream_available``
+  flag (``trades_stream_available``, ``liquidation_stream_available``):
+  ``False`` means no segment was collected for this day at all (the zero
+  aggregate columns carry no evidentiary weight -- absence of evidence, not
+  evidence of absence); ``True`` means the stream was collected and an
+  empty bin is a genuinely observed zero. Research-integrity audit finding
+  (post-P0-7): ``trades_stream_available`` did not exist until that audit --
+  trades had *no* day-level availability signal at all, a strictly worse gap
+  than liquidations' already-documented one, since a whole day of trades
+  outage was indistinguishable from a real zero-trade day anywhere in the
+  schema. Neither flag resolves intra-day outages (a mid-day WS reconnect
+  gap within an otherwise-"available" day) -- that remains the same
+  documented, deliberately out-of-scope limitation it always was.
 
 Neither stream's absence blocks assembly: like trades, both are optional
 inputs (a quiet day with zero liquidations, or an OI poll outage, does not
@@ -359,6 +372,11 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
         df_aligned = pd.merge(df_aligned, trade_aggs, left_on="timestamp", right_on="grid_ts", how="left")
         df_aligned = df_aligned.drop(columns=["grid_ts"])
+        # The stream was collected for this day: a bin with no matching
+        # aggregate genuinely had zero trades (not "unknown"), distinct from
+        # the whole-stream-absent case below -- same semantics as
+        # liquidation_stream_available (see docs/RESEARCH_DATASET_TIME_CONTRACT.md).
+        df_aligned["trades_stream_available"] = True
     else:
         df_aligned["trade_count"] = 0
         df_aligned["buy_volume"] = 0.0
@@ -368,6 +386,13 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_aligned["vwap"] = np.nan
         df_aligned["last_price"] = np.nan
         df_aligned["trades_time_unknown"] = False
+        # No trades segment exists for this day at all: a count of 0 here is
+        # NOT the same causal claim as "we watched and saw zero trades" --
+        # it means we have no evidence either way. Never collapse this into
+        # the same signal as a genuinely observed quiet interval. Mirrors
+        # liquidation_stream_available exactly (see module docstring and
+        # docs/RESEARCH_DATASET_TIME_CONTRACT.md).
+        df_aligned["trades_stream_available"] = False
 
     # Fill NaNs for trades where appropriate
     df_aligned["trade_count"] = df_aligned["trade_count"].fillna(0).astype(np.int32)

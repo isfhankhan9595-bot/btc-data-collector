@@ -98,6 +98,27 @@ for the replay path. Fixed the same way markprice was: `local_receive_ts`
 Binance OI's write path (`_poll_openinterest`) was already correct before
 P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
 
+### Trades
+
+- Aggregated per grid bin on the causal availability clock (never processing
+  time): `trade_count`, `buy_volume`, `sell_volume`, `net_volume`,
+  `trade_flow_imbalance`, `vwap`, `last_price`.
+- **Day-level availability: `trades_stream_available`.** `False` means no
+  trades segment was collected for this day at all — the zero-valued
+  aggregate columns carry no evidentiary weight; `True` means the stream was
+  collected and a bin with no aggregate is a genuinely observed zero-trade
+  interval. Added by the post-P0-7 research-integrity audit: before this,
+  trades had **no** day-level availability signal of any kind, a strictly
+  worse gap than liquidations' (which already had
+  `liquidation_stream_available`) — a full day of trades-collector outage was
+  indistinguishable anywhere in the schema from a real zero-trade day.
+- Same limitation as liquidations below: this does not resolve an *intra-day*
+  outage (a mid-day WS reconnect gap within an otherwise-"available" day) —
+  an empty bin within an "available" day is only as trustworthy as that
+  connection's own uptime for that window. Closing that would mean joining
+  the collector's persisted quality-event stream against the grid, a
+  separate, larger undertaking, deliberately out of this fix's scope.
+
 ### Open interest
 
 - Joined with `merge_asof` exactly like markprice: backward, receive-time
@@ -163,7 +184,10 @@ P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
   distinguishes a day with **no liquidation segment collected at all**
   (`False` — the zero columns carry no evidentiary weight, we simply don't
   know) from a day where the stream **was** collected and a bin genuinely saw
-  no events (`True` — a confidently observed zero). This does not extend to
+  no events (`True` — a confidently observed zero). Trades now carry the
+  symmetric `trades_stream_available` flag (see "Trades" above; added by the
+  post-P0-7 research-integrity audit — trades previously had no such flag at
+  all). This does not extend to
   per-bin outage detection (e.g. a mid-day WS reconnect gap within an
   otherwise-available day) — building that would require joining the
   collector's persisted quality-event stream against the grid, which is a
