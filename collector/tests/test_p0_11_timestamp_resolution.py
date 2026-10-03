@@ -322,10 +322,14 @@ def test_replay_orders_by_recorded_ns_not_by_row_order():
 
 
 def test_equal_ns_stay_tied_and_no_offset_is_added():
+    """order_key is (timestamp_ms, kind_rank, ns_tiebreak, source_index) as
+    of the P0-11 follow-up replay-ordering correction; the ns-tied portion
+    is index 2, not 0 (see that fix's own test file for the full rationale)."""
     rows = [{"local_receive_ts": MS, "local_receive_ns": NS_A, "payload": p, "decode_ok": True}
             for p in ("x", "y")]
     f = ReplaySource.from_records(wire_rows=rows).frames
-    assert f[0].order_key[0] == f[1].order_key[0] == NS_A   # first key component tied exactly
+    assert f[0].order_key[:3] == f[1].order_key[:3]          # ms, kind, ns all tied exactly
+    assert f[0].order_key[2] == NS_A
     assert [x.payload for x in f] == ["x", "y"]              # recorded-order secondary
 
 
