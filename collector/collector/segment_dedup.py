@@ -211,3 +211,92 @@ class SegmentDedupCoordinator:
             if key is not None:
                 keys.append(key)
         return keys
+
+
+# ---------------------------------------------------------------------------
+# Runner wiring (P0-4 production integration)
+# ---------------------------------------------------------------------------
+
+
+def event_identity_key(event: Any) -> str:
+    """The identity key of a ``CanonicalTradeEvent`` -- exactly the tuple
+    ``ExchangeAdapter._dedupe_trades`` uses, so writer-side attribution and
+    adapter-side admission can never name the same trade differently."""
+    return dedup_identity_key(
+        event.exchange, event.market_type,
+        event.instrument.key if event.instrument is not None else UNIDENTIFIED,
+        event.stream, event.trade_id)
+
+
+class StreamSpec:
+    """One durable trade stream: which adapter event stream it is, which
+    writer's *published segments* are its recovery anchor, and how to read
+    the identity back out of a stored row."""
+
+    def __init__(self, event_stream: str, writer: Any, exchange: str, market_type: str,
+                 trade_id_field: str = "trade_id") -> None:
+        self.event_stream, self.writer = event_stream, writer
+        self.exchange, self.market_type, self.trade_id_field = exchange, market_type, trade_id_field
+
+    def row_identity(self, row: Dict[str, Any]) -> Optional[str]:
+        trade_id = row.get(self.trade_id_field)
+        if trade_id is None:
+            return None                      # never deduplicated -- same exemption as production
+        return dedup_identity_key(self.exchange, self.market_type,
+                                  row.get("instrument_key") or UNIDENTIFIED,
+                                  self.event_stream, trade_id)
+
+
+class SegmentDedupHandle:
+    """What a runner keeps: one coordinator + one index file per stream."""
+
+    def __init__(self) -> None:
+        self.coordinators: Dict[str, SegmentDedupCoordinator] = {}
+        self.indexes: list = []
+
+    def bind_for(self, event: Any) -> Callable[[SegmentToken], None]:
+        coordinator = self.coordinators[event.stream]      # KeyError = unwired stream -> loud
+        key = event_identity_key(event)
+        return lambda token: coordinator.note_written(key, token)
+
+    def end_message(self) -> None:
+        for c in self.coordinators.values():
+            c.end_message()
+
+    def close(self) -> None:
+        for i in self.indexes:
+            try:
+                i.close()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+
+
+def attach_segment_dedup(adapter: Any, specs: Iterable[StreamSpec]) -> SegmentDedupHandle:
+    """Wire the segment-granularity backend into a live runner. Order is the
+    contract: index open -> publication hook installed -> startup reconcile
+    (raises DedupStateError => the runner's constructor fails => the collector
+    never starts ingestion) -> adapter installed last. Nothing here is
+    reached by ``ReplayEngine``, which builds its own adapter."""
+    handle = SegmentDedupHandle()
+    backends: Dict[str, SegmentDedupCoordinator] = {}
+    for spec in specs:
+        state_dir = Path(spec.writer.base_dir) / "dedup_state"
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise DedupStateError(f"cannot create dedup state dir {str(state_dir)!r}: {exc}") from exc
+        index = SegmentDedupIndex(str(state_dir / f"{spec.writer.stream_name}.sqlite3"))
+        handle.indexes.append(index)
+        coordinator = SegmentDedupCoordinator(index, spec.row_identity)
+        spec.writer.on_segment_published = coordinator.on_segment_published
+        coordinator.startup_reconcile(spec.writer.stream_dir)
+        backends[spec.event_stream] = coordinator
+        handle.coordinators[spec.event_stream] = coordinator
+    adapter.set_trade_dedup(backends)
+    return handle
+
+
+def bind_arg(handle: Optional[SegmentDedupHandle], event: Any) -> Optional[Callable[[SegmentToken], None]]:
+    """``bind=`` value for ``writer.write`` -- None when no backend is wired
+    (legacy/test construction), which leaves the writer behaviour unchanged."""
+    return None if handle is None else handle.bind_for(event)

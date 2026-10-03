@@ -24,6 +24,7 @@ from collector.collector.config import (
 )
 from collector.collector.adapters.binance import BinanceAdapter
 from collector.collector.instrument import BINANCE_USDM_BTCUSDT
+from collector.collector.segment_dedup import DedupStateError, StreamSpec, attach_segment_dedup, bind_arg
 from collector.collector.raw_capture import RawCapture, RawRestRecord, RawWireRecord
 from collector.collector.backoff import ExponentialBackoff, rate_limit_penalty
 from collector.collector.recovery_control import RecoveryController
@@ -53,7 +54,7 @@ OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
 BINANCE_DEPTH_SNAPSHOT_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
 
 class CollectorApp:
-    def __init__(self):
+    def __init__(self, enable_segment_dedup: bool = True):
         self.running = False
         self._closed = False
         self.raw_messages_logged = 0
@@ -107,6 +108,22 @@ class CollectorApp:
         self.liq_writer = ParquetWriter("liquidation", LIQUIDATION_SCHEMA)
         self.raw_wire_writer = ParquetWriter("raw_wire", RAW_WIRE_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_rest_writer = ParquetWriter("raw_rest", RAW_REST_SCHEMA, quality_event_sink=self._persist_quality_event)
+        # P0-4: the raw (least-processed) writer is the dedup recovery
+        # anchor -- it receives every admitted trade unconditionally,
+        # whereas trades_writer (computed features) additionally depends
+        # on validate_trade() succeeding and can miss a row the raw writer
+        # got. Binding the durable commit to the writer that is guaranteed
+        # to receive the row is the correct anchor; see segment_dedup.py's
+        # module docstring for why a published segment is the anchor at all.
+        # Failure here (index open/reconcile) raises DedupStateError, which
+        # aborts CollectorApp() construction -- the collector must not
+        # start with an uncertain dedup state (Invariant: fail closed).
+        self.segment_dedup = None
+        if enable_segment_dedup:
+            self.segment_dedup = attach_segment_dedup(self.binance_adapter, [
+                StreamSpec("trades", self.raw_trades_writer, "BINANCE", "linear_perpetual",
+                          trade_id_field="native_trade_id"),
+            ])
         self.raw_capture = RawCapture(self.raw_wire_writer, self.raw_rest_writer,
                                       quality_event_sink=self._persist_quality_event)
         # Adapter drops become durable quality events instead of vanishing.
@@ -697,7 +714,7 @@ class CollectorApp:
                 raw_trade_writer.write({"timestamp":process_ts, "local_receive_ts":event.local_receive_ts,
                     "exchange_timestamp":event.exchange_transaction_ts or event.exchange_event_ts, "trade_id":trade_id,
                     "native_trade_id":event.trade_id, "price":event.price, "quantity":event.quantity,
-                    "instrument_key": instrument_key})
+                    "instrument_key": instrument_key}, bind=bind_arg(getattr(self, "segment_dedup", None), event))
             if trade_id is None:
                 self.stream_counters["trades"]["rejected"] += 1
                 self._record_validation_rejection("trades", "legacy_trade_id_not_lossless")
@@ -713,6 +730,9 @@ class CollectorApp:
                 "instrument_key": instrument_key,
             }
             self._handle_trade_features(features)
+        segment_dedup = getattr(self, "segment_dedup", None)
+        if segment_dedup is not None:
+            segment_dedup.end_message()
         self._drain_integrity_quality_events()
 
     def _handle_trade_features(self, features: dict):
