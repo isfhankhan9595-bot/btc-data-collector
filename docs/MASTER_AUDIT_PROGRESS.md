@@ -70,4 +70,4 @@ transactions, and (b) a fresh line-by-line pass of P0-1 and P0-5 within this
 audit branch specifically, since both currently rest on evidence from before
 this branch existed.
 
-LAST COMMIT SHA: (recorded after this commit lands on master-audit-2026-10)
+LAST COMMIT SHA: fb3f868 (this commit, on master-audit-2026-10)
