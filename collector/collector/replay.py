@@ -73,7 +73,7 @@ from .adapters.bybit import BybitAdapter
 from .adapters.okx import OKXAdapter
 from .book_engine import LocalBook
 from .canonical import CanonicalOrderBookEvent
-from .clock import effective_ns, ms_from_ns, require_epoch_ns
+from .clock import ms_from_ns, require_epoch_ns
 from .quality_events import BookQuality, QualityEventType
 from .storage_layout import StorageCollisionError, iter_segments, read_streams
 from .utils import logger
@@ -126,12 +126,33 @@ class ReplayFrame:
     receive_mono_ns: Optional[int] = None
 
     @property
-    def order_key(self) -> tuple[int, int, int]:
-        # Ordered by recorded ns when present, else by ms expressed in ns.
-        # Ties stay ties: no offset is added to break them; the secondary
-        # keys are the existing evidence-based kind rank and recorded order.
-        return (effective_ns(self.timestamp_ms, self.receive_ns),
-                _KIND_RANK.get(self.kind, 9), self.source_index)
+    def order_key(self) -> tuple[int, int, int, int]:
+        """``(timestamp_ms, kind_rank, ns_tiebreak, source_index)``.
+
+        P0-11 follow-up: ``kind_rank`` must be compared BEFORE any
+        nanosecond tiebreak, not after. The earlier ``(effective_ns(...),
+        kind_rank, source_index)`` form synthesized a REST snapshot's
+        missing ``receive_ns`` as the start of its millisecond
+        (``timestamp_ms * 1_000_000``), which can sort *below* a WIRE
+        frame's real, later-in-the-millisecond ``receive_ns`` -- moving a
+        REST snapshot ahead of a websocket frame the collector actually
+        received first, purely because the snapshot has no finer evidence
+        to offer. That is a causality-relevant reordering: it can change
+        which event an order-book recovery sees as available first.
+
+        Putting ``timestamp_ms`` and ``kind_rank`` first restores the
+        documented event-kind ordering for same-millisecond frames
+        regardless of which ones happen to carry nanosecond evidence. The
+        ns tiebreak then refines order only *within* one (ms, kind) group
+        -- exactly where finer evidence is actually comparable. A frame
+        with no ``receive_ns`` (a REST row, or a legacy WIRE row) uses a
+        sentinel below any real epoch-ns value, so it is never confused
+        with a genuine zero-ns reading; which side of other such frames it
+        falls on is then settled by ``source_index``, the final,
+        deterministic tiebreaker -- never a synthesized offset.
+        """
+        ns_tiebreak = self.receive_ns if self.receive_ns is not None else -1
+        return (self.timestamp_ms, _KIND_RANK.get(self.kind, 9), ns_tiebreak, self.source_index)
 
 
 @dataclass(frozen=True)
