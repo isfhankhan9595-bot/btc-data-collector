@@ -382,6 +382,20 @@ class ParquetWriter:
             # Not close(): the writer keeps its stream directory across an
             # hour rollover, so the lock must stay held.
             self._finalize_segment()
+            # _finalize_segment can set _publication_failure (the just-closed
+            # segment's publication hook can fail) -- re-check immediately,
+            # before this record is bound/appended to the newly-opened
+            # segment. The check at the top of write() ran before this
+            # rollover happened, so it cannot see a failure caused by this
+            # same call; without this second check, the triggering record
+            # would be silently admitted into a writer that is already in a
+            # fail-closed state, one write late.
+            if self._publication_failure is not None:
+                raise RuntimeError(
+                    f"ParquetWriter for {self.stream_name!r} refuses this write: the segment-"
+                    f"publication hook failed during this write's own hour rollover "
+                    f"({self._publication_failure!r}); dedup/storage state is uncertain"
+                ) from self._publication_failure
             self.current_hour, self._seq = hour, self._next_sequence(hour)
             self._open_segment()
         if bind is not None:

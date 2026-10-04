@@ -274,12 +274,13 @@ def test_usdm_startup_reconciliation_specifically_recovers_a_commit_the_live_hoo
         "data": {"E": T, "a": 55, "p": "100", "q": "1", "m": False}}))
     app.raw_trades_writer.on_segment_published = None     # remove ONLY the live hook
     app.raw_trades_writer.close()                          # publishes with no commit at all
+    assert app.segment_dedup.coordinators["trades"].index.identity_count() == 0, \
+        "setup check: removing the live hook must mean nothing was committed before the simulated crash"
     for w in (app.ob_writer, app.raw_book_writer, app.trades_writer, app.mark_writer,
               app.oi_writer, app.liq_writer, app.raw_wire_writer, app.raw_rest_writer, app.quality_writer):
         w._release_lock()
     app.segment_dedup.close()
 
-    assert not (tmp_path / "data" / "dedup_state" / "binance_trades_raw.sqlite3").exists() or True
     app2 = _usdm_app(tmp_path, monkeypatch)   # attach_segment_dedup's reconcile must find & index it
     try:
         assert app2.segment_dedup.coordinators["trades"].index.identity_count() == 1, \
@@ -343,3 +344,62 @@ def test_usdm_startup_fails_closed_when_a_published_segment_is_unreadable(tmp_pa
 
     with pytest.raises(Exception):
         _usdm_app(tmp_path, monkeypatch)   # CollectorApp() itself must fail to construct
+
+
+def test_rollover_publication_hook_failure_fails_closed_for_the_triggering_write(tmp_path, monkeypatch):
+    """Reproduces, then proves fixed, the exact defect this hostile review
+    identified: _finalize_segment() inside the hour-rollover branch of
+    ParquetWriter.write() can set _publication_failure (its hook raised),
+    but the check for _publication_failure at the TOP of write() already
+    ran before this same call's own rollover -- so without a second check
+    immediately after _finalize_segment(), the triggering record would be
+    silently bound and appended into the newly-opened segment despite the
+    writer already being in a fail-closed state.
+
+    Drives the real production ParquetWriter.write() path, not a
+    reimplementation -- a hostile DedupStateError-raising hook, a forced
+    hour change via the real _get_current_hour_str seam."""
+    from collector.collector.segment_dedup import DedupStateError
+
+    app = _usdm_app(tmp_path, monkeypatch)
+    try:
+        _bridge_usdm(app)
+        writer = app.raw_trades_writer
+        asyncio.run(app.handle_message({"stream": "btcusdt@aggTrade",
+            "data": {"E": T, "a": 1, "p": "100", "q": "1", "m": False}}))
+        assert len(writer.buffer) == 1
+        assert writer._publication_failure is None
+
+        def hostile_hook(token, path):
+            raise DedupStateError("simulated publication failure during hour rollover")
+        writer.on_segment_published = hostile_hook
+        # Force a genuine rollover relative to whatever hour the real first
+        # write actually opened (never hand-set current_hour itself: that
+        # would desync it from the real .tmp file already open on disk).
+        next_hour = writer.current_hour[:-2] + f"{(int(writer.current_hour[-2:]) + 1) % 24:02d}"
+        monkeypatch.setattr(writer, "_get_current_hour_str", lambda: next_hour)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(app.handle_message({"stream": "btcusdt@aggTrade",
+                "data": {"E": T + 1, "a": 2, "p": "100", "q": "1", "m": False}}))
+
+        # 1. The triggering record itself must NOT have been admitted.
+        assert all(row["trade_id"] != "2" for row in writer.buffer), \
+            "the triggering write must be rejected, not silently appended to the new segment"
+        # 2. Dedup state was not falsely advanced: trade "2" must still be
+        #    considered unseen (the admission already happened at the
+        #    adapter layer before write() was ever called, by design --
+        #    what must NOT happen is this record becoming durable).
+        key = __import__("collector.collector.segment_dedup", fromlist=["dedup_identity_key"]).dedup_identity_key(
+            "BINANCE", "linear_perpetual", "BINANCE|linear_perpetual|BTC-USDT|BTCUSDT", "trades", "2")
+        assert not app.segment_dedup.coordinators["trades"].index.contains(key)
+        # 3. The writer is left fail-closed: subsequent writes also fail,
+        #    without needing another rollover to trigger it.
+        with pytest.raises(RuntimeError):
+            writer.write({"timestamp": T + 2, "trade_id": "3", "price": 1.0, "quantity": 1.0,
+                          "instrument_key": "x"})
+    finally:
+        # Writer is in a failed state; release its lock directly rather
+        # than calling close() (which would try to publish again).
+        writer._release_lock()
+        app.segment_dedup.close()
