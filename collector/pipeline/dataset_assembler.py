@@ -81,18 +81,30 @@ aligned with the exact same rule as every other stream: their own
   assumption the trades aggregation already makes -- but it is called out
   explicitly here rather than silently inherited.
 * Both trades and liquidations carry a day-level ``<stream>_stream_available``
-  flag (``trades_stream_available``, ``liquidation_stream_available``):
-  ``False`` means no segment was collected for this day at all (the zero
-  aggregate columns carry no evidentiary weight -- absence of evidence, not
-  evidence of absence); ``True`` means the stream was collected and an
-  empty bin is a genuinely observed zero. Research-integrity audit finding
-  (post-P0-7): ``trades_stream_available`` did not exist until that audit --
-  trades had *no* day-level availability signal at all, a strictly worse gap
-  than liquidations' already-documented one, since a whole day of trades
-  outage was indistinguishable from a real zero-trade day anywhere in the
-  schema. Neither flag resolves intra-day outages (a mid-day WS reconnect
-  gap within an otherwise-"available" day) -- that remains the same
-  documented, deliberately out-of-scope limitation it always was.
+  flag (``trades_stream_available``, ``liquidation_stream_available``). This
+  is a **day-level** signal and must not be read as more than it proves.
+  ``False`` means no qualifying segment was found for this day at all (the
+  zero aggregate columns carry no evidentiary weight -- absence of evidence,
+  not evidence of absence). ``True`` means the assembler found qualifying
+  trade/liquidation data *somewhere* in this day -- it does **not** mean
+  every grid bin in that day had continuous stream coverage, and an empty
+  bin under ``True`` is not a "confident" or "proven" zero at the bin level:
+  it is simply not flagged as coming from a day with no data at all. Whether
+  that specific bin itself was covered by an unbroken connection is not
+  established by this flag -- see the next paragraph. Research-integrity
+  audit finding (post-P0-7): ``trades_stream_available`` did not exist until
+  that audit -- trades had *no* day-level availability signal at all, a
+  strictly worse gap than liquidations' already-documented one, since a
+  whole day of trades outage was indistinguishable from a real zero-trade
+  day anywhere in the schema.
+* **Neither flag resolves intra-day outages, and this is not a secondary
+  caveat -- it is a hard limit on what ``<stream>_stream_available`` means.**
+  A mid-day WS reconnect gap within an otherwise-``True`` day produces
+  exactly the same empty-bin aggregate columns as a genuine lull in
+  activity, with nothing in the schema to tell them apart. Proving per-bin
+  coverage would require joining the collector's persisted quality-event
+  stream against the grid, which is a separate, larger undertaking and is
+  deliberately not attempted here.
 
 Neither stream's absence blocks assembly: like trades, both are optional
 inputs (a quiet day with zero liquidations, or an OI poll outage, does not
@@ -372,10 +384,13 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
         df_aligned = pd.merge(df_aligned, trade_aggs, left_on="timestamp", right_on="grid_ts", how="left")
         df_aligned = df_aligned.drop(columns=["grid_ts"])
-        # The stream was collected for this day: a bin with no matching
-        # aggregate genuinely had zero trades (not "unknown"), distinct from
-        # the whole-stream-absent case below -- same semantics as
-        # liquidation_stream_available (see docs/RESEARCH_DATASET_TIME_CONTRACT.md).
+        # Day-level signal only: at least one qualifying trades segment was
+        # found for this day, distinct from the whole-stream-absent case
+        # below. This does NOT certify that every individual grid bin in
+        # the day had continuous stream coverage -- an empty bin here is
+        # "not from a data-absent day", not a per-bin-proven zero. Same
+        # semantics as liquidation_stream_available (see
+        # docs/RESEARCH_DATASET_TIME_CONTRACT.md).
         df_aligned["trades_stream_available"] = True
     else:
         df_aligned["trade_count"] = 0
@@ -430,9 +445,11 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
         df_aligned = pd.merge(df_aligned, liq_aggs, left_on="timestamp", right_on="grid_ts", how="left")
         df_aligned = df_aligned.drop(columns=["grid_ts"])
-        # The stream was collected for this day: a bin with no matching
-        # aggregate genuinely had zero liquidations (not "unknown"),
-        # distinct from the whole-stream-absent case below (see
+        # Day-level signal only: at least one qualifying liquidation segment
+        # was found for this day, distinct from the whole-stream-absent case
+        # below. This does NOT certify that every individual grid bin in
+        # the day had continuous stream coverage -- an empty bin here is
+        # "not from a data-absent day", not a per-bin-proven zero (see
         # docs/RESEARCH_DATASET_TIME_CONTRACT.md, "empty liquidation
         # interval" semantics).
         df_aligned["liquidation_stream_available"] = True

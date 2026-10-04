@@ -103,19 +103,26 @@ P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
 - Aggregated per grid bin on the causal availability clock (never processing
   time): `trade_count`, `buy_volume`, `sell_volume`, `net_volume`,
   `trade_flow_imbalance`, `vwap`, `last_price`.
-- **Day-level availability: `trades_stream_available`.** `False` means no
-  trades segment was collected for this day at all — the zero-valued
-  aggregate columns carry no evidentiary weight; `True` means the stream was
-  collected and a bin with no aggregate is a genuinely observed zero-trade
-  interval. Added by the post-P0-7 research-integrity audit: before this,
+- **Day-level availability: `trades_stream_available`.** This is a
+  **day-level** flag and proves exactly one thing: *"the assembler found
+  qualifying trade data for this day."* `False` means no trades segment was
+  found for this day at all — the zero-valued aggregate columns carry no
+  evidentiary weight. `True` means qualifying data existed somewhere in the
+  day; it does **not** mean every grid bin in that day had continuous
+  stream coverage, and an empty bin under `True` is day-level stream
+  available, not a bin-level proven zero — the aggregate zero for that one
+  bin is not equivalent to a claim that the whole day's coverage was
+  unbroken. Added by the post-P0-7 research-integrity audit: before this,
   trades had **no** day-level availability signal of any kind, a strictly
   worse gap than liquidations' (which already had
   `liquidation_stream_available`) — a full day of trades-collector outage was
   indistinguishable anywhere in the schema from a real zero-trade day.
-- Same limitation as liquidations below: this does not resolve an *intra-day*
-  outage (a mid-day WS reconnect gap within an otherwise-"available" day) —
-  an empty bin within an "available" day is only as trustworthy as that
-  connection's own uptime for that window. Closing that would mean joining
+- **This flag does not solve intra-day outage detection, and that is not a
+  minor caveat.** A mid-day WS reconnect gap within an otherwise-`True` day
+  produces the exact same empty-bin aggregate columns as a genuine lull —
+  nothing in the schema distinguishes them. `trades_stream_available` only
+  separates "no data for this day at all" from "some data exists this day";
+  it says nothing about any individual bin's own coverage. Closing that would mean joining
   the collector's persisted quality-event stream against the grid, a
   separate, larger undertaking, deliberately out of this fix's scope.
 
@@ -179,15 +186,18 @@ P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
   positive from genuine WS redelivery, which is the more common failure
   mode this heuristic targets. Do not describe this elsewhere as "exact" or
   "guaranteed" deduplication.
-- **Empty-interval semantics are explicit**, per the requirement that "no row
-  = zero" must not be silently assumed: `liquidation_stream_available`
-  distinguishes a day with **no liquidation segment collected at all**
-  (`False` — the zero columns carry no evidentiary weight, we simply don't
-  know) from a day where the stream **was** collected and a bin genuinely saw
-  no events (`True` — a confidently observed zero). Trades now carry the
-  symmetric `trades_stream_available` flag (see "Trades" above; added by the
-  post-P0-7 research-integrity audit — trades previously had no such flag at
-  all). This does not extend to
+- **Empty-interval semantics are explicit, at the day level only**, per the
+  requirement that "no row = zero" must not be silently assumed:
+  `liquidation_stream_available` distinguishes a day with **no liquidation
+  segment found at all** (`False` — the zero columns carry no evidentiary
+  weight, we simply don't know) from a day where qualifying liquidation
+  data **was** found somewhere (`True`). `True` does not certify that a
+  specific bin's own stream coverage was unbroken — it means the day is not
+  in the data-absent category, nothing more. Trades now carry the
+  symmetric `trades_stream_available` flag with the identical day-level
+  meaning (see "Trades" above; added by the post-P0-7 research-integrity
+  audit — trades previously had no such flag at all). Neither flag extends
+  to
   per-bin outage detection (e.g. a mid-day WS reconnect gap within an
   otherwise-available day) — building that would require joining the
   collector's persisted quality-event stream against the grid, which is a

@@ -1,11 +1,21 @@
 """Research-integrity audit: trades must carry a day-level availability
-signal distinguishing "no trades segment collected" from "a genuinely
-observed zero-trade interval" -- the same contract liquidations already had
-via ``liquidation_stream_available`` (see
+signal distinguishing "no qualifying trades segment was found for this day"
+from "qualifying trade data was found somewhere in this day" -- the same
+contract liquidations already had via ``liquidation_stream_available`` (see
 ``tests/test_dataset_assembler_oi_liquidation.py``). Before this fix,
 ``trades_stream_available`` did not exist: a day with no trades collector
 output and a real zero-trade day produced byte-identical aggregate columns
 with no distinguishing signal anywhere in the schema.
+
+IMPORTANT -- what the flag does and does not prove: ``trades_stream_
+available=True`` means the assembler found qualifying trade data for that
+day. It does NOT mean every grid bin in that day had continuous stream
+coverage, and an empty bin under ``True`` is not a "confident" or "proven"
+zero at the bin level -- it only means the day is not in the data-absent
+category. A mid-day WS reconnect gap within an otherwise-``True`` day is
+indistinguishable from a genuine lull; that is a real, unresolved
+limitation this test file does not attempt to close (see
+docs/RESEARCH_DATASET_TIME_CONTRACT.md).
 """
 import os
 
@@ -87,11 +97,13 @@ def test_missing_trades_stream_is_flagged_unavailable_not_silently_zero(data_dir
     assert not df["trades_stream_available"].any()
 
 
-def test_trades_present_but_bin_empty_is_a_confident_zero(data_dir):
-    """The stream WAS collected (one real trade exists somewhere in the
-    day); a bin far from that trade has trade_count=0 but
-    trades_stream_available=True -- a genuinely observed zero, not an
-    absence of evidence."""
+def test_trades_present_somewhere_in_day_sets_day_level_available(data_dir):
+    """Qualifying trade data WAS found somewhere in the day (one real
+    trade); a bin far from that trade has trade_count=0 but
+    trades_stream_available=True. This only means the day is not in the
+    data-absent category -- it does not by itself certify that this
+    specific far-away bin had continuous stream coverage (see the module
+    docstring)."""
     start_ts = _start_ts()
     _write_minimal_orderbook_and_mark(data_dir, start_ts)
     trades_df = pd.DataFrame({
@@ -132,7 +144,8 @@ def test_missing_and_present_trades_produce_the_same_zero_but_different_flags(da
     df_missing = _assemble(data_dir)
 
     # Scenario B: trades stream genuinely collected (one real trade early in
-    # the day); a bin far from it is a confident, evidenced zero.
+    # the day); a bin far from it is day-level "available" but is not
+    # itself individually proven to have had continuous coverage.
     import shutil
     data_dir_b = data_dir + "-b"
     shutil.copytree(data_dir, data_dir_b)
@@ -156,6 +169,38 @@ def test_missing_and_present_trades_produce_the_same_zero_but_different_flags(da
     # The flag is what tells them apart.
     assert not df_missing["trades_stream_available"].any()
     assert df_present.loc[idx_far_from_any_trade, "trades_stream_available"]
+
+
+def test_day_level_flag_does_not_detect_an_intra_day_outage(data_dir):
+    """Explicit demonstration of the documented limitation: this flag is
+    day-level only. A single trade early in the day sets
+    trades_stream_available=True for the WHOLE day, including bins many
+    hours later that could equally represent a genuine lull or an
+    undetected mid-day collector outage -- the flag cannot and does not
+    distinguish them. This test does not attempt to fix that (would require
+    joining the quality-event stream against the grid); it exists only to
+    pin the limitation so it cannot be silently "fixed" into an overclaim
+    later without a test noticing."""
+    start_ts = _start_ts()
+    _write_minimal_orderbook_and_mark(data_dir, start_ts)
+    # One trade in the first grid bin, nothing else all day -- indistinguishable,
+    # from this flag alone, from "the trades stream went down right after."
+    trades_df = pd.DataFrame({
+        "timestamp": [start_ts], "local_timestamp": [start_ts], "exchange_timestamp": [start_ts],
+        "trade_id": [1], "price": [100.0], "quantity": [1.0],
+        "is_buyer_maker": [False], "signed_qty": [1.0],
+        "instrument_key": [INSTRUMENT_KEY],
+    })
+    _write_parquet(trades_df, _seg(data_dir, "trades"))
+
+    df = _assemble(data_dir)
+
+    late_in_day_idx = len(df) - 1  # the last grid bin of the day
+    assert df.loc[late_in_day_idx, "trade_count"] == 0
+    # Still True: the flag has no mechanism to detect that the stream could
+    # have gone silent hours ago. This is the known, accepted limitation,
+    # not a bug -- see docs/RESEARCH_DATASET_TIME_CONTRACT.md.
+    assert df.loc[late_in_day_idx, "trades_stream_available"]
 
 
 def test_trades_stream_available_matches_liquidation_stream_available_semantics(data_dir):
