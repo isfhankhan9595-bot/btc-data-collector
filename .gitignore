@@ -22,3 +22,7 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local secrets (telegram_bot loads .env via python-dotenv)
+.env
+.env.*
