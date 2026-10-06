@@ -41,6 +41,7 @@ SELL guess.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Optional
 
@@ -136,10 +137,33 @@ def observe_trade_flow_at(
     full venue-by-venue audit and the acceptance tests proving this module
     does not double-count a duplicate.
     """
+    _require_observation_ts(observation_ts)
+
+    trades, frames_considered = _causal_trades(frames, observation_ts, venue)
+    return _cumulative_observation(
+        trades, frames_considered, observation_ts, venue, staleness_ms)
+
+
+def _require_observation_ts(observation_ts) -> None:
     if isinstance(observation_ts, bool) or not isinstance(observation_ts, int):
         raise TypeError(f"observation_ts must be an int (epoch ms), got {observation_ts!r}")
 
-    trades, frames_considered = _causal_trades(frames, observation_ts, venue)
+
+def _require_window_ms(window_ms) -> None:
+    if isinstance(window_ms, bool) or not isinstance(window_ms, int):
+        raise TypeError(f"window_ms must be an int (milliseconds), got {window_ms!r}")
+    if window_ms <= 0:
+        raise ValueError(f"window_ms must be positive, got {window_ms!r}")
+
+
+def _cumulative_observation(trades, frames_considered: int, observation_ts: int,
+                            venue: str, staleness_ms: int) -> TradeFlowObservation:
+    """Assemble the cumulative observation from the causal trade list.
+
+    Shared by ``observe_trade_flow_at`` and ``TradeFlowObserver`` so both
+    derive every output field from the same code; they can differ only in
+    *which* causal trade list they hand it.
+    """
     if not trades:
         return TradeFlowObservation(
             exchange=venue, instrument=None, observation_ts=observation_ts,
@@ -257,12 +281,8 @@ def observe_windowed_trade_flow_at(
     leak in, because the upper-bound exclusion already happened first, at
     the frame level, before this function ever sees the trade list.
     """
-    if isinstance(observation_ts, bool) or not isinstance(observation_ts, int):
-        raise TypeError(f"observation_ts must be an int (epoch ms), got {observation_ts!r}")
-    if isinstance(window_ms, bool) or not isinstance(window_ms, int):
-        raise TypeError(f"window_ms must be an int (milliseconds), got {window_ms!r}")
-    if window_ms <= 0:
-        raise ValueError(f"window_ms must be positive, got {window_ms!r}")
+    _require_observation_ts(observation_ts)
+    _require_window_ms(window_ms)
 
     window_start = observation_ts - window_ms
     window_end = observation_ts
@@ -270,6 +290,28 @@ def observe_windowed_trade_flow_at(
     all_causal_trades, frames_considered = _causal_trades(frames, observation_ts, venue)
 
     if not all_causal_trades:
+        latest_known, windowed = None, []
+    else:
+        latest_known = all_causal_trades[-1]
+        windowed = [t for t in all_causal_trades if window_start < t.local_receive_ts <= window_end]
+    return _windowed_observation(
+        latest_known, windowed, frames_considered, observation_ts, window_ms, venue, staleness_ms)
+
+
+def _windowed_observation(latest_known, windowed, frames_considered: int, observation_ts: int,
+                          window_ms: int, venue: str, staleness_ms: int) -> WindowedTradeFlowObservation:
+    """Assemble the windowed observation.
+
+    ``latest_known`` is the last causally-known trade overall (``None`` when
+    no causal trade exists at all) and ``windowed`` is the trailing run of
+    causal trades with ``window_start < local_receive_ts <= window_end``, in
+    replay order. Shared by ``observe_windowed_trade_flow_at`` and
+    ``TradeFlowObserver`` so both derive every output field from one place.
+    """
+    window_start = observation_ts - window_ms
+    window_end = observation_ts
+
+    if latest_known is None:
         # Genuinely NEVER_OBSERVED: no trade evidence exists for this venue
         # at all, up to observation_ts. Nothing to say about the window.
         return WindowedTradeFlowObservation(
@@ -280,20 +322,18 @@ def observe_windowed_trade_flow_at(
             last_trade_local_receive_ts=None, age_ms=None, frames_considered=frames_considered,
         )
 
-    windowed = [t for t in all_causal_trades if window_start < t.local_receive_ts <= window_end]
     # `all_causal_trades` is in ascending causal order (ReplaySource's own
     # deterministic order), and the window is the suffix
     # `(window_start, observation_ts]`; every trade in `all_causal_trades`
     # already satisfies `local_receive_ts <= observation_ts`, so the
-    # window filter above keeps exactly a trailing run of it. That means
-    # `all_causal_trades[-1]` -- the most recent causally-known trade,
+    # window filter keeps exactly a trailing run of it. That means
+    # `latest_known` -- the most recent causally-known trade,
     # whether or not it happens to fall inside this window -- is the
     # right "how fresh is our knowledge of this venue" reference in every
     # case: when the window is non-empty it IS `windowed[-1]` (the suffix
     # includes the last element or the window would be empty), and when
     # the window is empty it is still the best available evidence of when
     # this venue was last actually heard from.
-    latest_known = all_causal_trades[-1]
     overall_age_ms = observation_ts - latest_known.local_receive_ts
 
     if not windowed:
@@ -332,3 +372,125 @@ def observe_windowed_trade_flow_at(
         last_trade_local_receive_ts=last_trade.local_receive_ts,
         age_ms=age_ms, frames_considered=frames_considered,
     )
+
+
+class TradeFlowObserver:
+    """Many causal trade-flow observations over one frame set, replayed once.
+
+    ``observe_trade_flow_at`` / ``observe_windowed_trade_flow_at`` replay the
+    whole causal prefix from scratch on every call, so ``K`` observations
+    over ``N`` frames cost ``O(K*N)`` adapter operations. This class replays
+    the full frame set exactly once, at construction, and answers each
+    observation by bisecting the resulting trade list. Every output field is
+    assembled by the same helpers the module-level functions use
+    (``_cumulative_observation`` / ``_windowed_observation`` /
+    ``_side_volumes``), so the two can differ only in which causal trade list
+    they are handed; ``tests/test_trade_flow_observer.py`` proves those lists
+    are identical.
+
+    Why one full replay equals the per-observation causal-prefix replay
+    -------------------------------------------------------------------
+    Replay is a forward-only fold over frames in ``order_key`` order: adapter
+    state (including first-occurrence-wins trade dedup) at frame ``i``
+    depends only on frames ``0..i``. The legacy path replays
+    ``sorted({f : f.timestamp_ms <= T})``. That is a *prefix* of
+    ``sorted(all frames)`` exactly when ``timestamp_ms`` is non-decreasing
+    along the sorted order; then both replays process the same frames in the
+    same order with the same state, and a later frame cannot influence an
+    earlier trade. Likewise a trade belongs to the prefix iff
+    ``trade.local_receive_ts <= T`` exactly when its ``local_receive_ts``
+    equals its source frame's ``timestamp_ms``.
+
+    Both conditions are *checked* while building, not assumed. If either
+    fails (mixed-precision / inconsistent ``receive_ns`` ordering, an adapter
+    stamping a different receive time, or any exception from the replay),
+    the observer does not index: every query is delegated to the module-level
+    functions on the original frames, which is the unchanged reference
+    behaviour (including raising only for observations whose causal prefix
+    contains the offending frame). ``mode`` and ``fallback_reason`` report
+    which path is in use.
+
+    Nothing is cached across calls of the module-level functions, and the
+    observer snapshots ``frames`` (``ReplayFrame`` is frozen) at construction,
+    so later mutation of the caller's list cannot change its answers. It
+    answers only for the frame set it was built from; there is no
+    incremental append, so a future frame can never enter a historical
+    observation.
+
+    Cost: construction is one replay (``O(N)`` adapter operations,
+    ``O(N + T)`` memory retained: frame timestamps plus trade events).
+    Each query is ``O(log N + T_prefix)`` for cumulative (the same
+    ``_side_volumes`` sums, deliberately not maintained incrementally so
+    floating-point results stay bit-identical to the reference) and
+    ``O(log T + T_window)`` for windowed.
+    """
+
+    def __init__(self, frames, *, venue: str) -> None:
+        self._venue = venue
+        self._frames = list(frames)
+        self._frame_ts: list[int] = []
+        self._trades: list[CanonicalTradeEvent] = []
+        self._trade_ts: list[int] = []
+        self.fallback_reason: Optional[str] = None
+        try:
+            self._build()
+        except Exception as exc:  # noqa: BLE001 - any build problem -> reference path
+            self._fall_back(f"build_raised:{type(exc).__name__}")
+
+    @property
+    def mode(self) -> str:
+        return "indexed" if self.fallback_reason is None else "reference_fallback"
+
+    def _fall_back(self, reason: str) -> None:
+        self.fallback_reason = reason
+        self._frame_ts, self._trades, self._trade_ts = [], [], []
+
+    def _build(self) -> None:
+        engine = ReplayEngine(venue=self._venue)
+        previous_ts = None
+        for frame in ReplaySource(self._frames):
+            frame_ts = frame.timestamp_ms
+            if previous_ts is not None and frame_ts < previous_ts:
+                self._fall_back("frame_timestamps_not_monotone_in_replay_order")
+                return
+            previous_ts = frame_ts
+            self._frame_ts.append(frame_ts)
+            events = engine.result.non_book_events
+            before = len(events)
+            engine.run((frame,))
+            for event in events[before:]:
+                if not isinstance(event, CanonicalTradeEvent):
+                    continue
+                if event.local_receive_ts != frame_ts:
+                    self._fall_back("trade_receive_ts_differs_from_frame_timestamp")
+                    return
+                self._trades.append(event)
+                self._trade_ts.append(frame_ts)
+
+    def observe_trade_flow_at(self, observation_ts: int, *, staleness_ms: int = 5_000) -> TradeFlowObservation:
+        _require_observation_ts(observation_ts)
+        if self.fallback_reason is not None:
+            return observe_trade_flow_at(
+                self._frames, observation_ts, venue=self._venue, staleness_ms=staleness_ms)
+        frames_considered = bisect_right(self._frame_ts, observation_ts)
+        trade_count = bisect_right(self._trade_ts, observation_ts)
+        return _cumulative_observation(
+            self._trades[:trade_count], frames_considered, observation_ts,
+            self._venue, staleness_ms)
+
+    def observe_windowed_trade_flow_at(
+        self, observation_ts: int, window_ms: int, *, staleness_ms: int = 5_000,
+    ) -> WindowedTradeFlowObservation:
+        _require_observation_ts(observation_ts)
+        _require_window_ms(window_ms)
+        if self.fallback_reason is not None:
+            return observe_windowed_trade_flow_at(
+                self._frames, observation_ts, window_ms, venue=self._venue,
+                staleness_ms=staleness_ms)
+        frames_considered = bisect_right(self._frame_ts, observation_ts)
+        end = bisect_right(self._trade_ts, observation_ts)
+        start = bisect_right(self._trade_ts, observation_ts - window_ms, 0, end)
+        latest_known = self._trades[end - 1] if end else None
+        return _windowed_observation(
+            latest_known, self._trades[start:end], frames_considered, observation_ts,
+            window_ms, self._venue, staleness_ms)

@@ -136,11 +136,49 @@ regression test confirms windowed CVD does not bypass it
 
 ## Performance
 
-Reference implementation, no optimization attempted (correctness first,
-per this phase's own instruction): ~75,000 trade events/sec on this
-environment (10k trades: 134 ms; 100k trades: 1.37 s, roughly linear).
-Acceptable for the intended 5m/15m manual-analysis use case; not
-benchmarked against a production event rate.
+`observe_trade_flow_at` / `observe_windowed_trade_flow_at` are the reference
+implementation. Each call is stateless and replays its whole causal prefix
+from scratch: filter all frames (`O(N)`), sort the causal frames, run them
+through `ReplayEngine` (JSON decode, adapter normalize, instrument stamp,
+duplicate check: ~92% of the time), then tally. One call costs about
+**17 us per causal frame** and scales with total frames, not with the window
+size; nothing is shared between calls.
+
+Measured (synthetic Binance aggTrade frames at 10 frames/s, 1 CPU, 4 GB,
+Python 3.12.3, one fresh process per row; cumulative + 5m + 15m = 3 calls per
+observation point):
+
+| Workload | Reference | `TradeFlowObserver` |
+|---|---|---|
+| 10k frames, 1 call | 0.17 s | build 0.23 s |
+| 100k frames, 1 call | 1.7 s | build 2.3 s |
+| 500k frames, 1 call | 10.3 s (peak RSS 717 MB) | build 11.0 s (684 MB) |
+| 100k frames, 20 points x 3 queries | 61 s | 2.5 s total |
+| 100k frames, 100 points x 3 queries | 318 s | 5.0 s total |
+| 100k frames, 1000 points x 3 queries | not run (extrapolates to about 45 min) | 26.8 s total |
+
+K observation points over N frames cost `O(K*N)` adapter operations in the
+reference (60 calls over 10k frames made 315,000 `normalize` calls against
+10,000 frames). `TradeFlowObserver(frames, venue=...)` replays once and
+answers every later query by bisecting the trade list: construction is one
+replay, a windowed query is `O(log T + T_window)`, and a cumulative query is
+`O(T_prefix)` for the unchanged `_side_volumes` sums (kept non-incremental on
+purpose so floating-point results stay bit-identical). That remaining term is
+what dominates the 1000-point row.
+
+Equivalence rests on two properties that the observer checks while building
+and otherwise falls back to the reference path (`observer.mode`,
+`observer.fallback_reason`): `timestamp_ms` non-decreasing along replay order
+(so the causal frames are a prefix of the replay and a later frame cannot
+influence an earlier trade) and every trade stamped with its own frame's
+`timestamp_ms`. `tests/test_trade_flow_observer.py` compares every output
+field with the reference across all four replay venues, many timestamps and
+windows, boundaries, resends and unknown sides, and counts adapter calls so
+the single-replay property is protected without wall-clock thresholds.
+
+The numbers are for synthetic frames; real depth/ticker frames in a recorded
+session add replay work to both paths equally. Not benchmarked against a
+production event rate.
 
 ## Explicitly not built here
 
