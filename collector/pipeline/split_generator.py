@@ -86,6 +86,9 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        # The rename lives in the parent directory's metadata: make it
+        # durable, and fail closed (raise) if that cannot be established.
+        _fsync_dir(directory)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -95,16 +98,19 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
 
 
 def _fsync_dir(path: str) -> None:
-    """Best-effort directory fsync so a rename is durable before the manifest
-    that depends on it is published. Not supported on every platform."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
+    """Fsync a directory so a rename/creation inside it is durable.
+
+    FAIL CLOSED: an ``OSError`` from opening or fsyncing the directory (e.g.
+    ``EIO``) propagates, so a caller can never report a publication as durable
+    when durability could not be established. The only exemption is Windows,
+    where a directory cannot be opened for fsync at all (a platform
+    capability, not a runtime failure).
+    """
+    if os.name == "nt":
         return
+    fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 
@@ -161,6 +167,12 @@ def _publish_generation(out_dir: str, blobs: dict[str, bytes]) -> tuple[str, dic
                     f"content address ({name}.parquet missing or altered); refusing "
                     "to publish a manifest that references it"
                 )
+        # A prior attempt may have renamed the generation into place and then
+        # failed (or crashed) before its directory entries were made durable.
+        # The content is verified; make the directory chain durable too.
+        _fsync_dir(final)
+        _fsync_dir(gens_dir)
+        _fsync_dir(out_dir)
         return generation, artifacts
 
     tmp_dir = tempfile.mkdtemp(dir=gens_dir, prefix=".tmp-")
@@ -172,7 +184,11 @@ def _publish_generation(out_dir: str, blobs: dict[str, bytes]) -> tuple[str, dic
                 os.fsync(handle.fileno())
         _fsync_dir(tmp_dir)
         os.rename(tmp_dir, final)
+        # Rename durable in generations/, then generations/ itself (which may
+        # have just been created) durable in out_dir -- BEFORE any manifest
+        # naming this generation can be written. Failures propagate.
         _fsync_dir(gens_dir)
+        _fsync_dir(out_dir)
     except BaseException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
