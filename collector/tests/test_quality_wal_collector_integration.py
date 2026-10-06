@@ -27,12 +27,20 @@ from collector.collector.quality_wal import QualityEventWAL
 CollectorApp = _run_collector.CollectorApp
 
 
-def _minimal_app(tmp_path, *, wal_dir=None):
-    """A real quality_writer + real WAL, nothing else from __init__."""
+def _minimal_app(tmp_path, *, wal_dir=None, segment_rows=1, segment_seconds=1):
+    """A real quality_writer + real WAL, nothing else from __init__.
+
+    Wired exactly like production (on_segment_durable -> checkpoint). The
+    default segment_rows=1 makes every write() also an immediate publish, so
+    checkpoint-on-publish is observable per event; batching behaviour is
+    covered in test_quality_event_durability.py.
+    """
     app = CollectorApp.__new__(CollectorApp)
     app.binance_book = LocalBook("BINANCE")
+    app._init_quality_durability_state()
     app.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, base_dir=str(tmp_path),
-                                       segment_rows=1, segment_seconds=1)
+                                       segment_rows=segment_rows, segment_seconds=segment_seconds,
+                                       on_segment_durable=app._on_quality_segment_durable)
     wal_dir = wal_dir or (app.quality_writer.stream_dir / "wal")
     app._quality_wal = QualityEventWAL(wal_dir)
     app._quality_queue = asyncio.Queue(maxsize=1024)
@@ -81,33 +89,33 @@ def test_normal_drain_persists_to_parquet_and_checkpoints_the_wal(tmp_path):
 
 
 def test_crash_before_checkpoint_can_duplicate_but_is_reconcilable_by_id(tmp_path):
-    """Test 4's essence: WAL -> Parquet succeeds -> CRASH before checkpoint
-    -> restart. The event is legitimately replayed again (a duplicate
-    Parquet row IS possible in this narrow window, and the task
-    explicitly permits that) -- but both rows carry the identical
-    quality_event_id, which is what makes the duplicate reconcilable
-    rather than silently ambiguous. No event is ever silently lost."""
+    """WAL -> Parquet publish succeeds -> the checkpoint write fails/crashes
+    right there -> restart. The event is legitimately replayed again (a
+    duplicate row IS possible in this narrow window) -- but both rows carry
+    the identical quality_event_id, so the duplicate is reconcilable. No event
+    is ever silently lost. Drives the real production path both times."""
     app = _minimal_app(tmp_path)
+    app._quality_wal.checkpoint = lambda **kw: (_ for _ in ()).throw(OSError("simulated crash"))
+
     app._websocket_quality_event(QualityEventType.RESYNC, "startup_resync")
     event = app._quality_queue.get_nowait()
-    app._persist_quality_event(event)   # Parquet write succeeds...
-    # ...but no checkpoint() call -- simulates the crash landing exactly there.
+    app._persist_quality_event(event)   # published; checkpoint fails -> latched, not raised
+    assert app._quality_checkpoint_is_blocked()
+    app.quality_writer.close()
 
-    # "Restart": a fresh WAL over the same directory recovers the
-    # not-yet-checkpointed event and replays it, exactly as CollectorApp's
-    # own __init__ does.
-    resume_seq = QualityEventWAL.highest_recovered_seq(app._quality_wal.wal_dir)
-    recovered = QualityEventWAL.recover(app._quality_wal.wal_dir)
-    assert len(recovered) == 1
-    for r in recovered:
-        app._persist_quality_event(r)
-    new_wal = QualityEventWAL(app._quality_wal.wal_dir, start_seq=resume_seq)
-    new_wal.checkpoint(up_to_seq=max(r["seq"] for r in recovered))
+    # "Restart": a brand-new app over the same directories, real recovery.
+    fresh = CollectorApp.__new__(CollectorApp)
+    fresh.binance_book = LocalBook("BINANCE")
+    fresh._init_quality_durability_state()
+    fresh.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, base_dir=str(tmp_path),
+                                         segment_rows=1, segment_seconds=1,
+                                         on_segment_durable=fresh._on_quality_segment_durable)
+    fresh._recover_quality_wal(app._quality_wal.wal_dir)
 
     rows = _quality_rows(tmp_path)
     assert len(rows) == 2                                    # the duplicate is real and expected here
     assert rows[0]["quality_event_id"] == rows[1]["quality_event_id"]   # but reconcilable: same ID
-    assert QualityEventWAL.recover(new_wal.wal_dir) == []     # and now fully checkpointed, no further replay
+    assert QualityEventWAL.recover(app._quality_wal.wal_dir) == []     # and now fully checkpointed, no further replay
 
 
 def test_full_startup_recovery_path_matches_constructor_logic(tmp_path):
@@ -124,7 +132,9 @@ def test_full_startup_recovery_path_matches_constructor_logic(tmp_path):
     recovered_events = QualityEventWAL.recover(wal_dir)
     fresh = CollectorApp.__new__(CollectorApp)
     fresh.binance_book = LocalBook("BINANCE")
+    fresh._init_quality_durability_state()
     fresh.quality_writer = app.quality_writer
+    fresh.quality_writer.on_segment_durable = fresh._on_quality_segment_durable
     for recovered in recovered_events:
         fresh._persist_quality_event(recovered)
     fresh._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
@@ -150,7 +160,9 @@ def test_recover_quality_wal_resumes_sequence_correctly_no_id_reuse(tmp_path):
     wal_dir = app._quality_wal.wal_dir
     fresh = CollectorApp.__new__(CollectorApp)
     fresh.binance_book = LocalBook("BINANCE")
+    fresh._init_quality_durability_state()
     fresh.quality_writer = app.quality_writer
+    fresh.quality_writer.on_segment_durable = fresh._on_quality_segment_durable
     fresh._quality_queue = asyncio.Queue(maxsize=1024)
     fresh._recover_quality_wal(wal_dir)   # the real startup path
 
@@ -254,7 +266,9 @@ def test_startup_recovery_stops_checkpointing_at_first_persist_failure(tmp_path)
 
     fresh = CollectorApp.__new__(CollectorApp)
     fresh.binance_book = LocalBook("BINANCE")
+    fresh._init_quality_durability_state()
     fresh.quality_writer = app.quality_writer
+    fresh.quality_writer.on_segment_durable = fresh._on_quality_segment_durable
     real_persist = fresh._persist_quality_event
 
     def _selectively_broken(event):

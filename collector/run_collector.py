@@ -52,6 +52,12 @@ OI_POLL_INTERVAL_S = 3.0
 OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
 BINANCE_DEPTH_SNAPSHOT_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
 
+#: P0-3 quality-event batching (single source of truth for the production
+#: quality writer). Was 1 row / 1 s = one Parquet file per event.
+QUALITY_SEGMENT_ROWS = 500
+QUALITY_SEGMENT_SECONDS = 30.0
+
+
 class CollectorApp:
     def __init__(self):
         self.running = False
@@ -88,15 +94,22 @@ class CollectorApp:
         self._quality_task = None
         self._quality_overflow = 0
 
-        self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, segment_rows=1, segment_seconds=1)
+        # P0-3: batched (was segment_rows=1 / segment_seconds=1 = one Parquet
+        # file per quality event). Batching means write() no longer implies
+        # "durable", so EVERY event entering _persist_quality_event is WAL-
+        # protected first (P0-2) and the WAL checkpoint only advances from
+        # on_segment_durable, i.e. after the segment holding the event is
+        # published (fsync + rename + directory fsync). Written state is set
+        # up BEFORE the writer exists because its hook references it.
+        self._init_quality_durability_state()
+        self.quality_writer = ParquetWriter(
+            "quality_events", QUALITY_EVENTS_SCHEMA,
+            segment_rows=QUALITY_SEGMENT_ROWS, segment_seconds=QUALITY_SEGMENT_SECONDS,
+            on_segment_durable=self._on_quality_segment_durable, age_from_first_row=True)
         # P0-2: the durable quality-event WAL replaces the old
-        # quality_queue.pending.json marker, which only ever recorded a
-        # queue depth -- never the events themselves. This is the sole
-        # loss window the WAL closes: _websocket_quality_event's queue,
-        # not every _persist_quality_event call site (most of those write
-        # straight to Parquet, already fsync'd per event since
-        # segment_rows=1 above -- see quality_wal.py's own docstring for
-        # why that makes a *second* durability layer unnecessary there).
+        # quality_queue.pending.json marker (which only recorded a queue
+        # depth, never the events). With batching it protects ALL quality
+        # events, not just the websocket queue: see _persist_quality_event.
         self._recover_quality_wal(self.quality_writer.stream_dir / "wal")
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_book_writer = ParquetWriter("binance_orderbook_raw", BINANCE_ORDERBOOK_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
@@ -288,6 +301,100 @@ class CollectorApp:
             logger.error("Validation spike detected: >0.1% failures in 60s window")
             send_telegram_alert("Validation spike detected: >0.1% failures in 60s window")
 
+    # ------------------------------------------------------------------
+    # P0-2 / P0-3 quality-event durability state.
+    #
+    # Invariant: wal checkpoint N on disk  =>  every quality event with WAL
+    # seq <= N is durably in a PUBLISHED quality Parquet segment.
+    #   _quality_wal_inflight  seqs WAL-appended but not yet in a published
+    #                          segment (added at append time, so an event
+    #                          still sitting in the queue holds the
+    #                          checkpoint back).
+    #   _quality_segment_seqs  seqs written into the currently open segment.
+    # On publication the open segment's seqs leave inflight and the
+    # checkpoint moves to min(inflight)-1 (or the highest published seq when
+    # nothing is in flight) -- a contiguous prefix, never a max.
+    # ------------------------------------------------------------------
+    def _init_quality_durability_state(self) -> None:
+        self._quality_checkpoint_blocked = False
+        self._quality_checkpoint_block_reason = None
+        self._quality_wal_inflight = set()
+        self._quality_segment_seqs = set()
+        self._quality_published_hwm = None
+        self._quality_overflow_unpersisted = 0
+
+    def _ensure_quality_state(self) -> None:
+        if not hasattr(self, "_quality_wal_inflight"):
+            self._init_quality_durability_state()
+
+    def _quality_checkpoint_is_blocked(self) -> bool:
+        return getattr(self, "_quality_checkpoint_blocked", False)
+
+    def _block_quality_checkpoint(self, why: str) -> None:
+        """Latch: stop advancing the WAL checkpoint for the rest of this
+        process's life. Everything stays in the WAL and is reconciled (same
+        quality_event_id) by the next startup's recovery. Fail closed."""
+        self._ensure_quality_state()
+        if not self._quality_checkpoint_blocked:
+            self._quality_checkpoint_block_reason = why
+        self._quality_checkpoint_blocked = True
+        logger.error("quality_checkpoint_blocked", reason=why)
+
+    def _on_quality_segment_durable(self, path, record_count: int) -> None:
+        """Called by quality_writer only after a segment is durably published.
+        Never raises: any failure latches the checkpoint closed instead."""
+        self._ensure_quality_state()
+        durable = self._quality_segment_seqs
+        self._quality_segment_seqs = set()
+        if durable:
+            self._quality_wal_inflight -= durable
+            top = max(durable)
+            if self._quality_published_hwm is None or top > self._quality_published_hwm:
+                self._quality_published_hwm = top
+        wal = getattr(self, "_quality_wal", None)
+        if wal is None or self._quality_checkpoint_is_blocked() or self._quality_published_hwm is None:
+            return
+        inflight = self._quality_wal_inflight
+        target = (min(inflight) - 1) if inflight else self._quality_published_hwm
+        try:
+            wal.checkpoint(up_to_seq=target)
+        except Exception as exc:  # noqa: BLE001 - must not escape the writer hook
+            self._block_quality_checkpoint(f"checkpoint_write_failed:{type(exc).__name__}")
+            return
+        try:
+            wal.maybe_rotate_for_size()
+        except Exception:  # noqa: BLE001 - rotation failure leaves the WAL handle valid
+            logger.error("quality_wal_rotation_failed")
+
+    def _quality_publish_if_due(self) -> None:
+        """Idle tick: segment_seconds is only evaluated inside write(), so a
+        stream that goes quiet would otherwise keep its tail in RAM."""
+        try:
+            self.quality_writer.publish_if_due()
+        except Exception as exc:  # noqa: BLE001
+            self._block_quality_checkpoint(f"idle_publish_failed:{type(exc).__name__}")
+
+    def _drain_quality_queue_sync(self) -> None:
+        """Persist whatever is still queued, synchronously. Shutdown-only:
+        events enqueued after the persistence loop has exited (e.g. websocket
+        disconnect events raised by ws_client.stop()) would otherwise never
+        leave the queue."""
+        queue = getattr(self, "_quality_queue", None)
+        if queue is None:
+            return
+        while True:
+            try:
+                event = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                self._persist_quality_event(event)
+            except Exception:  # noqa: BLE001
+                logger.error("quality_event_shutdown_drain_persist_failed")
+                self._block_quality_checkpoint("shutdown_drain_persist_failed")
+            finally:
+                queue.task_done()
+
     def _recover_quality_wal(self, wal_dir) -> None:
         """Startup recovery: discover the WAL, recover exact event content
         not yet checkpointed, replay it into Parquet, and checkpoint only
@@ -296,6 +403,7 @@ class CollectorApp:
         testable against the real code path rather than a reimplementation
         of its logic.
         """
+        self._ensure_quality_state()
         self._quality_wal_recovery_error = None
         resume_seq = QualityEventWAL.highest_recovered_seq(wal_dir)
         try:
@@ -309,6 +417,12 @@ class CollectorApp:
             # quality event as soon as quality_writer exists, below.
             recovered_events = []
             self._quality_wal_recovery_error = str(exc)
+            # The corrupt file (and any valid records in it we could not
+            # replay) must survive: a later checkpoint(N) would otherwise
+            # cover its seqs and the file would be deleted -- destroying the
+            # evidence. Checkpointing stays off until an operator resolves it.
+            self._quality_checkpoint_blocked = True
+            self._quality_checkpoint_block_reason = "wal_corruption_on_startup"
         self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
         if self._quality_wal_recovery_error is not None:
             self._persist_quality_event({
@@ -325,25 +439,34 @@ class CollectorApp:
         # and everything after it remain in the WAL, recoverable on the
         # next restart (potentially re-persisted as a reconcilable
         # duplicate, per this module's own accepted design).
-        highest_contiguous_ok_seq = None
+        # Replay in strict seq order. Each event is tracked in-flight BEFORE
+        # it is written and only leaves in-flight when its segment is
+        # published, so the checkpoint can only ever reach the contiguous
+        # successfully-published prefix: on a failure at seq k the event and
+        # everything after it stay in the WAL (k remains in-flight, which
+        # also pins the checkpoint below k for the rest of this process).
+        replay_failed = False
         for recovered in recovered_events:
-            # Exact prior content, not a "something was pending" marker --
-            # this is the entire point of P0-2. quality_event_id flows
-            # through so a WAL-recovered row and any row that (impossibly,
-            # given checkpoint-then-delete ordering, but defensively)
-            # duplicates it can be reconciled by ID at research time.
             try:
-                self._persist_quality_event(recovered)
+                # "_wal_seq" = this event is already durably in the WAL (do
+                # not append again); quality_event_id flows through so a
+                # replayed row is reconcilable with any earlier copy by id.
+                self._persist_quality_event({**recovered, "_wal_seq": recovered["seq"]})
             except Exception:
-                # Loud, never silent -- but market-data capture is still
-                # the primary mission, so startup continues rather than
-                # crashing over one bad quality-event row. This event and
-                # everything after it stay uncheckpointed.
                 logger.error("quality_event_recovery_persist_failed", seq=recovered.get("seq"))
+                replay_failed = True
                 break
-            highest_contiguous_ok_seq = recovered["seq"]
-        if highest_contiguous_ok_seq is not None:
-            self._quality_wal.checkpoint(up_to_seq=highest_contiguous_ok_seq)
+        # Batching: replayed rows sit in quality_writer's buffer. Force them
+        # durable now (one-time startup cost); on_segment_durable then
+        # checkpoints exactly the contiguous published prefix. A crash before
+        # this completes leaves them in the WAL, uncheckpointed -- correct.
+        try:
+            self.quality_writer.publish_open_segment()
+        except Exception as exc:
+            logger.error("quality_event_recovery_publish_failed", error=str(exc))
+            self._block_quality_checkpoint("recovery_publish_failed")
+        if replay_failed:
+            self._block_quality_checkpoint("recovery_persist_failed")
 
     def _websocket_quality_event(self, event_type, reason, connection_id=None, stream_group="websocket"):
         """Websocket hot path: bounded non-blocking enqueue only, never parquet I/O.
@@ -363,96 +486,133 @@ class CollectorApp:
         if not hasattr(self, "_quality_queue"):
             self._persist_quality_event(event)
             return
+        self._ensure_quality_state()
         wal = getattr(self, "_quality_wal", None)
         if wal is not None:
             try:
                 event_type_value = event_type.value if isinstance(event_type, QualityEventType) else event_type
                 event_id = wal.append({**event, "event_type": event_type_value})
-                event["quality_event_id"] = event_id
-                event["_wal_seq"] = int(event_id.rsplit("-", 1)[-1])
-            except OSError:
-                # The WAL itself could not durably record this event.
-                # Queueing it now would only reintroduce the very loss
-                # window this mechanism exists to close, so it is
-                # persisted directly and synchronously instead (still
-                # fsync'd, via quality_writer's segment_rows=1) rather
-                # than silently dropped.
+            except Exception as wal_exc:  # noqa: BLE001 - any append failure, not only OSError
+                # The WAL could not durably record this event. Queueing it
+                # would reintroduce the loss window, so it is persisted
+                # directly instead -- and _persist_quality_event, seeing no
+                # WAL provenance, force-publishes it (never a RAM-only row).
+                # The id was assigned before the failure and bytes may already
+                # be in the WAL file (write+flush ok, fsync failed): stamping
+                # it makes any WAL-resident copy reconcilable by id.
                 logger.error("quality_wal_append_failed", reason=reason)
+                event["quality_event_id"] = getattr(wal_exc, "quality_event_id", None)
                 try:
                     self._persist_quality_event(event)
-                except Exception:
-                    # Both the WAL and the direct Parquet fallback failed
-                    # -- a genuine double failure (most plausibly a real
-                    # disk-full or permissions catastrophe), not merely
-                    # "the WAL is unavailable". This event may actually be
-                    # lost, and that must never be silently claimed
-                    # otherwise -- but this method is called synchronously
-                    # from the websocket receive/processing path, so
-                    # letting the exception propagate would crash far more
-                    # than this one quality event (the whole connection's
-                    # consume/processing task). Logged loudly and
-                    # distinctly from the single-failure case, then
-                    # swallowed here deliberately: market-data capture
-                    # remains the primary mission even when the
-                    # quality-event durability mechanism has doubly
-                    # failed.
+                except Exception:  # noqa: BLE001
+                    # WAL and direct persistence both failed. A WAL copy may
+                    # exist and may be the only record: never let a later
+                    # checkpoint cover it. Not re-raised -- this is the
+                    # websocket hot path and market data is the mission.
                     logger.error("quality_event_double_failure_possible_loss", reason=reason)
+                    self._block_quality_checkpoint("wal_and_direct_persist_both_failed")
                 return
+            event["quality_event_id"] = event_id
+            event["_wal_seq"] = int(event_id.rsplit("-", 1)[-1])
+            # In-flight from the moment it is WAL-durable: while this event
+            # sits in the queue it must hold the checkpoint back.
+            self._quality_wal_inflight.add(event["_wal_seq"])
         try:
             self._quality_queue.put_nowait(event)
         except asyncio.QueueFull:
-            # The event is already durable in the WAL above -- a full
-            # queue only delays its Parquet persistence, it does not lose
-            # it. Recovery on restart (or the persistence loop catching
-            # up) still finds it. Counted for observability only.
+            # The queue stays bounded. The event is durable in the WAL but
+            # will never be drained by the persistence loop, and its seq is
+            # in-flight (it would pin the checkpoint forever), so it is
+            # persisted directly and synchronously -- deliberate: overflow
+            # means persistence has fallen behind. If even that fails the
+            # checkpoint is latched off and the WAL copy is retained for
+            # restart recovery.
             self._quality_overflow += 1
-            logger.error("quality_event_queue_overflow", dropped=self._quality_overflow)
+            logger.error("quality_event_queue_overflow", overflowed=self._quality_overflow)
+            try:
+                self._persist_quality_event(event)
+            except Exception:  # noqa: BLE001
+                self._quality_overflow_unpersisted += 1
+                logger.error("quality_event_overflow_direct_persist_failed", reason=reason)
+                self._block_quality_checkpoint("queue_overflow_direct_persist_failed")
 
     async def _quality_persistence_loop(self):
-        wal = getattr(self, "_quality_wal", None)
-        # Area 4 / Area 13: once a persist fails, checkpointing must never
-        # advance again this process's lifetime -- seq values arrive here
-        # strictly sequentially (single producer: _websocket_quality_event's
-        # own WAL-append-then-enqueue path is the only source of
-        # _wal_seq-carrying items), so a skipped seq would otherwise leave
-        # an undetectable gap under whatever the next successful
-        # checkpoint(N) claims. The failed event, and everything the WAL
-        # ever holds from this point on, stays recoverable and gets
-        # reconciled (as a duplicate-but-same-quality_event_id row where
-        # applicable) on the next restart instead.
-        checkpoint_blocked = False
+        """Drain the queue into Parquet. Must survive any single bad event: a
+        dead loop leaves the queue undrained and makes shutdown's
+        queue.join() hang. Checkpointing is NOT done here -- it happens only
+        in _on_quality_segment_durable, after a segment is published."""
         while self.running or not self._quality_queue.empty():
             try:
-                event=await asyncio.wait_for(self._quality_queue.get(), timeout=0.1)
+                event = await asyncio.wait_for(self._quality_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
+                self._quality_publish_if_due()
                 continue
             try:
                 self._persist_quality_event(event)
-            except Exception:
-                # This task must survive one bad event -- an unhandled
-                # exception here would silently kill the persistence loop
-                # for the rest of the process's life (nothing awaits this
-                # background task while it's running), leaving the queue
-                # to accept items forever with nothing draining them.
+            except Exception:  # noqa: BLE001
                 logger.error("quality_event_persist_failed", event_type=event.get("event_type"))
-                checkpoint_blocked = True
+                self._block_quality_checkpoint("persist_failed")
+            finally:
                 self._quality_queue.task_done()
-                continue
-            self._quality_queue.task_done()
-            wal_seq = event.get("_wal_seq")
-            if wal is not None and wal_seq is not None and not checkpoint_blocked:
-                wal.checkpoint(up_to_seq=wal_seq)
-                wal.maybe_rotate_for_size()
         if self._quality_overflow:
-            self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,
-                "reason":"quality_queue_overflow", "rows_lost":self._quality_overflow})
+            # Not a loss claim: overflowed events were persisted directly (or,
+            # if that failed, retained in the WAL with checkpointing latched).
+            unpersisted = getattr(self, "_quality_overflow_unpersisted", 0)
+            try:
+                self._persist_quality_event({"stream": "quality_events", "event_type": QualityEventType.ERROR,
+                    "reason": f"quality_queue_overflow:total={self._quality_overflow};"
+                              f"direct_persist_failed={unpersisted};wal_retained_for_recovery={unpersisted}",
+                    "rows_lost": None})
+            except Exception:  # noqa: BLE001
+                logger.error("quality_overflow_summary_persist_failed")
+                self._block_quality_checkpoint("overflow_summary_persist_failed")
 
     def _persist_quality_event(self, event: dict):
-        """Persist versioned lineage. Missing values remain null rather than fabricated."""
+        """Single choke point for EVERY quality event (~14 direct call sites,
+        the queue loop, recovery replay).
+
+        Durability contract: before the event can sit in quality_writer's RAM
+        buffer it is WAL-protected -- unless it already carries WAL provenance
+        (``_wal_seq``: appended by _websocket_quality_event or replayed from
+        the WAL). Its seq is tracked in-flight until the segment holding it is
+        published; only then may the checkpoint cover it.
+
+        If the WAL append fails the event is still written, but with no WAL
+        record backing it a crash would lose it, so the open segment is
+        force-published immediately (the pre-batching behaviour). If THAT
+        fails the exception propagates and the checkpoint is latched.
+        """
+        self._ensure_quality_state()
+        wal = getattr(self, "_quality_wal", None)
+        wal_seq = event.get("_wal_seq")
+        wal_protected = wal is not None and wal_seq is not None
+        if wal is not None and wal_seq is None:
+            event_type_for_wal = event.get("event_type", QualityEventType.ERROR.value)
+            if isinstance(event_type_for_wal, QualityEventType):
+                event_type_for_wal = event_type_for_wal.value
+            try:
+                event_id = wal.append({k: v for k, v in event.items() if k != "_wal_seq"}
+                                      | {"event_type": event_type_for_wal})
+            except Exception as exc:  # noqa: BLE001
+                logger.error("quality_event_wal_append_failed_in_persist", reason=event.get("reason"))
+                failed_id = getattr(exc, "quality_event_id", None)
+                if failed_id is not None:
+                    # A WAL record may exist for this seq: keep the id on the
+                    # row and hold the checkpoint below it until published.
+                    if event.get("quality_event_id") is None:
+                        event = {**event, "quality_event_id": failed_id}
+                    wal_seq = int(failed_id.rsplit("-", 1)[-1])
+            else:
+                if event.get("quality_event_id") is None:
+                    event = {**event, "quality_event_id": event_id}
+                wal_seq = int(event_id.rsplit("-", 1)[-1])
+                wal_protected = True
+        if wal_seq is not None:
+            self._quality_wal_inflight.add(wal_seq)
         rows_lost = event.get("rows_lost"); event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType): event_type = event_type.value
         local_ts = event.get("local_ts", event.get("timestamp", int(time.time() * 1000)))
-        self.quality_writer.write({"timestamp": local_ts, "exchange": event.get("exchange", "BINANCE"),
+        row = {"timestamp": local_ts, "exchange": event.get("exchange", "BINANCE"),
             "stream": event.get("stream", "orderbook"), "event_type": event_type, "reason": event.get("reason", ""),
             "gap_size_ms": event.get("gap_size_ms"), "rows_lost": None if rows_lost is None else str(rows_lost),
             "quality_state": event.get("new_state", event.get("quality_state", self.binance_book.state.state.value)),
@@ -461,7 +621,28 @@ class CollectorApp:
             "actual_previous_update_id": event.get("actual_previous_update_id"), "update_id": event.get("update_id"), "first_update_id": event.get("first_update_id"),
             "previous_update_id": event.get("previous_update_id"),
             "local_receive_ts": event.get("local_receive_ts"), "local_process_ts": event.get("local_process_ts", local_ts),
-            "quality_event_id": event.get("quality_event_id")})
+            "quality_event_id": event.get("quality_event_id")}
+
+        def _bind(_token, _seq=wal_seq):
+            # Called by the writer AFTER any hour rollover and BEFORE the
+            # append: attributes this seq to the segment that will really
+            # contain the row (a rollover publish inside this very write()
+            # must not count an event that is not in that segment).
+            if _seq is not None:
+                self._quality_segment_seqs.add(_seq)
+        try:
+            self.quality_writer.write(row, bind=_bind)
+        except Exception:
+            # Writer state is now uncertain (buffered row may be unwritable,
+            # segment may be half-closed): fail closed, event stays in WAL.
+            self._block_quality_checkpoint("quality_writer_write_failed")
+            raise
+        if not wal_protected:
+            try:
+                self.quality_writer.publish_open_segment()
+            except Exception:
+                self._block_quality_checkpoint("unprotected_event_publish_failed")
+                raise
 
     def _record_book_quality(self, kind, reason, transition=None, event=None):
         transition=transition or self.binance_book.last_transition
@@ -1050,12 +1231,28 @@ class CollectorApp:
         # out of shutdown() and abort every writer still left in this list,
         # including quality_writer itself. One writer's finalization failure
         # must never silently cost every OTHER writer's still-buffered data.
+        #
+        # P0-2/P0-3 order: intake is stopped above -> drain whatever is still
+        # queued -> close the other writers (their failure reports are
+        # quality events, WAL-protected and buffered) -> close quality_writer,
+        # which PUBLISHES the final partial segment and thereby checkpoints
+        # its WAL seqs -> only then close the WAL (the publish hook needs it).
+        self._drain_quality_queue_sync()
         for writer_name in ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
                             "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer", "raw_rest_writer"):
             self._close_writer_reporting_failure(writer_name)
-        self._close_writer_reporting_failure("quality_writer")
+        if not self._close_writer_reporting_failure("quality_writer"):
+            # Final segment not published: its events stay in the WAL,
+            # uncheckpointed, and are replayed by the next startup.
+            self._block_quality_checkpoint("quality_writer_close_failed")
+        wal = getattr(self, "_quality_wal", None)
+        if wal is not None:
+            try:
+                wal.close()
+            except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
+                logger.error("quality_wal_close_failed", error=str(exc))
 
-    def _close_writer_reporting_failure(self, writer_name: str) -> None:
+    def _close_writer_reporting_failure(self, writer_name: str) -> bool:
         """Close one writer; on failure, report it and still return.
 
         Never lets one writer's close() raise past this point: shutdown must
@@ -1065,10 +1262,12 @@ class CollectorApp:
         """
         writer = getattr(self, writer_name, None)
         if writer is None:
-            return
+            return True
+        closed_ok = True
         try:
             writer.close()
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
+            closed_ok = False
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
             if writer_name != "quality_writer":
                 try:
@@ -1083,6 +1282,7 @@ class CollectorApp:
         msg = "Collector Application Shutdown"
         logger.info(msg)
         send_telegram_alert(msg)
+        return closed_ok
 
 if __name__ == "__main__":
     validate_telegram_startup()

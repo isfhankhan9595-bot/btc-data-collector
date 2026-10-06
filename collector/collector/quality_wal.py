@@ -137,6 +137,7 @@ class QualityEventWAL:
         self._active_path = self._new_wal_path()
         self._handle = open(self._active_path, "a", encoding="utf-8")
         self._write_failed = False
+        self._closed = False
 
     def _new_wal_path(self) -> Path:
         stamp = time.strftime("%Y-%m-%d-%H%M%S", time.gmtime())
@@ -153,14 +154,30 @@ class QualityEventWAL:
         with self._lock:
             self._seq += 1
             event_id = f"{self.process_start_marker}-{self._seq}"
+            if self._closed:
+                # Explicit, loud, and an OSError so callers that already
+                # treat "the WAL could not durably record this" as one
+                # failure class (fall back / report) handle a late append
+                # during teardown the same way, rather than seeing an
+                # incidental ValueError from a closed file object.
+                exc = OSError("quality WAL is closed")
+                exc.quality_event_id = event_id
+                raise exc
             record = {"quality_event_id": event_id, "seq": self._seq, **event}
             line = json.dumps(record, default=str)
             try:
                 self._handle.write(line + "\n")
                 self._handle.flush()
                 os.fsync(self._handle.fileno())
-            except OSError:
+            except OSError as exc:
                 self._write_failed = True
+                # The id was already assigned and bytes may already be in
+                # the file (e.g. write() and flush() succeeded but fsync()
+                # failed). Attach it so a caller that falls back to a
+                # direct write can stamp the SAME id on that row -- a
+                # WAL-resident copy recovered later is then reconcilable
+                # by id instead of being an anonymous duplicate.
+                exc.quality_event_id = event_id
                 raise
             return event_id
 
@@ -174,14 +191,19 @@ class QualityEventWAL:
         with self._lock:
             if up_to_seq <= self._checkpointed_seq:
                 return
-            self._checkpointed_seq = up_to_seq
             checkpoint_path = self.wal_dir / CHECKPOINT_FILENAME
             tmp = checkpoint_path.with_suffix(".json.tmp")
             with tmp.open("w", encoding="utf-8") as handle:
-                json.dump({"checkpointed_seq": self._checkpointed_seq}, handle)
+                json.dump({"checkpointed_seq": up_to_seq}, handle)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, checkpoint_path)
+            # In-memory state advances ONLY after the durable replace
+            # succeeded. Advancing it first (the previous order) meant a
+            # failed write left this object claiming a checkpoint that
+            # never reached disk, and made an immediate retry of the
+            # same seq a silent no-op via the guard above.
+            self._checkpointed_seq = up_to_seq
             self._delete_fully_checkpointed_files()
 
     def _delete_fully_checkpointed_files(self) -> None:
@@ -190,7 +212,14 @@ class QualityEventWAL:
                 continue  # never delete the file currently being appended to
             max_seq = _max_seq_in_file(wal_file)
             if max_seq is not None and max_seq <= self._checkpointed_seq:
-                wal_file.unlink(missing_ok=True)
+                try:
+                    wal_file.unlink(missing_ok=True)
+                except OSError:
+                    # The checkpoint is already durable, so a file we
+                    # could not delete is harmless: recover() filters by
+                    # seq, so it contributes nothing pending, and the
+                    # next checkpoint() retries the deletion.
+                    continue
 
     def maybe_rotate_for_size(self) -> None:
         """Open a new WAL file if the active one has grown past max_bytes.
@@ -199,14 +228,26 @@ class QualityEventWAL:
         elsewhere."""
         with self._lock:
             if self._active_path.exists() and self._active_path.stat().st_size >= self.max_bytes:
+                # Order matters: make the old file durable, open the new
+                # one, and only then close the old. If any step raises,
+                # self._handle is still the original, open, valid file --
+                # a failed rotation must never leave the WAL holding a
+                # closed handle that turns every later append into a
+                # ValueError.
                 self._handle.flush()
                 os.fsync(self._handle.fileno())
-                self._handle.close()
-                self._active_path = self._new_wal_path()
-                self._handle = open(self._active_path, "a", encoding="utf-8")
+                new_path = self._new_wal_path()
+                new_handle = open(new_path, "a", encoding="utf-8")
+                old_handle = self._handle
+                self._handle = new_handle
+                self._active_path = new_path
+                old_handle.close()
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._handle.flush()
             os.fsync(self._handle.fileno())
             self._handle.close()

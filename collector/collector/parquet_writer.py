@@ -130,6 +130,8 @@ class ParquetWriter:
         quality_event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
         exchange: str = "BINANCE",
         on_segment_published: Optional[Callable[[Tuple[str, int], Path], None]] = None,
+        on_segment_durable: Optional[Callable[[Path, int], None]] = None,
+        age_from_first_row: bool = False,
     ) -> None:
         if segment_rows <= 0 or segment_seconds <= 0:
             raise ValueError("segment_rows and segment_seconds must be positive")
@@ -147,6 +149,21 @@ class ParquetWriter:
         #: P0-4: called after a segment is durably published (fsync+rename+dir
         #: fsync) with ``((hour, seq), final_path)``. None = no behaviour change.
         self.on_segment_published = on_segment_published
+        #: P0-3, deliberately a DIFFERENT API from ``on_segment_published``
+        #: above (different signature ``(final_path, record_count)``, different
+        #: failure contract). Called once per segment, only after the segment
+        #: is durably published: fsync'd, atomically renamed, and the parent
+        #: directory fsync'd. Never called for a segment whose publication
+        #: raised. A hook failure is logged and NEVER un-publishes the segment
+        #: and NEVER poisons the writer (unlike ``on_segment_published``): the
+        #: hook's owner must latch its own failure state.
+        self.on_segment_durable = on_segment_durable
+        #: When True, ``segment_seconds`` is measured from the segment's first
+        #: row instead of from when the (possibly long-idle) segment was
+        #: opened. Without it, the first event after a quiet spell publishes
+        #: as a 1-row file -- the tiny-file pattern for sparse streams.
+        self._age_from_first_row = age_from_first_row
+        self._first_row_monotonic: Optional[float] = None
         self._publication_failure: Optional[BaseException] = None
         self._lock_handle: Optional[IO[bytes]] = _acquire_writer_lock(self.stream_dir)
         try:
@@ -321,6 +338,15 @@ class ParquetWriter:
         self.record_count = 0
         self._first_record_ts = self._last_record_ts = None
         self._segment_opened_monotonic = time.monotonic()
+        self._first_row_monotonic = None
+
+    def _segment_age(self) -> float:
+        start = self._segment_opened_monotonic
+        if self._age_from_first_row:
+            if self._first_row_monotonic is None:
+                return 0.0
+            start = self._first_row_monotonic
+        return time.monotonic() - start
 
     def _persist_counter(self) -> None:
         assert self._counter_filepath is not None
@@ -361,14 +387,16 @@ class ParquetWriter:
         if bind is not None:
             bind((self.current_hour, self._seq))
         self.buffer.append(record)
+        if self._first_row_monotonic is None:
+            self._first_row_monotonic = time.monotonic()
         ts = _epoch_ms(record.get("timestamp"))
         if self._first_record_ts is None:
             self._first_record_ts = ts
         self._last_record_ts = ts
         if (len(self.buffer) >= 1_000 or self.record_count + len(self.buffer) >= self.segment_rows
-                or time.monotonic() - self._segment_opened_monotonic >= self.segment_seconds):
+                or self._segment_age() >= self.segment_seconds):
             self.flush()
-        if self.record_count >= self.segment_rows or time.monotonic() - self._segment_opened_monotonic >= self.segment_seconds:
+        if self.record_count >= self.segment_rows or self._segment_age() >= self.segment_seconds:
             self._close_segment(open_next=True)
 
     def flush(self) -> None:
@@ -399,6 +427,14 @@ class ParquetWriter:
         finally:
             os.close(parent_fd)
         counter.unlink(missing_ok=True)
+        # P0-3: durable-publication callback. Placed strictly AFTER the
+        # rename and the directory fsync -- the only point at which a caller
+        # may treat the rows of this segment as durable.
+        if self.on_segment_durable is not None:
+            try:
+                self.on_segment_durable(final, self.record_count)
+            except Exception as exc:  # noqa: BLE001 - segment is durable; the owner latches its own state
+                logger.error("segment_durable_hook_failed", file=str(final), error=f"{type(exc).__name__}: {exc}")
         # The segment is already durably published above. A metadata failure
         # must therefore never propagate: it would kill the ingest task over a
         # sidecar hint while the data itself is safely on disk. Surface it as a
@@ -435,6 +471,27 @@ class ParquetWriter:
         if open_next:
             self._seq += 1
             self._open_segment()
+
+    def has_unpublished_rows(self) -> bool:
+        return self.writer is not None and (self.record_count > 0 or bool(self.buffer))
+
+    def publish_open_segment(self) -> None:
+        """Publish the open segment now (if it holds rows) and open the next.
+        A no-op when nothing is pending, so an idle stream never produces an
+        empty segment. Raises if publication fails (nothing is claimed durable)."""
+        if not self.has_unpublished_rows():
+            return
+        self._close_segment(open_next=True)
+
+    def publish_if_due(self) -> bool:
+        """Time-based publish. ``segment_seconds`` is otherwise only evaluated
+        inside write(); there is no background timer, so a stream that goes
+        idle would keep its tail in RAM indefinitely. A caller with an idle
+        tick calls this. Returns True if a segment was published."""
+        if self.has_unpublished_rows() and self._segment_age() >= self.segment_seconds:
+            self._close_segment(open_next=True)
+            return True
+        return False
 
     def close(self) -> None:
         """Publish the open segment and release the stream directory lock."""

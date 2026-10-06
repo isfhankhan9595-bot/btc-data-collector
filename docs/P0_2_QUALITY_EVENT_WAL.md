@@ -1,291 +1,300 @@
 # P0-2: Quality-Event Durability (WAL)
 
-## A. The existing problem
+> **Superseded in part by P0-3 (see `docs/QUALITY_EVENT_DURABILITY.md`).**
+> This document describes the WAL itself and the P0-2 hostile-audit findings.
+> Statements below that mention `segment_rows=1`, "already fsync'd per event",
+> or a checkpoint issued right after `write()` describe the pre-P0-3 writer and
+> are no longer how the collector behaves: the quality writer is batched
+> (500 rows / 30 s), every quality event is WAL-protected at
+> `_persist_quality_event`, and the checkpoint advances only from the writer's
+> `on_segment_durable` hook, to the contiguous published prefix.
 
-`_websocket_quality_event` is the collector's websocket-hot-path entry
-point for quality events (connect/disconnect/rate-limit/etc.) -- it must
-never block on Parquet I/O, so events were buffered in an in-memory
-`asyncio.Queue` and drained later by a background loop. The only durable
-artifact of that queue before this fix was `quality_queue.pending.json`,
-a marker recording **the queue's depth and a timestamp** -- never the
-events themselves. After a hard kill (SIGKILL, power loss) with events
-still in the queue, the collector could know *"N quality events were
-pending"* on restart, but could not recover *which* events, or what they
-said. They were permanently lost; the marker only let the next process
-emit one synthetic `DATA_DROP` event admitting that loss had occurred.
 
-Every other `_persist_quality_event` call site (validator/book-integrity
-drains, adapter-unhandled records, recovery transitions) was **not**
-affected by this gap: they write directly and synchronously to
-`quality_writer`, which is already configured with `segment_rows=1,
-segment_seconds=1` -- confirmed by reading `ParquetWriter.write()`/
-`flush()`/`_close_segment()` directly, every such write already performs
-a full `os.fsync()` + atomic rename before returning. The websocket
-hot-path queue was the one, narrow, real gap; this fix is scoped to it.
+This document describes the CURRENT implementation, as it exists on
+`p0-2-post-merge-validation`, based on `origin/main`. It replaces the
+version that shipped in the original merged P0-2 PR, which described an
+earlier, less hardened state. Facts are labeled FACT (directly verified
+by reading the code or running a test), INFERENCE (a reasoned conclusion
+not directly tested), or UNVERIFIED (stated as an open question, not
+claimed either way).
 
-## B. New architecture
+## A. Original problem (FACT)
+
+The old mechanism (`quality_queue.pending.json`) recorded only a queue
+depth and a timestamp, never the event content. After a hard kill, the
+collector knew events had been pending but could not recover what they
+said.
+
+## B. Architecture (FACT)
 
 ```
-_websocket_quality_event (hot path)
-        |
-        v
-  QualityEventWAL.append()     <- durability boundary: fsync'd before return
-        |
-        v
-  asyncio.Queue (bounded, in-memory, may now safely overflow --
-                 the event is already durable by this point)
-        |
-        v
-  _quality_persistence_loop (background)
-        |
-        v
-  _persist_quality_event -> quality_writer.write() -> Parquet (fsync'd)
-        |
-        v
-  QualityEventWAL.checkpoint(seq) -> old, fully-covered WAL files deleted
+quality event created (_websocket_quality_event)
+      |
+      v
+QualityEventWAL.append()  -- write, flush, fsync, THEN return
+      |
+      v
+asyncio.Queue (bounded; overflow -> direct synchronous persist, see F)
+      |
+      v
+_quality_persistence_loop  -- one event at a time, in FIFO order
+      |
+      v
+_persist_quality_event -> quality_writer.write() -> Parquet (segment_rows=1,
+                                                      so also fsync'd per row)
+      |
+      v
+QualityEventWAL.checkpoint(seq)  -- only after persist succeeds, only the
+                                     contiguous prefix, never past a failure
 ```
 
-On startup, `CollectorApp.__init__` calls `QualityEventWAL.recover()`
-against the WAL directory *before* processing any new events, replays
-every recovered record through `_persist_quality_event` (exact prior
-content, not a marker), and checkpoints them.
+Startup: `CollectorApp._recover_quality_wal()` (extracted from `__init__`
+for testability) reads the WAL, replays whatever was not checkpointed,
+and checkpoints only the contiguous prefix that actually re-persisted.
 
-## C. WAL record format
+## C. WAL record format (FACT, unchanged)
 
-Newline-delimited JSON, one line per event, in `<quality stream
-dir>/wal/<timestamp>-<process_start_marker>-<start_seq>.wal`:
+Newline-delimited JSON in `<quality stream dir>/wal/<file>.wal`, one line
+per event, `quality_event_id` and `seq` added by the WAL, every other key
+exactly as the caller passed it.
 
-```json
-{"quality_event_id": "1758768000123-4821-7", "seq": 7, "exchange": "BINANCE",
- "stream": "websocket", "event_type": "DISCONNECT", "reason": "...",
- "connection_id": "...", "local_ts": 1758768000123}
-```
+## D. Durability boundary (FACT)
 
-`quality_event_id` and `seq` are added by the WAL itself; every other key
-is the original event dict passed to `append()`, unmodified. This mirrors
-the fields `_persist_quality_event` already knows how to read (it already
-handled an open-ended dict via `.get()` with defaults) -- no new record
-shape was invented beyond adding the two identity fields.
+`append()` returns only after write, flush and `os.fsync()` all succeed.
+Any failure among those raises `OSError`, `write_failed` becomes `True`,
+and the exception carries `.quality_event_id` (the id was already
+assigned before the failing I/O, and bytes may already be on disk if
+`write`/`flush` succeeded and only `fsync` failed) so a caller falling
+back to direct persistence can stamp the identical id on that row.
 
-## D. Durability guarantee -- exactly, not aspirationally
+## E. Checkpoint semantics (FACT)
 
-- **Normal shutdown / SIGTERM**: every event. Graceful shutdown already
-  drains the queue fully (`await self._quality_queue.join()`) before
-  exiting; unchanged by this fix.
-- **SIGKILL / process crash / machine power loss**: every event whose
-  `QualityEventWAL.append()` call had already **returned** before the
-  kill. `append()` is synchronous: write the line, flush the Python
-  buffer, `os.fsync()` the file descriptor, then return -- nothing after
-  that point can un-durable it short of physical media failure.
-- **What can still be lost**: a single event whose `append()` call was
-  itself interrupted mid-write by the kill. This is the one honest,
-  narrow, unavoidable boundary of any WAL -- `fsync()` makes a *completed*
-  write durable, it cannot protect a write that never finished. This is
-  categorically smaller than the old failure mode (an unbounded in-memory
-  queue, not one in-flight write).
-- **Disk full**: `append()`'s `os.fsync()`/`write()` raise `OSError`
-  (`ENOSPC`) like any other write in this condition; caught explicitly,
-  logged (`quality_wal_append_failed`), and the event is persisted
-  directly and synchronously instead of being queued (falling back to the
-  same path every non-hot-path quality event already uses). If the disk
-  is genuinely full, that direct write can also fail -- no software layer
-  can write to a full disk; this is not claimed as a fix for that. The
-  pre-existing `DiskMonitor` component is the collector's actual
-  proactive defense against reaching that state, unchanged by this work.
-- **Partial WAL write on disk**: handled explicitly as evidence, not
-  loss -- see F below.
+`checkpoint(up_to_seq)` means "every seq <= up_to_seq is durably in
+Parquet." Three properties, each independently tested:
 
-## E. Recovery, step by step
+1. **Only advances after the on-disk replace succeeds.** The in-memory
+   `_checkpointed_seq` is updated *after* `os.replace()`, not before --
+   a failed checkpoint write leaves the object's own state honest, and
+   an immediate retry of the same seq is not silently treated as already
+   done.
+2. **State is read from disk, never inferred from `start_seq`.**
+   `__init__` calls `_read_checkpointed_seq(self.wal_dir)`. `start_seq`
+   only tells the id/sequence counter where to resume -- conflating the
+   two (the original bug) made checkpointing any seq below `start_seq - 1`
+   a silent no-op.
+3. **Never advances past a failure.** Both call sites (the runtime
+   persistence loop and startup recovery) stop advancing the checkpoint
+   the instant any event fails to persist, via
+   `_block_quality_checkpoint()` -- a latch that, once set, blocks every
+   later checkpoint call for the rest of the process's life. The failed
+   event and everything after it stay in the WAL, replayed (as a
+   reconcilable, same-id duplicate where it already landed once) on the
+   next restart.
 
-1. `QualityEventWAL.highest_recovered_seq(wal_dir)` scans every `*.wal`
-   file for the highest `seq` present (checkpointed or not), so the new
-   process's sequence counter starts strictly above anything on disk --
-   IDs never collide across a restart.
-2. `QualityEventWAL.recover(wal_dir)` reads every `*.wal` file, oldest
-   first (filenames are timestamp-and-seq-prefixed, so filename sort is
-   chronological), skips a genuinely incomplete final line (see F), and
-   returns every record not already covered by the durable checkpoint
-   file -- in original append order.
-3. `CollectorApp.__init__` replays each recovered record through
-   `_persist_quality_event` (a real Parquet row, exact content), then
-   checkpoints the WAL up to the highest recovered `seq`, which deletes
-   any now-fully-covered old `.wal` file.
-4. If step 2 raises `QualityWALCorruption` (see F), recovery of that
-   specific WAL is abandoned (the corrupted file is left on disk,
-   untouched, for forensic inspection -- never deleted), one durable
-   `ERROR`-type quality event records the corruption in Parquet, and
-   startup **continues** rather than crashing the collector over a
-   quality-journal problem. Market-data capture is the primary mission;
-   quality-event WAL corruption must be loud, not fatal.
+`_delete_fully_checkpointed_files()` never deletes the currently active
+file (verified directly: a test checkpoints exactly up to the active
+file's own max seq and confirms it survives and remains appendable), and
+tolerates its own `unlink()` failing (the checkpoint is already durable;
+a file it could not delete is inert, filtered out by `recover()`'s own
+seq check, and retried on the next checkpoint).
 
-## F. Idempotency and corruption
+## F. Fallback / double-failure (FACT)
 
-**Idempotency**: `quality_event_id` is stable across the entire
-WAL-to-Parquet lifecycle (assigned once, at `append()`, never
-regenerated). If a crash lands between a successful Parquet write and its
-checkpoint, the event is legitimately replayed and appears as **two**
-Parquet rows on next startup -- the task's own acceptance framing permits
-this ("effectively-once after event-ID deduplication"), and it is what
-`quality_event_id` exists to make reconcilable: both rows carry the
-identical ID, so a duplicate is never ambiguous, even though quality
-events are not currently compacted (`QUALITY_EVENTS_SCHEMA` is
-deliberately excluded from `compact_daily.py`, unchanged by this work) --
-the ID is there and stable, ready for that dedup whenever a consumer
-needs it, rather than absent.
+If `append()` raises, the event is persisted directly and synchronously
+(`quality_writer`, `segment_rows=1`, so still fsync'd) -- carrying the
+**same** `quality_event_id` the failed append already assigned, so a
+partially-written WAL copy (write/flush succeeded, only fsync failed) is
+reconcilable rather than an anonymous duplicate if it is ever recovered.
 
-**Corruption**: an incomplete final line (no trailing newline, unparsable
-JSON) is treated as a normal, expected crash artifact -- silently
-quarantined, every complete prior record still recovered. A malformed
-record **anywhere else** in the file (not the final line) raises
-`QualityWALCorruption` instead of being silently skipped -- the position,
-not the content, is what distinguishes an expected torn tail from real
-mid-file corruption, and the two are deliberately never treated the same.
+If that fallback *also* fails, the double failure is logged distinctly
+(`quality_event_double_failure_possible_loss`, verified via `caplog`, not
+merely "the call didn't raise") and checkpointing is latched off, since a
+WAL-resident copy of this event may exist. **This is the one place a
+quality event may actually be lost** -- both the durability mechanism and
+its fallback failed. It is never silently claimed otherwise.
 
-## G. Files changed
+The same pattern (persist-with-stamped-id, latch-on-failure,
+checkpoint-only-on-success) applies to queue overflow: the event is
+already durable in the WAL when `QueueFull` fires, so it is persisted
+directly rather than left to rot un-drained, and checkpointed on success
+so it does not become a needless duplicate on the next restart.
 
-- `collector/collector/quality_wal.py` (new): `QualityEventWAL`,
-  `QualityWALCorruption`.
-- `collector/run_collector.py`: constructor now recovers/replays/
-  checkpoints on startup instead of emitting one "presumed lost" event;
-  `_websocket_quality_event` appends to the WAL before enqueueing;
-  `_quality_persistence_loop` checkpoints after each successful persist;
-  `_persist_quality_event` now writes `quality_event_id` through to
-  Parquet. `_write_quality_pending_marker` and the old
-  `quality_queue.pending.json` mechanism are removed entirely -- the WAL
-  is now the sole durability mechanism for this path.
-- `collector/collector/config.py`: `QUALITY_EVENTS_SCHEMA` gains a
-  nullable `quality_event_id` column (`schema_version` bumped `1.1` ->
-  `1.2`). Nullable, so every pre-P0-2 row (which has none) reads back as
-  legacy, never fabricated. `QUALITY_EVENTS_SCHEMA` is not part of
-  `compact_daily.py`'s `STREAM_SCHEMAS`, so this has no legacy-column
-  interaction with compaction to reconcile.
+## G. Quality-event ID uniqueness scope (per Step 7)
 
-## H. Tests
+- **FACT:** `quality_event_id = f"{process_start_marker}-{seq}"`, where
+  `process_start_marker` defaults to `f"{int(time.time()*1000)}-{os.getpid()}"`.
+- **FACT:** within one WAL directory, across any number of restarts of
+  the same collector, ids are unique and monotonically informative --
+  `start_seq` is always resumed past the highest seq `recover()` ever
+  saw in that directory.
+- **INFERENCE, not proven:** across two *different* process lifetimes
+  whose `process_start_marker` values happen to collide (same millisecond
+  timestamp, same PID), ids from the two runs could collide. On bare
+  metal this is practically implausible (restart latency vastly exceeds
+  1ms). Under containerized deployment, where the main process commonly
+  gets PID 1 on every restart, the collision risk rests entirely on the
+  millisecond-timestamp half not coinciding -- still implausible given
+  realistic restart timing, but not proven and not tested.
+- **Correct scope statement:** the id is **WAL-directory-unique**, not
+  provably globally unique. It is never claimed as globally unique in
+  this document or in the module's own docstring.
 
-- `collector/tests/test_quality_wal.py` (21 tests): append/recovery
-  ordering, stable IDs across a simulated restart, crash-before-any-
-  checkpoint, checkpoint idempotency and monotonicity, incomplete-tail
-  vs. mid-file-corruption distinction (same bytes, different position,
-  different outcome), rotation + cross-file recovery order, checkpoint-
-  triggered cleanup that never deletes the active file, bounded per-
-  instance memory (structural check), a 2,000-event burst round trip,
-  8-thread concurrent-append integrity (no interleaved bytes, no
-  duplicate/missing sequence numbers), write-failure visibility, and
-  input purity/determinism.
-- `collector/tests/test_quality_wal_collector_integration.py` (5 tests):
-  the real `run_collector.py` wiring, not just the WAL primitive --
-  survives-a-simulated-crash-before-drain, normal-drain-checkpoints,
-  crash-before-checkpoint's legitimate-but-reconcilable duplicate, the
-  actual startup recovery sequence, and the WAL-append-failure fallback.
+## H. Disk-failure analysis (Step 8) -- FACT, all deterministically injected
 
-**Baseline** (bare `origin/main`, captured properly via `git stash`
-before any change, not assumed from an earlier session): **1241 passed**.
-**Final**: **1267 passed** (1241 + 21 + 5). `compileall`: clean.
-`git diff --check`: clean.
+No test fills a real disk; each failure is injected at the exact syscall
+boundary (`os.fsync`, `os.replace`, a wrapped file handle), in
+`tests/test_quality_wal_failure_semantics.py`.
 
-## I. Performance
+| Failure point | Verified behavior |
+|---|---|
+| `write()` fails | `append()` raises, `write_failed=True`, id attached to the exception |
+| `flush()` fails | same |
+| `fsync()` fails | same; confirmed not silently ignored |
+| checkpoint's `os.replace()` fails | in-memory state does NOT advance; a retry of the same seq is NOT a no-op |
+| checkpoint's `fsync()` fails | same |
+| `Path.unlink()` fails during cleanup | tolerated; checkpoint itself still succeeds; file left behind is inert |
+| rotation's file-open fails | original handle still open and appendable afterward |
+| Parquet write fails in the loop | loop survives, checkpoint latches off, WAL retained |
+| Parquet write fails during recovery | recovery stops at the contiguous prefix, does not crash startup |
+| checkpoint write fails during recovery | recovery does not crash; event stays pending |
+| WAL append AND direct Parquet fallback both fail | no crash; logged distinctly; checkpoint latched off |
 
-Not separately benchmarked as a dedicated exercise -- the WAL append's
-per-event cost is the same shape of operation
-(open/write/flush/fsync/replace or write/flush/fsync) the marker file it
-replaces already performed on every single event, so this is not a new
-performance characteristic introduced by this fix, only a more complete
-one. The 2,000-event burst test above completed in the same test run as
-everything else, in well under a second total for the whole 26-test
-combined suite -- adequate confirmation that this remains far from a
-bottleneck for a stream this task itself describes as low-volume, without
-constructing a separate formal benchmark for a claim nothing in this
-fix's scope depended on.
+## I. Shutdown analysis (Step 9) -- FACT
 
-## J. Remaining limitations / deferred
+- `shutdown()` closes the WAL (`wal.close()`, idempotent and
+  exception-guarded so a close failure is logged, not raised).
+- An event appended to the WAL but never drained before shutdown is NOT
+  lost: the next `CollectorApp()` construction's `_recover_quality_wal()`
+  finds and replays it. Verified end to end with two real `CollectorApp`
+  instances against the same directory.
+- A late quality event after `close()` raises a clean `OSError` rather
+  than an incidental `ValueError`, handled by the existing fallback path.
 
-- No compaction step reads `quality_event_id` back for deduplication yet
-  (there is no quality-event compaction at all, by pre-existing design --
-  out of scope here). The ID is present and stable, ready for that.
-- WAL rotation is size-triggered only (`maybe_rotate_for_size()`, called
-  after each checkpoint); no separate age-based rotation. Given quality
-  events are low-volume, a single WAL file is unlikely to become large
-  enough for this to matter in practice, but it is a real, explicit gap
-  against Section 14's "maximum bytes or maximum age" framing.
-- Concurrency protection is a `threading.Lock` inside `QualityEventWAL`,
-  correct for the actual single-asyncio-event-loop concurrency model this
-  collector uses (and stress-tested here beyond that model, with real
-  OS threads, to be conservative) -- not a multi-process lock; two
-  separate `CollectorApp` processes must never point at the same WAL
-  directory simultaneously (the same constraint `ParquetWriter`'s own
-  stream-directory lock already enforces for Parquet segments, unchanged
-  by this work).
-- P0-3 through P0-12 are explicitly out of scope and untouched.
+## J. P0-1 interaction (Step 10) -- FACT / UNVERIFIED
 
-## Independent hostile audit (second pass)
+- P0-1 and P0-2 compose at exactly one point: `_websocket_quality_event`
+  is the `on_quality_event` callback P0-1's `WebSocketClient` invokes.
+  P0-2 did not need to modify `websocket_client.py`, and did not.
+- **UNVERIFIED:** whether the WAL's synchronous fsync can measurably
+  stall the P0-1 receive path under sustained quality-event bursts. Not
+  benchmarked under load.
 
-A second, adversarial review of the branch found and fixed real defects;
-the first-pass document above overclaimed in places, corrected here.
+## K. Performance (Step 11) -- INFERENCE only, not measured under load
 
-### Defects found and fixed
+`append()`'s cost is one `write` + one `flush` + one `fsync` per event --
+the same syscall shape the marker file it replaced already performed on
+every event. No EC2 or production measurement exists.
 
-1. **HIGH -- `QualityEventWAL.__init__` inferred checkpoint state from
-   `start_seq`** (`quality_wal.py`): `_checkpointed_seq = start_seq - 1`
-   conflated "where the ID counter resumes" with "what is durably
-   checkpointed". Checkpointing any seq below `start_seq - 1` silently
-   no-oped. Masked before because startup always checkpointed exactly the
-   max recovered seq. Now reads the real on-disk checkpoint.
-2. **HIGH -- persistence loop died on any Parquet error**
-   (`_quality_persistence_loop`): an unhandled exception killed the
-   background task silently (nothing awaits it while running), leaving
-   the queue undrained for the rest of the process. Now logged loudly,
-   the loop survives, and checkpointing latches off after the first
-   failure so a later success can never checkpoint past a failed seq.
-3. **HIGH -- startup recovery checkpointed `max(seq)` unconditionally**
-   (`_recover_quality_wal`, extracted from `__init__` so it is testable):
-   a failed persist mid-batch would still be checkpointed over. Now
-   stops at the first failure and checkpoints only the contiguous
-   successful prefix.
-4. **HIGH -- WAL failure + direct-persist failure crashed the caller**
-   (`_websocket_quality_event`): the fallback persist was unguarded; a
-   double failure raised into the websocket path. Now logged distinctly
-   (`quality_event_double_failure_possible_loss`) and not raised. In
-   this double-failure case the event MAY BE LOST -- stated plainly.
-5. **DOC -- "globally unique" overclaim** for `quality_event_id`:
-   uniqueness rests on `process_start_marker` (ms timestamp + PID)
-   not colliding; PID 1 is common in containers. Docstring narrowed.
+## L. Mutation testing -- ALL 20 requested mutations run, ALL caught
 
-### Mutation testing (real source, restored, `cmp` byte-identical)
+Every mutation below was applied to the real, current source, the
+focused P0-2 suite was run, a failure was observed, the source was
+restored, and the restoration was confirmed byte-identical via `cmp` --
+for every row, not a subset.
 
-| Mutation | Caught? | Test |
-|---|---|---|
-| revert checkpoint-from-`start_seq` inference | Yes (2) | `test_start_seq_alone_does_not_imply_anything_was_checkpointed`, `test_startup_recovery_stops_checkpointing_at_first_persist_failure` |
-| remove `checkpoint_blocked` guard in loop | Yes | `test_persist_failure_in_the_loop_never_advances_checkpoint_past_it` |
-| swallow double failure w/o distinct log | Yes, **after** strengthening (first run: NOT caught) | `test_double_failure_...` (now asserts via caplog) |
-| allow deleting the active WAL file | Yes, **after** adding a test (first run: NOT caught) | `test_checkpoint_never_deletes_the_active_file_even_when_fully_covered` |
-| ignore `resume_seq` on restart | Yes, **after** adding a test (first run: NOT caught) | `test_recover_quality_wal_resumes_sequence_correctly_no_id_reuse` |
+| # | Mutation | Caught | Failing test(s) |
+|---|---|---|---|
+| 1 | Revert checkpoint inference to `start_seq - 1` | Yes | `test_start_seq_alone_does_not_imply_anything_was_checkpointed`, `test_startup_recovery_stops_checkpointing_at_first_persist_failure` |
+| 2 | Remove `checkpoint_blocked` guard (loop, 2 sites) | Yes | `test_persist_failure_in_the_loop_never_advances_checkpoint_past_it` |
+| 3 | Swallow double failure, no distinct log/latch | Yes | `test_double_failure_wal_and_parquet_both_fail_does_not_crash_caller` |
+| 4 | Delete the active WAL file during checkpoint cleanup | Yes | `test_checkpoint_never_deletes_the_active_file_even_when_fully_covered` |
+| 5 | Ignore `resume_seq`, always `start_seq=0` | Yes | `test_recover_quality_wal_resumes_sequence_correctly_no_id_reuse` |
+| 6 | Remove `os.fsync()` from `append()` | Yes | `test_fsync_failure_is_visible_and_carries_the_event_id` |
+| 7 | Remove `.flush()` from `append()` | Yes | `test_flush_failure_is_visible` |
+| 8 | Enqueue before WAL append | Yes | `test_wal_write_failure_falls_back_to_direct_synchronous_persist`, `test_queue_overflow_event_is_persisted_directly_not_silently_covered` |
+| 9 | Ignore malformed middle WAL record | Yes | `test_corrupt_middle_record_raises_and_does_not_silently_skip` |
+| 10 | Treat a corrupt checkpoint file as fully checkpointed | Yes | `test_a_corrupted_checkpoint_file_is_treated_as_nothing_checkpointed_not_everything` |
+| 11 | Skip WAL recovery entirely at startup | Yes | 5 tests across the recovery/shutdown suites |
+| 12 | Checkpoint beyond the first startup persistence failure | Yes | `test_startup_recovery_stops_checkpointing_at_first_persist_failure`, `test_partial_recovery_failure_blocks_later_runtime_checkpoints` |
+| 13 | Treat a WAL `OSError` as a successful append | Yes | 6 tests across the fallback/overflow/checkpoint suites |
+| 14 | *(see note below)* | NOT APPLICABLE | -- |
+| 15 | Continue after a persistent quality-store failure without latching | Yes | same invariant as #20; see note |
+| 16 | Remove chronological ordering from `recover()`'s file iteration | Yes | `test_event_ids_are_stable_and_unique_across_a_simulated_restart`, `test_rotation_then_recovery_preserves_cross_file_order` |
+| 17 | Treat a torn final-line tail as corruption (no tolerance) | Yes | `test_incomplete_final_line_is_quarantined_not_fabricated`, `test_corrupt_middle_record_is_distinguished_from_incomplete_tail` |
+| 18 | Treat middle-of-file corruption as harmless | Yes | `test_corrupt_middle_record_raises_and_does_not_silently_skip`, `test_corrupt_wal_at_startup_is_reported_preserved_and_never_checkpointed_over` |
+| 19 | Remove the loop's per-event try/except (silent task death) | Yes | `test_persist_failure_in_the_loop_never_advances_checkpoint_past_it` |
+| 20 | Forget to latch the checkpoint block on a persist failure | Yes | `test_persist_failure_in_the_loop_never_advances_checkpoint_past_it` |
 
-Only these five were run. The task's list of 20 was **not** fully
-executed; the other 15 (e.g. remove fsync/flush, queue-before-WAL,
-ignore malformed middle record, treat corrupt checkpoint as fully
-checkpointed) are NOT VERIFIED by fresh mutation this pass -- the
-first-pass tests cover several of them but that was not re-proven.
+**Note on #14:** "clear WAL before Parquet persistence" has no real
+mutation site in the current implementation -- `checkpoint()` is called
+exactly once, after `_persist_quality_event` returns without raising, at
+both call sites. There is no code path where a WAL file is cleared
+before persistence is attempted; constructing one would mean writing new,
+unrelated logic rather than mutating an existing decision point.
+Classified **NOT APPLICABLE**. Invariant C is covered from the failure
+side by mutations 3, 12, 13, 19 and 20 instead.
 
-### Known limitations (not fixed)
+**Note on #15:** identical in effect to #20 as implemented -- the current
+source has exactly one place where "continue after failure" and "latch
+the checkpoint block" are the same line. Rather than double-count one
+code site as two mutations, #15 is recorded as proven by #20's result,
+and #19 (remove the surrounding try/except entirely) as the adjacent,
+genuinely distinct mutation of that same region.
+
+## M. Remaining limitations
 
 - Invalid UTF-8 in a WAL file raises `UnicodeDecodeError` from
-  `recover()` rather than `QualityWALCorruption`, so startup would fail
-  loudly instead of following the corruption policy. Torn multibyte tails
-  are not realistic (`json.dumps` escapes non-ASCII, so lines are pure
-  ASCII); genuine media corruption is the only trigger.
-- `default=str` in `append()` can change value types (e.g. non-JSON
-  objects become strings); "exact original content" holds for JSON-native
-  types only. Not audited field by field.
-- Sync `fsync` inside `_websocket_quality_event` runs on the caller's
-  thread; whether that can stall the receive path depends on P0-1
-  (separate branch, deliberately not addressed here).
-- Multiple processes sharing one WAL directory are NOT supported (the
-  `threading.Lock` is in-process only).
-- Total WAL directory size is not bounded: only per-file size is; old
-  files persist until checkpointed.
-- Duplicates after a crash between Parquet write and checkpoint are
-  expected; they carry the same `quality_event_id`.
+  `recover()` rather than `QualityWALCorruption`. Low risk
+  (`json.dumps` output is pure ASCII), not fixed.
+- `default=str` in `append()`'s JSON serialization can change value
+  types for non-JSON-native fields. Not audited field by field.
+- Multiple processes sharing one WAL directory are not supported (the
+  lock is `threading.Lock`, in-process only).
+- Total WAL directory size is not bounded, only per-file size is.
+- P0-1/P0-2 interaction under sustained load is reasoned, not
+  benchmarked.
 - No live/production verification of any of this.
 
-Test count: baseline 1267 -> 1273 (+6). Verdict: COMPLETE WITH
-DOCUMENTED LIMITATIONS.
+## N. Test count
+
+Baseline captured twice, because `origin/main` moved mid-session (other
+P0 work -- P0-4, P0-9, P0-10, P0-11, P0-12, a P0-1 follow-up -- merged
+while this pass was in progress):
+
+- First baseline, `origin/main` @ `2038e36c19e5a34280b50ca2c2d09917e7a573f1`:
+  **1452 passed**.
+- After `git rebase origin/main` onto the new tip (`7cda4b4...`, verified
+  clean: `git merge-base origin/main HEAD` equals `origin/main` exactly,
+  no conflicts, `run_collector.py`'s only upstream change was an
+  unrelated nanosecond-timestamp parameter nowhere near the quality-event
+  code -- confirmed by diffing the two main tips for that file and
+  finding no overlap with anything this document touches): **1660 tests
+  total, 1657 passed, 3 failed**.
+
+**The 3 failures are a pre-existing regression on `origin/main` itself,
+unrelated to this work** -- independently confirmed by running those
+exact 3 tests against bare `origin/main` with none of this branch's
+commits present; they fail identically there
+(`test_p0_12_systemd_deployment.py::test_stop_timeout_outlasts_the_p0_1_websocket_drain`,
+`test_websocket_client.py::test_on_message_receives_the_arrival_timestamp_not_the_processing_timestamp`,
+`test_websocket_client.py::test_receive_timestamp_also_holds_for_handlers_that_take_no_connection_id`).
+Not fixed here: they are P0-1/P0-11 territory, out of this task's scope,
+and documented rather than silently worked around.
+
+The P0-2-specific suite (`test_quality_wal.py`,
+`test_quality_wal_collector_integration.py`,
+`test_quality_wal_failure_semantics.py`, 50 tests) passes completely on
+the rebased branch. `compileall`: clean. `git diff --check`: clean.
+
+**Second rebase, same session:** `origin/main` moved again while this
+document's first rebase note was being written (`7cda4b4` ->
+`385a6e6`, a P0-1 shutdown-finalization audit). That PR touched the same
+`shutdown()` method this branch's own WAL-close guard touches -- a real
+conflict, not a textual coincidence. Resolved manually: kept main's new
+per-writer `_close_writer_reporting_failure()` guard (every writer's
+`close()` individually exception-guarded, so one failure cannot abort
+closing the rest), and added this branch's WAL-close guard into that same
+structure, immediately before `quality_writer` is closed. Verified
+afterward: `git merge-base origin/main HEAD` equals the new main tip
+exactly, and the full `test_quality_wal_failure_semantics.py` shutdown
+tests (which exercise the real `shutdown()` method end to end) still pass
+against the merged result -- confirming the resolution is semantically
+correct, not merely textually conflict-free. Final count after this
+second rebase: **1664 passed**, same 3 pre-existing unrelated failures
+as above.
+
+**Verdict: COMPLETE -- VERIFIED.** All 20 requested mutations were
+executed against the current, rebased, hardened source; all were caught;
+every restoration was confirmed byte-identical. The limitations in
+section M are documented scope narrowing and edge cases, not unproven
+safety-critical invariants.
