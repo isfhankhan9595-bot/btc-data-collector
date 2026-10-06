@@ -48,9 +48,17 @@ caller controls ``process_start_marker`` and the sequence is a plain
 incrementing integer, not random), monotonically informative within one
 ``process_start_marker`` (a higher seq is always a later event, including
 across a WAL rotation -- the sequence is never reset by rotation), and
-resumed across a process restart via ``highest_recovered_seq`` so a new
-process's IDs never collide with an old one's **for the common case where
-the two processes' default ``process_start_marker`` values differ**.
+resumed across a process restart so a new process's IDs never collide
+with an old one's **for the common case where the two processes' default
+``process_start_marker`` values differ**.
+
+Sequence invariant: a freshly constructed WAL issues seqs strictly greater
+than BOTH the highest seq still present in any surviving ``*.wal`` file AND
+the durable ``checkpointed_seq`` (``start_seq`` can only raise that floor,
+never lower it). Both bounds are needed because checkpointing deletes covered
+files: after a restart the files alone may hold a lower highest-seq than the
+checkpoint, or none at all, and a seq at or below the checkpoint would be
+silently treated as already persisted by ``recover()`` and ``checkpoint()``.
 
 That default is ``f"{int(time.time()*1000)}-{os.getpid()}"`` --
 millisecond timestamp plus PID. This is NOT a mathematically proven
@@ -119,7 +127,6 @@ class QualityEventWAL:
         self.wal_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
         self.process_start_marker = process_start_marker or f"{int(time.time() * 1000)}-{os.getpid()}"
-        self._seq = start_seq
         self._lock = threading.Lock()
         # Independent audit finding: this must read the ACTUAL on-disk
         # checkpoint state, never infer it from start_seq. start_seq only
@@ -134,6 +141,20 @@ class QualityEventWAL:
         # because start_seq alone said so, with no checkpoint.json ever
         # written to back that belief up.
         self._checkpointed_seq = _read_checkpointed_seq(self.wal_dir)
+        # SEQUENCE FLOOR (restart-after-checkpoint data-integrity fix).
+        # ``start_seq`` is only a caller-supplied LOWER bound on the counter.
+        # The counter is the last seq already issued (append() pre-increments),
+        # so it must be at least as large as BOTH durable facts this WAL can
+        # observe for itself:
+        #   * the durable checkpoint -- checkpoint() deletes fully-covered
+        #     files, so every seq-bearing file may be gone while
+        #     checkpoint.json still says N; and
+        #   * the highest seq still present in any surviving WAL file.
+        # Resuming from the files alone (what highest_recovered_seq() reports)
+        # could issue a seq <= the checkpoint, which recover() and checkpoint()
+        # would then both treat as "already persisted" -- silently losing a
+        # brand-new event. Computed BEFORE the new active file is created.
+        self._seq = max(start_seq, self._checkpointed_seq, self.highest_recovered_seq(self.wal_dir))
         self._active_path = self._new_wal_path()
         self._handle = open(self._active_path, "a", encoding="utf-8")
         self._write_failed = False
@@ -293,9 +314,15 @@ class QualityEventWAL:
 
     @staticmethod
     def highest_recovered_seq(wal_dir: Any) -> int:
-        """The highest seq present anywhere in wal_dir (checkpointed or
-        not) -- used to resume a WAL's sequence counter across a restart
-        without ever reusing an old quality_event_id."""
+        """The highest seq present in any WAL file still on disk
+        (checkpointed or not), or -1 if none.
+
+        This looks at surviving files ONLY. checkpoint() deletes covered
+        files, so it can legitimately be lower than the durable checkpoint
+        (even -1) after a normal restart; it is therefore NOT sufficient on
+        its own as the next sequence floor. QualityEventWAL.__init__ combines
+        it with the durable checkpoint, so callers may keep passing it as
+        ``start_seq`` safely."""
         wal_dir = Path(wal_dir)
         highest = -1
         for wal_file in sorted(wal_dir.glob("*.wal")):
