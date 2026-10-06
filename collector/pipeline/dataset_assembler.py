@@ -110,14 +110,17 @@ def _normalize_ms(frame: pd.DataFrame, col: str) -> None:
     Arrow/Pandas may preserve a millisecond physical timestamp as a
     datetime64 column; this coerces it to nanosecond resolution first so the
     floor-division to milliseconds is exact, never a silent unit error.
+
+    A null (NaT) is kept as NaN, never converted to the int64 sentinel that
+    ``NaT.astype("int64")`` yields -- that sentinel would masquerade as a
+    (hugely negative) real timestamp. Rows with a null availability clock are
+    dropped, loudly, in ``_prepare_stream_frame``.
     """
     if col in frame and pd.api.types.is_datetime64_any_dtype(frame[col]):
-        frame[col] = (
-            pd.to_datetime(frame[col], utc=True)
-            .astype("datetime64[ns, UTC]")
-            .astype("int64")
-            // 1_000_000
-        )
+        converted = pd.to_datetime(frame[col], utc=True)
+        null = converted.isna()
+        ms = converted.astype("datetime64[ns, UTC]").astype("int64") // 1_000_000
+        frame[col] = ms.where(~null) if null.any() else ms
 
 
 def _availability_series(frame: pd.DataFrame) -> tuple[pd.Series, bool]:
@@ -179,6 +182,15 @@ def _prepare_stream_frame(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
     """
     frame = _enforce_single_instrument(frame, prefix)
     avail, used_fallback = _availability_series(frame)
+    # A row with no availability time cannot be placed on the causal clock.
+    # It is dropped -- never given a fabricated time -- and the loss is
+    # reported, not silent.
+    null_avail = avail.isna()
+    if null_avail.any():
+        print(f"WARNING: dropping {int(null_avail.sum())} {prefix} row(s) with a null "
+              f"availability timestamp (cannot be placed on the causal clock)")
+        frame = frame.loc[~null_avail]
+        avail = avail.loc[~null_avail]
     out = frame.copy()
     out[f"{prefix}_ts"] = avail.astype("int64")
     out[f"{prefix}_time_unknown"] = used_fallback
@@ -189,6 +201,44 @@ def _prepare_stream_frame(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
         rename["exchange_timestamp"] = f"{prefix}_exchange_ts"
     out = out.rename(columns=rename)
     return out.drop(columns=["local_timestamp", "instrument_key"], errors="ignore")
+
+
+def _grid_bin(avail: pd.Series, start_ts: int, end_ts: int, grid_ms: int, prefix: str) -> pd.Series:
+    """Causal bin label for each event, restricted to the requested day.
+
+    An event at availability time ``t`` belongs to the bin ``(T - grid_ms, T]``
+    labelled ``T = start_ts + ceil((t - start_ts) / grid_ms) * grid_ms`` (the
+    first grid instant at or after ``t`` -- never earlier, so a row can never
+    contain information received after its own timestamp).
+
+    Only events with ``start_ts <= t <= last_grid`` can be represented in the
+    requested ``[start_ts, end_ts)`` day, where ``last_grid`` is the last
+    grid row. Every other event is excluded and counted, never silently
+    re-labelled or lost:
+
+    * ``t < start_ts``            -- previous day. ``ceil`` would otherwise
+      clamp these (up to ``grid_ms - 1`` ms early) into the first bin.
+    * ``last_grid < t < end_ts``  -- in-day, but its bin label would be
+      ``>= end_ts``: no grid row exists to hold it.
+    * ``t >= end_ts``             -- next day.
+
+    Returns an int64 Series of bin labels aligned to ``avail``'s index, with
+    excluded events absent (callers index the frame by this Series' index).
+    Integer arithmetic only: no float rounding at the boundary.
+    """
+    last_grid = start_ts + ((end_ts - start_ts - 1) // grid_ms) * grid_ms
+    t = avail.astype("int64")
+    before = t < start_ts
+    after = t >= end_ts
+    trailing = (t > last_grid) & ~after
+    if before.any() or after.any() or trailing.any():
+        print(f"WARNING: excluded {prefix} event(s) outside the requested day grid: "
+              f"{int(before.sum())} before start_ts, {int(trailing.sum())} in the trailing "
+              f"partial bin (no grid row), {int(after.sum())} at/after end_ts")
+    keep = ~(before | after | trailing)
+    t = t[keep]
+    offset = t - start_ts
+    return start_ts + (-((-offset) // grid_ms)) * grid_ms
 
 
 def _read_stream(data_dir: str, stream: str, date_str: str) -> list[pd.DataFrame]:
@@ -247,14 +297,23 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         # genuinely distinct liquidations that happen to share all four
         # fields would be incorrectly collapsed into one. See
         # docs/RESEARCH_DATASET_TIME_CONTRACT.md for the full tradeoff.
-        before = len(df_liq)
-        df_liq = df_liq.drop_duplicates(subset=["liq_exchange_ts", "side", "price", "quantity"], keep="first")
-        if len(df_liq) < before:
-            print(f"WARNING: dropped {before - len(df_liq)} duplicate liquidation row(s) "
-                  f"(identical exchange_timestamp/side/price/quantity)")
+        # Order by the availability clock BEFORE choosing which copy survives,
+        # so ``keep="first"`` means "earliest received" and never depends on
+        # the order segment files happened to be concatenated in. A row with a
+        # null exchange_timestamp has no key to claim identity with, so it is
+        # never collapsed (NaN would otherwise compare equal to NaN).
         df_liq = df_liq.sort_values("liq_ts", kind="stable").reset_index(drop=True)
+        dup_mask = df_liq.duplicated(
+            subset=["liq_exchange_ts", "side", "price", "quantity"], keep="first"
+        ) & df_liq["liq_exchange_ts"].notna()
+        df_liq_dups = df_liq.loc[dup_mask, ["liq_ts"]]
+        df_liq = df_liq.loc[~dup_mask].reset_index(drop=True)
+        if len(df_liq_dups):
+            print(f"WARNING: dropped {len(df_liq_dups)} duplicate liquidation row(s) "
+                  f"(identical exchange_timestamp/side/price/quantity; heuristic, not exact)")
     else:
         df_liq = pd.DataFrame()
+        df_liq_dups = pd.DataFrame()
 
     # Create common time grid
     start_dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -326,13 +385,17 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
             df_aligned[f"{col}_fisher"] = np.arctanh(clipped).astype("float64")
 
     # Aggregate trades
-    if not df_trades.empty:
+    # Stream availability is decided by whether a trades segment was collected
+    # for this day -- not by whether any row survives the day filter below.
+    trades_available = bool(trades_dfs)
+    if trades_available:
         # Bin trades by grid timestamp, using the causal availability clock
         # (trades_ts), never the processing timestamp. A trade at t falls
-        # into the bin (t_grid-grid_ms, t_grid]. We can achieve this by
-        # ceiling the trade's availability timestamp to the nearest grid point.
-        df_trades["grid_ts"] = np.ceil((df_trades["trades_ts"] - start_ts) / grid_ms) * grid_ms + start_ts
-        df_trades["grid_ts"] = df_trades["grid_ts"].astype(np.int64)
+        # into the bin (t_grid-grid_ms, t_grid]. Events outside the requested
+        # day grid are excluded and counted (see _grid_bin).
+        grid_labels = _grid_bin(df_trades["trades_ts"], start_ts, end_ts, grid_ms, "trades")
+        df_trades = df_trades.loc[grid_labels.index].copy()
+        df_trades["grid_ts"] = grid_labels.astype(np.int64)
 
         df_trades["is_buyer"] = ~df_trades["is_buyer_maker"]
         df_trades["buy_vol"] = np.where(df_trades["is_buyer"], df_trades["quantity"], 0)
@@ -360,6 +423,8 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_aligned = pd.merge(df_aligned, trade_aggs, left_on="timestamp", right_on="grid_ts", how="left")
         df_aligned = df_aligned.drop(columns=["grid_ts"])
     else:
+        # No trades segment exists for this day: the zeros below carry no
+        # evidentiary weight (see ``trades_stream_available``).
         df_aligned["trade_count"] = 0
         df_aligned["buy_volume"] = 0.0
         df_aligned["sell_volume"] = 0.0
@@ -368,6 +433,11 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_aligned["vwap"] = np.nan
         df_aligned["last_price"] = np.nan
         df_aligned["trades_time_unknown"] = False
+
+    # True iff a trades segment was collected for this day. False means the
+    # zero trade columns are "no evidence", NOT "observed no trades" -- the
+    # same distinction ``liquidation_stream_available`` makes.
+    df_aligned["trades_stream_available"] = trades_available
 
     # Fill NaNs for trades where appropriate
     df_aligned["trade_count"] = df_aligned["trade_count"].fillna(0).astype(np.int32)
@@ -383,9 +453,11 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     # availability clock, never the processing timestamp), see module
     # docstring for the shared "empty bin = zero" limitation this inherits
     # from the trades aggregation.
-    if not df_liq.empty:
-        df_liq["grid_ts"] = np.ceil((df_liq["liq_ts"] - start_ts) / grid_ms) * grid_ms + start_ts
-        df_liq["grid_ts"] = df_liq["grid_ts"].astype(np.int64)
+    liq_available = bool(liq_dfs)
+    if liq_available:
+        liq_labels = _grid_bin(df_liq["liq_ts"], start_ts, end_ts, grid_ms, "liquidation")
+        df_liq = df_liq.loc[liq_labels.index].copy()
+        df_liq["grid_ts"] = liq_labels.astype(np.int64)
 
         # side: +1 == BUY (forced buy => a short position was liquidated),
         # -1 == SELL (forced sell => a long position was liquidated). See
@@ -403,6 +475,13 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
             liquidation_time_unknown=("liq_time_unknown", "any"),
         ).reset_index()
 
+        # Rows the heuristic collapsed, counted in the bin of their own
+        # availability time so the (possible) over-collapse is measurable in
+        # the dataset rather than only in a log line.
+        dup_labels = _grid_bin(df_liq_dups["liq_ts"], start_ts, end_ts, grid_ms, "liquidation-dup") if len(df_liq_dups) else pd.Series(dtype="int64")
+        dup_counts = dup_labels.value_counts().rename("liquidation_dup_dropped").rename_axis("grid_ts").reset_index()
+        liq_aggs = liq_aggs.merge(dup_counts, on="grid_ts", how="outer") if len(dup_counts) else liq_aggs.assign(liquidation_dup_dropped=0)
+
         df_aligned = pd.merge(df_aligned, liq_aggs, left_on="timestamp", right_on="grid_ts", how="left")
         df_aligned = df_aligned.drop(columns=["grid_ts"])
         # The stream was collected for this day: a bin with no matching
@@ -418,6 +497,7 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_aligned["liquidation_net_volume"] = 0.0
         df_aligned["liquidation_notional"] = 0.0
         df_aligned["liquidation_time_unknown"] = False
+        df_aligned["liquidation_dup_dropped"] = 0
         # No liquidation segment exists for this day at all: a count of 0
         # here is NOT the same causal claim as "we watched and saw zero" --
         # it means we have no evidence either way. Never collapse this into
@@ -430,6 +510,7 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     df_aligned["liquidation_net_volume"] = df_aligned["liquidation_net_volume"].fillna(0.0)
     df_aligned["liquidation_notional"] = df_aligned["liquidation_notional"].fillna(0.0)
     df_aligned["liquidation_time_unknown"] = df_aligned["liquidation_time_unknown"].fillna(False).astype(bool)
+    df_aligned["liquidation_dup_dropped"] = df_aligned["liquidation_dup_dropped"].fillna(0).astype(np.int32)
 
     # Save aligned dataset
     out_dir = os.path.join(data_dir, "aligned")
