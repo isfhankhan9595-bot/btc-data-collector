@@ -227,9 +227,15 @@ class BybitCollectorApp:
 
     async def _handle_message(self, data: dict, local_receive_ts: int, connection_id=None) -> None:
         self.messages_handled += 1
-        events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
-        for event in events:
-            self._persist_event(event)
+        try:
+            events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
+            for event in events:
+                self._persist_event(event)
+        finally:
+            # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
 
     def _persist_event(self, event) -> None:
         base = {
@@ -262,9 +268,6 @@ class BybitCollectorApp:
                 "block_trade": bool(event.block_trade) if event.block_trade is not None else None,
                 "rpi": bool(event.rpi) if event.rpi is not None else None,
             }, bind=bind_arg(getattr(self, "segment_dedup", None), event))
-            segment_dedup = getattr(self, "segment_dedup", None)
-            if segment_dedup is not None:
-                segment_dedup.end_message()
         elif isinstance(event, CanonicalMarkPriceEvent):
             self.mark_writer.write({
                 **base, "mark_price": event.mark_price, "index_price": event.index_price,

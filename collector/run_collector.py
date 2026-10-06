@@ -883,6 +883,17 @@ class CollectorApp:
         return numeric
 
     def _handle_binance_trade(self, raw: dict, stream: str, local_receive_ts: int):
+        # P0-4: normalize() admits identities up front; any exit (return, validator
+        # rejection, writer/dedup exception) must still end the message so an
+        # admitted-but-unwritten identity never suppresses a later redelivery.
+        try:
+            self._handle_binance_trade_events(raw, stream, local_receive_ts)
+        finally:
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
+
+    def _handle_binance_trade_events(self, raw: dict, stream: str, local_receive_ts: int):
         self.stream_counters["trades"]["received"] += 1
         events = self.binance_adapter.normalize(raw, local_receive_ts=local_receive_ts)
         for event in events:
@@ -911,9 +922,6 @@ class CollectorApp:
                 "instrument_key": instrument_key,
             }
             self._handle_trade_features(features)
-        segment_dedup = getattr(self, "segment_dedup", None)
-        if segment_dedup is not None:
-            segment_dedup.end_message()
         self._drain_integrity_quality_events()
 
     def _handle_trade_features(self, features: dict):

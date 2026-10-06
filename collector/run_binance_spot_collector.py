@@ -276,9 +276,15 @@ class BinanceSpotCollectorApp:
                 "local_receive_ts": local_receive_ts, "local_ts": local_receive_ts,
             })
 
-        events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
-        for event in events:
-            await self._persist_event(event)
+        try:
+            events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
+            for event in events:
+                await self._persist_event(event)
+        finally:
+            # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
 
     async def _persist_event(self, event) -> None:
         if isinstance(event, CanonicalTradeEvent):
@@ -294,9 +300,6 @@ class BinanceSpotCollectorApp:
                 # adapters/base.py) -- not re-derived here.
                 "instrument_key": event.instrument.key if event.instrument is not None else None,
             }, bind=bind_arg(getattr(self, "segment_dedup", None), event))
-            segment_dedup = getattr(self, "segment_dedup", None)
-            if segment_dedup is not None:
-                segment_dedup.end_message()
             self.stream_counters["trades"]["written"] += 1
             return
 

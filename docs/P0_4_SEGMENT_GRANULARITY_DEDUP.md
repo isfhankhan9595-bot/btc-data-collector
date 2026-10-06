@@ -221,6 +221,22 @@ exchange as its first component, and is already directly proven by
 `test_identity_isolation_across_every_component` (component-level) without
 needing index sharing to be artificially constructed at the runner level.
 
+### Message-boundary lifecycle contract (runner side)
+
+`normalize()` admits every trade identity of a message *before* any write, so
+each runner calls `SegmentDedupHandle.end_message()` from a `finally` that
+encloses `normalize()` and all writes for the message. An early exit or an
+exception (writer refusal, transient index error, validator rejection) thus
+cannot leave an admitted-but-never-written identity in RAM to suppress the
+venue's redelivery. A trade with `trade_id is None` is never admitted, never
+indexed and therefore never bound (`bind_for` returns `None`). Proven through
+the real runners in `tests/test_p0_4_runner_lifecycle.py`.
+
+Binance USD-M anchors on the RAW trade writer (`binance_trades_raw`, identity
+read from `native_trade_id`): it receives every admitted trade before canonical
+validation, so a canonically-rejected trade is still durable in the raw segment
+and stays suppressed after a restart.
+
 ### What remains unverified
 
 Target-EC2 throughput for the wired path (one SQLite transaction per

@@ -254,12 +254,22 @@ class SegmentDedupHandle:
         self.coordinators: Dict[str, SegmentDedupCoordinator] = {}
         self.indexes: list = []
 
-    def bind_for(self, event: Any) -> Callable[[SegmentToken], None]:
+    def bind_for(self, event: Any) -> Optional[Callable[[SegmentToken], None]]:
+        if event.trade_id is None:
+            # The adapter never admits (and StreamSpec.row_identity never indexes)
+            # an unidentified trade, so there is no identity to attribute. Without
+            # this, event_identity_key() raised TypeError on len(None) and the
+            # write -- a trade the adapter deliberately keeps -- was lost.
+            return None
         coordinator = self.coordinators[event.stream]      # KeyError = unwired stream -> loud
         key = event_identity_key(event)
         return lambda token: coordinator.note_written(key, token)
 
     def end_message(self) -> None:
+        """Message boundary. Runners MUST call this from a ``finally`` that
+        encloses ``adapter.normalize()`` and every write for the message, so an
+        early exit / exception cannot leave admitted-but-never-written
+        identities in RAM to suppress a legitimate redelivery."""
         for c in self.coordinators.values():
             c.end_message()
 
