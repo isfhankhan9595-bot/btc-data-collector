@@ -64,10 +64,14 @@ evidence-based only where the recorded stamps distinguish the frames.
 Three separate questions, three separate answers on :class:`ReplayResult`:
 
 * what was produced -- ``digest`` (output state only);
-* which recorded evidence produced it -- ``input_fingerprint``;
-* how trustworthy that evidence and ordering were -- ``integrity_issues()``
-  / ``is_pristine`` (skipped foreign rows, dropped REST rows, truncated,
+* which replay frames produced it, plus how many rows were excluded and why
+  -- ``input_fingerprint`` (a fingerprint of the frames replayed and the
+  exclusion ACCOUNTING; not of the content of excluded rows);
+* whether the result is fully evidenced -- ``integrity_issues()`` /
+  ``is_pristine`` (skipped foreign rows, dropped REST rows, truncated,
   undecodable or unhandled frames, rejected snapshots, unresolved ties).
+  ``is_pristine=False`` means NOT FULLY EVIDENCED; it is not a verdict that
+  the replay is unusable.
 
 No network
 ----------
@@ -240,15 +244,23 @@ class ReplayResult:
     #: Same-millisecond frame pairs whose true relative order the recorded
     #: evidence cannot establish (see ``ReplaySource.unresolved_order_ties``).
     unresolved_order_ties: dict[str, int] = field(default_factory=dict)
-    #: SHA-256 over the ordered input evidence plus the skip accounting.
+    #: SHA-256 over (1) the replay frames the engine was given -- kind,
+    #: recorded stamps, lineage, success flags, truncated flag and a hash of
+    #: each payload, in replay order -- and (2) the exclusion ACCOUNTING:
+    #: counts of skipped foreign-venue rows and dropped REST rows by key.
+    #: It does NOT fingerprint the content of excluded rows: inputs that differ
+    #: only in what an excluded row contained (same counts) share a value.
     input_fingerprint: Optional[str] = None
 
     def integrity_issues(self) -> dict[str, Any]:
-        """Every condition under which this replay is NOT a clean,
-        fully-evidenced reconstruction. Empty means pristine.
+        """Every recorded condition under which this replay is NOT fully
+        evidenced. Empty means pristine.
 
         Deliberately separate from :attr:`digest`: the digest says *what was
-        produced*; this says *how trustworthy the inputs and ordering were*.
+        produced*; this says what evidence was excluded, refused, rejected or
+        order-ambiguous on the way. It is a disclosure, not a validity
+        verdict: a non-empty result does not mean the retained evidence is
+        wrong or that the replay is unusable.
         """
         issues: dict[str, Any] = {}
         for name in ("frames_undecodable", "frames_unhandled", "frames_truncated",
@@ -264,6 +276,16 @@ class ReplayResult:
 
     @property
     def is_pristine(self) -> bool:
+        """``True`` only when nothing was excluded, refused, rejected or
+        order-ambiguous (:meth:`integrity_issues` is empty).
+
+        ``False`` means the result is NOT FULLY EVIDENCED. It does not mean
+        the replay is historically unusable, invalid for every research use,
+        or that the evidence it did retain is wrong: an ordinary replay whose
+        only issue is a same-millisecond WIRE/REST tie still reaches the same
+        book it would without the tie. Callers decide fitness for their use
+        from :meth:`integrity_issues`; this flag is not a gate.
+        """
         return not self.integrity_issues()
 
     @property
@@ -379,14 +401,20 @@ class ReplaySource:
         return {key: count for key, count in ties.items() if count}
 
     def input_fingerprint(self) -> str:
-        """SHA-256 identifying exactly which recorded evidence this source
-        holds: every frame's kind, recorded timestamps, lineage, success
-        flags and payload hash, in replay order, plus the skip accounting.
+        """SHA-256 over the replay frames this source presents to the engine
+        (kind, recorded timestamps, lineage, success flags, truncated flag and
+        a hash of each payload, in replay order) plus the exclusion
+        ACCOUNTING (counts of skipped foreign-venue rows and dropped REST rows
+        by key).
 
-        This is the INPUT counterpart of ``ReplayResult.digest``. Two sources
-        with the same fingerprint present the engine identical evidence; the
-        output digest alone cannot say that (an unconsumed or ignored frame
-        changes nothing in it).
+        What it identifies: the exact frame sequence replayed, so two sources
+        with the same fingerprint present the engine identical frames -- which
+        the output digest cannot say, because an ignored or undecodable frame
+        changes nothing in it. What it does NOT identify: the content of
+        excluded rows. Only their counts enter the hash, so inputs differing
+        solely in what a skipped or dropped row contained share a fingerprint.
+        It is therefore not a unique content fingerprint of everything that
+        was on disk.
         """
         hasher = hashlib.sha256()
         for frame in self._frames:

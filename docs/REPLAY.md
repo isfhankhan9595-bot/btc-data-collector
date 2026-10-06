@@ -115,7 +115,9 @@ true orders produce different outputs (pinned by
 not hide this: every REST row that shares a millisecond with a WIRE frame, and
 every ns-less WIRE frame sharing a millisecond with ns-bearing ones, is counted
 in `ReplayResult.unresolved_order_ties` and makes the result non-pristine.
-Nothing is fabricated to resolve it.
+Nothing is fabricated to resolve it. These ties are disclosure, not failure:
+`is_pristine` becomes `False` ("not fully evidenced"), and the book is still
+whatever the deterministic order produced.
 
 **Availability of a bridged book.** A `BookUpdate` stamped `RECOVERY_BRIDGE` /
 `RECOVERY_INCREMENTAL` has `timestamp_ms` equal to the diff's own receive time
@@ -166,8 +168,8 @@ Two further concepts sit beside it on `ReplayResult`:
 | Field | Question it answers |
 |---|---|
 | `digest` | what output state was produced |
-| `input_fingerprint` | exactly which recorded evidence (frame kinds, recorded stamps, lineage, success flags, payload hashes, skip accounting) was consumed |
-| `integrity_issues()` / `is_pristine` | whether the replay was a clean, fully evidenced reconstruction; lists `frames_undecodable`, `frames_unhandled`, `frames_truncated`, `snapshots_rejected`, `oi_rejected`, `skipped_rows`, `dropped_rest_rows`, `unresolved_order_ties`, `empty_replay` |
+| `input_fingerprint` | which replay frames were fed to the engine (kind, recorded stamps, lineage, success flags, truncated flag, payload hashes, in replay order) **plus the exclusion accounting** (counts of skipped foreign-venue rows and dropped REST rows by key). It does **not** fingerprint the content of excluded rows: inputs that differ only in what an excluded row contained, with the same counts, share a fingerprint |
+| `integrity_issues()` / `is_pristine` | whether the replay is fully evidenced. `is_pristine=False` means **not fully evidenced** (something was excluded, refused, rejected or order-ambiguous); it does **not** mean the replay is unusable, invalid for every research use, or that the retained evidence is wrong. A replay whose only issue is a same-millisecond tie still reaches the same book. Callers judge fitness from the listed conditions; the flag is not a gate. Lists `frames_undecodable`, `frames_unhandled`, `frames_truncated`, `snapshots_rejected`, `oi_rejected`, `skipped_rows`, `dropped_rest_rows`, `unresolved_order_ties`, `empty_replay` |
 
 Replay-originated quality events also carry `replay_ts_ms` (the recorded
 availability time of the frame being handled, never the wall clock),
@@ -223,7 +225,8 @@ segments. Enforced by an AST-based test over the module's own imports
   engine over the same frames.
 - OKX order-book replay is fixture-tested but has no live collector (above).
 - REST stamps have whole-millisecond resolution; same-millisecond WIRE-vs-REST order cannot be established and is reported, not resolved (see Causality).
-- `input_fingerprint` identifies the evidence a replay consumed; it does not prove that evidence is complete (a missing capture is not detectable from the capture itself).
+- `input_fingerprint` identifies the frames a replay consumed plus the exclusion counts. It is not a content fingerprint of excluded rows, and it does not prove the evidence is complete (a missing capture is not detectable from the capture itself).
+- Replay-side REST ordering resolution (`response_receive_ns`) is a separate, deferred task; nothing in this document describes it as implemented.
 - Non-book events are preserved, not featurised or quality-gated.
 - Bybit and OKX sequence semantics are exercised against documented protocol
   behaviour, not against real sequence-reset or gap events from the venues.

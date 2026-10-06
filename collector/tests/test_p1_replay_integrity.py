@@ -433,3 +433,227 @@ def test_okx_malformed_level_is_unhandled_and_visible_never_raised():
     assert result.frames_unhandled == 1
     assert not result.is_pristine
     assert any(e["reason"] == "adapter_unhandled:malformed_payload" for e in result.quality_events)
+
+
+# ---------------------------------------------------------------------------
+# input_fingerprint semantics: frames replayed + exclusion ACCOUNTING only
+# ---------------------------------------------------------------------------
+
+
+def _rest_rows_with_excluded(payload):
+    return [
+        {"purpose": "orderbook_snapshot", "response_receive_ts": T + 2, "ok": True, "endpoint": "e",
+         "payload": json.dumps({"lastUpdateId": 102, "bids": [["100", "1"]], "asks": [["101", "1"]]})},
+        {"purpose": "exchange_info", "response_receive_ts": T + 3, "ok": True, "payload": payload},
+    ]
+
+
+def test_fingerprint_covers_exclusion_counts_but_not_excluded_content():
+    """Pins the documented boundary: only the COUNT of an excluded row enters
+    the fingerprint, never its content. Two inputs that differ solely in what
+    a dropped row contained are indistinguishable by fingerprint."""
+    a = ReplaySource.from_records([], _rest_rows_with_excluded('{"symbols": 1}'))
+    b = ReplaySource.from_records([], _rest_rows_with_excluded('{"symbols": 999, "other": "content"}'))
+    assert a.dropped_rest_rows == b.dropped_rest_rows == {"rest_unsupported_purpose:exchange_info": 1}
+    assert a.input_fingerprint() == b.input_fingerprint()
+
+
+def test_fingerprint_does_change_when_the_exclusion_count_changes():
+    one = ReplaySource.from_records([], _rest_rows_with_excluded("{}"))
+    two = ReplaySource.from_records([], _rest_rows_with_excluded("{}") + [
+        {"purpose": "exchange_info", "response_receive_ts": T + 4, "ok": True, "payload": "{}"}])
+    assert one.input_fingerprint() != two.input_fingerprint()
+
+
+def test_fingerprint_does_change_when_a_replayed_frames_content_changes():
+    base = ReplaySource.from_records([], _rest_rows_with_excluded("{}"))
+    rows = _rest_rows_with_excluded("{}")
+    rows[0]["payload"] = json.dumps({"lastUpdateId": 103, "bids": [["100", "1"]], "asks": [["101", "1"]]})
+    assert ReplaySource.from_records([], rows).input_fingerprint() != base.input_fingerprint()
+
+
+# ---------------------------------------------------------------------------
+# is_pristine=False means NOT FULLY EVIDENCED, not "unusable"
+# ---------------------------------------------------------------------------
+
+
+def test_non_pristine_is_a_disclosure_not_a_validity_verdict():
+    tied = _run(SCENARIOS["same_ms"]())
+    assert not tied.is_pristine
+    assert set(tied.integrity_issues()) == {"unresolved_order_ties"}      # the ONLY compromise
+    assert tied.final_state == "VALID"                                    # the book is still reconstructed
+    assert len(tied.book_updates) == 2
+    assert tied.digest == PINNED_DIGESTS["same_ms"]                       # output is the deterministic one
+
+
+def test_excluded_foreign_evidence_does_not_make_retained_evidence_wrong():
+    clean = _run(SCENARIOS["clean"]())
+    source = ReplaySource(SCENARIOS["clean"]())
+    source.skipped_rows = {"OKX": 3}
+    flagged = ReplayEngine().run(source)
+    assert not flagged.is_pristine and clean.is_pristine
+    assert flagged.digest == clean.digest                                 # retained evidence reconstructs identically
+    assert flagged.book_updates == clean.book_updates
+
+
+def test_pristine_is_exactly_an_empty_issue_set():
+    for name in SCENARIOS:
+        result = _run(SCENARIOS[name]())
+        assert result.is_pristine == (result.integrity_issues() == {})
+
+
+# ---------------------------------------------------------------------------
+# available_ts_ms: causal boundary contract
+#
+# A recovery state is built from the snapshot's landing, the diff that
+# straddles lastUpdateId (the bridge), and every other buffered diff committed
+# in the chain (book_engine.LocalBook._attempt_bridge). A historical observer
+# standing at time t holds exactly the frames with recorded time <= t, so the
+# contract is CAUSAL CONSISTENCY: replaying only those frames must yield
+# exactly the book updates the full replay marks available at <= t. An update
+# visible early would appear in the full replay's ``available_ts_ms <= t`` set
+# but NOT in the prefix replay (its inputs had not yet arrived).
+# ---------------------------------------------------------------------------
+
+
+def _visible_at(result, t):
+    return [u for u in result.book_updates if u.available_ts_ms <= t]
+
+
+def _cut_times(frames):
+    stamps = {f.timestamp_ms for f in frames}
+    return sorted({s + d for s in stamps for d in (-1, 0, 1)})
+
+
+def _assert_causally_consistent(frames):
+    full = _run(frames)
+    for t in _cut_times(frames):
+        prefix = _run([f for f in frames if f.timestamp_ms <= t])
+        seen = [u.digest_tuple() for u in _visible_at(full, t)]
+        assert seen == [u.digest_tuple() for u in prefix.book_updates], f"cut t={t - T}"
+        # The VALID transition must not be knowable earlier than the prefix says.
+        became_valid = lambda r, cut: [e for e in r.quality_events
+                                        if e.get("new_state") == "VALID"
+                                        and e.get("replay_ts_ms", cut + 1) <= cut]
+        assert len(became_valid(full, t)) == len(became_valid(prefix, t)), f"cut t={t - T}"
+    return full
+
+
+def _scenario_snapshot_lands_last():
+    # Required: D0 (T+1), D1 (T+3), snapshot (T+10).
+    return [_diff(T + 1, 100, 105, 99, idx=0),
+            _diff(T + 3, 106, 110, 105, idx=1, bid="100.1"),
+            _snap(T + 10, 102, idx=2)]
+
+
+def _scenario_snapshot_first_bridge_diff_last():
+    # Snapshot lid=110 lands (T+5) AHEAD of the only buffered diff (u=105<110):
+    # retained as pending. Bridge needs the straddling diff D1 (T+8, 106..112).
+    # Required: snapshot (T+5) + D1 (T+8). D0 is discarded by the discard rule.
+    return [_diff(T, 100, 105, 99, idx=0),
+            _snap(T + 5, 110, idx=1),
+            _diff(T + 8, 106, 112, 105, idx=2, bid="100.1")]
+
+
+def _scenario_second_recovery_generation():
+    # Gen 1: D0 (T+1) + snapshot lid=102 (T+2). Then a hole: D_gap (T+3, 200..210).
+    # Gen 2 needs snapshot2 lid=205 (T+30) + D_gap (T+3).
+    return [_diff(T + 1, 100, 105, 99, idx=0),
+            _snap(T + 2, 102, idx=1),
+            _diff(T + 3, 200, 210, 199, idx=2, bid="100.5"),
+            _snap(T + 30, 205, idx=3)]
+
+
+@pytest.mark.parametrize("build", [
+    _scenario_snapshot_lands_last,
+    _scenario_snapshot_first_bridge_diff_last,
+    _scenario_second_recovery_generation,
+], ids=["snapshot_last", "snapshot_first_bridge_diff_last", "second_generation"])
+def test_no_observer_can_see_a_recovery_state_before_all_its_causal_inputs(build):
+    _assert_causally_consistent(build())
+
+
+def test_boundary_snapshot_lands_last_is_unusable_until_the_snapshot_lands():
+    result = _assert_causally_consistent(_scenario_snapshot_lands_last())
+    for t in range(T - 1, T + 10):                       # before any input, then after D0 only, then D0+D1
+        assert _visible_at(result, t) == [], f"visible early at t={t - T}"
+    at_boundary = _visible_at(result, T + 10)
+    assert [u.update_id for u in at_boundary] == [105, 110]
+    assert {u.available_ts_ms for u in at_boundary} == {T + 10}
+    assert [u.event_kind for u in at_boundary] == ["RECOVERY_BRIDGE", "RECOVERY_INCREMENTAL"]
+
+
+def test_boundary_snapshot_first_state_waits_for_the_bridge_diff_not_the_snapshot():
+    result = _assert_causally_consistent(_scenario_snapshot_first_bridge_diff_last())
+    # Snapshot (T+5) alone is NOT enough: the book is not usable until the
+    # straddling diff arrives at T+8.
+    for t in range(T - 1, T + 8):
+        assert _visible_at(result, t) == [], f"visible early at t={t - T}"
+    (update,) = _visible_at(result, T + 8)
+    assert (update.update_id, update.event_kind) == (112, "RECOVERY_BRIDGE")
+    assert update.available_ts_ms == T + 8 == update.timestamp_ms
+
+
+def test_boundary_second_generation_is_not_visible_until_its_own_snapshot_lands():
+    result = _assert_causally_consistent(_scenario_second_recovery_generation())
+    gen2 = lambda t: [u for u in _visible_at(result, t) if u.recovery_generation == 2]
+    for t in range(T + 3, T + 30):        # gap diff already held, replacement snapshot not yet landed
+        assert gen2(t) == [], f"generation 2 visible early at t={t - T}"
+    (update,) = gen2(T + 30)
+    assert update.update_id == 210 and update.available_ts_ms == T + 30
+    # The earlier generation stays visible throughout; it is never retro-edited.
+    assert [u.update_id for u in _visible_at(result, T + 29) if u.recovery_generation == 1] == [105]
+
+
+@pytest.mark.parametrize("label,frames", [
+    ("snapshot never lands", [_diff(T + 1, 100, 105, 99, idx=0), _diff(T + 3, 106, 110, 105, idx=1)]),
+    ("bridge diff never received (hole after snapshot)",
+     [_diff(T + 3, 106, 110, 105, idx=0), _snap(T + 10, 102, idx=1)]),
+    ("snapshot ahead, no straddling diff ever arrives",
+     [_diff(T, 100, 105, 99, idx=0), _snap(T + 5, 110, idx=1)]),
+], ids=["no_snapshot", "no_bridge_diff", "no_straddle"])
+def test_a_recovery_missing_a_required_input_is_never_usable_at_any_time(label, frames):
+    result = _assert_causally_consistent(frames)
+    assert result.book_updates == [], label
+    assert result.final_state != "VALID", label
+    assert _visible_at(result, T + 10**6) == []
+
+
+def test_availability_is_late_bound_to_the_completing_frame_for_every_snapshot_position():
+    """Metamorphic: each update becomes available at the LATER of its own
+    receive time and the snapshot's landing. A diff that arrives after the
+    book is already bridged is an ordinary incremental, not part of the
+    recovery batch (snapshot at T+2 sits between D0 and D1)."""
+    for snap_ms in (T + 2, T + 4, T + 9, T + 40):
+        result = _run([_diff(T + 1, 100, 105, 99, idx=0), _diff(T + 3, 106, 110, 105, idx=1),
+                       _snap(snap_ms, 102, idx=2)])
+        assert [u.update_id for u in result.book_updates] == [105, 110]
+        for update in result.book_updates:
+            assert update.available_ts_ms == max(snap_ms, update.timestamp_ms), f"snap at {snap_ms - T}"
+        if snap_ms == T + 2:
+            assert [u.event_kind for u in result.book_updates] == ["RECOVERY_BRIDGE", "NORMAL_INCREMENTAL"]
+
+
+def test_causal_consistency_holds_over_randomised_snapshot_and_chain_layouts():
+    executed = recovered = 0
+    for seed in range(120):
+        rng = random.Random(seed)
+        chain, start, ms = [], 100, T + 1
+        for i in range(rng.randint(2, 5)):
+            width = rng.randint(2, 6)
+            chain.append((ms, start, start + width - 1, start - 1))
+            start += width
+            ms += rng.randint(1, 6)
+        if rng.random() < 0.3 and len(chain) > 2:
+            del chain[rng.randrange(len(chain))]             # a hole: a diff never received
+        frames = [_diff(m, U, u, pu, idx=i, bid=f"{90 + i}.0") for i, (m, U, u, pu) in enumerate(chain)]
+        frames.append(_snap(T + rng.randint(0, 40), rng.randint(95, 125), idx=len(frames)))
+        # keep millisecond stamps distinct so ordering ties cannot mask the check
+        if len({f.timestamp_ms for f in frames}) != len(frames):
+            continue
+        full = _assert_causally_consistent(frames)
+        executed += 1
+        recovered += bool(full.book_updates)
+    # Guard against a vacuous pass: most layouts must run, and a healthy share
+    # must actually reconstruct a book (the rest exercise fail-closed paths).
+    assert executed >= 80 and recovered >= 20, (executed, recovered)
