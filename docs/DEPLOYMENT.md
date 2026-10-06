@@ -67,10 +67,13 @@ cancellation reaches it. `TimeoutStopSec=60` is kept as generous margin, not as 
 proven wait for that drain -- whether it completes in practice depends on asyncio task
 scheduling this analysis cannot settle without running it. **NOT VERIFIED LIVE.**
 
-## Known issue outside this change
+## Telegram credentials
 
-`telegram_bot.py`, in the repository's **current source** (not only Git history), hard-codes
-a Telegram bot token and chat id as module-level constants, read by `TelegramConfig.load()`'s
-`os.getenv(..., BOT_TOKEN)` fallback. This is a real, live credential exposure. Not rotated,
-not reproduced anywhere in this PR/report, and not fixed here -- separate remediation,
-outside P0-12's scope. The systemd unit itself carries no secret regardless.
+`telegram_bot.py` reads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from the environment only;
+there is no source-code default. Telegram stays optional: unset or malformed values disable it
+and the collector runs normally. An explicit request (`load_telegram_config(validate=True)`,
+`send_test_telegram_alert()`) raises `TelegramConfigError` instead.
+
+**ROTATION REQUIRED.** A bot token and chat id were previously committed to `telegram_bot.py`
+and remain in Git history. Treat that token as compromised: revoke it via BotFather, issue a new
+one, and supply it only through `/etc/btc-collector.env` on the host. Never commit it.
