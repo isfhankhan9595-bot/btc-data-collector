@@ -71,7 +71,12 @@ its absence would look identical to never having tried.
   fidelity is bad; losing the live feed is worse.
 - **Bounded.** Payloads above `DEFAULT_MAX_PAYLOAD_BYTES` (4 MB) are stored
   truncated with the original length recorded, and truncation itself raises a
-  quality event, because a clipped payload is partial raw data.
+  quality event, because a clipped payload is partial raw data. The event is
+  `DATA_DROP` / `raw_payload_truncated` with `rows_lost = 1` (one affected
+  frame; `rows_lost` is a row count, never a byte count). The original byte
+  length is the in-memory event's `payload_bytes` key and, durably, the raw
+  row's own `payload_bytes` column (with `truncated = true`); the persisted
+  quality-event schema has no byte-length column.
 
 ## The no-silent-discard contract
 
