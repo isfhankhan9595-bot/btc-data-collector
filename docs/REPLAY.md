@@ -43,7 +43,7 @@ non-authoritative, as live does.
 |---|---|
 | Binance | IMPLEMENTED, TESTED, REPLAY-VERIFIED (snapshot bridge, gaps, recovery, repeated diffs) |
 | Bybit | IMPLEMENTED, TESTED, REPLAY-VERIFIED (wire snapshot, resync signal, recovery transitions) |
-| OKX | The adapter parses `books` and replay applies it through `LocalBook`, but this is **not covered by a committed test** (an ad-hoc synthetic snapshot + 2 updates reached VALID, which is evidence of nothing more than that). **No live OKX book collection exists**: `run_okx_collector` deliberately excludes `books`, so recorded OKX book frames exist only if `run_okx_capture` was used. OKX levels are parsed as `float` while the canonical dataclass declares `Decimal`; the precision consequence has not been analysed. |
+| OKX | Correct on the cases now covered by `tests/test_p1_replay_integrity.py` (snapshot, update, level delete, `prevSeqId` mismatch, sequence reset, missing sequence ids, update with no snapshot, malformed level; price text preserved). Fixture-tested only; a malformed delta is reported unhandled while the book stays VALID until the next message exposes the sequence break (in-flight PR #90 addresses fail-closed behaviour). **No live OKX book collection exists**: `run_okx_collector` deliberately excludes `books`, so recorded OKX book frames exist only if `run_okx_capture` was used. OKX levels are parsed as `float` while the canonical dataclass declares `Decimal`; the precision consequence has not been analysed. |
 
 ### Non-order-book event replay
 
@@ -95,7 +95,35 @@ asynchronously and can only bridge once it has landed. A snapshot is never
 visible before the moment it arrived in the recorded run, so replay cannot
 repair a gap with information from the future. A snapshot request with no
 response is excluded entirely: it bridged nothing live, so it bridges nothing
-here.
+here -- and the exclusion is counted in `ReplayResult.dropped_rest_rows`.
+
+**Timestamps and what they establish**
+
+| Stamp | Used for ordering / availability? | Notes |
+|---|---|---|
+| `local_receive_ts` / `local_receive_ns` (wire) | yes -- the only causal clock | ns is recorded for P0-11+ rows; legacy rows are ms only |
+| `response_receive_ts` (REST) | yes | **whole milliseconds only**; there is no REST ns stamp |
+| `exchange_event_ts`, `request_ts`, `local_capture_ts`, `local_process_ts` | never | source evidence / diagnostics, not availability |
+| `receive_mono_ns` | never | intra-run delta only; not an epoch value |
+
+**Same-millisecond ordering is a convention, not evidence.** Because REST rows
+carry whole milliseconds, a REST response and a WIRE frame in the same
+millisecond may have arrived in either order. Replay sorts the WIRE frame
+first (`kind_rank`), which is deterministic but not observed; the two possible
+true orders produce different outputs (pinned by
+`test_the_two_physically_possible_orders_give_different_outputs`). Replay does
+not hide this: every REST row that shares a millisecond with a WIRE frame, and
+every ns-less WIRE frame sharing a millisecond with ns-bearing ones, is counted
+in `ReplayResult.unresolved_order_ties` and makes the result non-pristine.
+Nothing is fabricated to resolve it. These ties are disclosure, not failure:
+`is_pristine` becomes `False` ("not fully evidenced"), and the book is still
+whatever the deterministic order produced.
+
+**Availability of a bridged book.** A `BookUpdate` stamped `RECOVERY_BRIDGE` /
+`RECOVERY_INCREMENTAL` has `timestamp_ms` equal to the diff's own receive time
+but only became available when the bridging snapshot landed.
+`BookUpdate.available_ts_ms` carries that recorded time; consumers joining on
+availability must use it, not `timestamp_ms`.
 
 REST snapshots are a **Binance-only** mechanism. For any other venue a
 `REST_SNAPSHOT` frame is counted as unhandled and recorded as
@@ -104,13 +132,20 @@ Binance's `lastUpdateId` format.
 
 ## Determinism
 
-Frames carry a total order key `(timestamp, kind_rank, source_index)`, so ties
-never depend on filesystem iteration, dict ordering or sort stability. Within
-one millisecond a wire frame sorts before a snapshot, matching live, where the
-diff was already in the socket buffer when the HTTP response completed.
-Ordering is independent of the order frames are supplied in (tested).
+Frames carry a total order key
+`(timestamp_ms, kind_rank, ns_tiebreak, source_index)`, so ties never depend on
+filesystem iteration, dict ordering or sort stability. Within one millisecond a
+wire frame sorts before a REST row (see the causality caveat above: a
+convention, **not** an observed order). Ordering is independent of the order
+frames are supplied in (tested).
 
-`ReplayResult.digest` is a SHA-256 over, in order:
+Replay is deterministic. That is a weaker claim than causally correct: it is
+causally faithful only where the recorded stamps distinguish the frames.
+
+### What `digest` proves, and what it does not
+
+`ReplayResult.digest` is an **output-state digest**. It is a SHA-256 over, in
+order:
 
 1. every book update (`BookUpdate.digest_tuple()`),
 2. every non-book canonical event (its type name plus its full field set), so a
@@ -120,8 +155,26 @@ Ordering is independent of the order frames are supplied in (tested).
 Tests show the digest changes for a changed or removed trade, changed OI,
 changed funding rate and changed liquidation quantity, and is identical across
 two runs. **Not covered by the digest:** the frame counters (`frames_total`,
-`frames_unhandled`, ...), `ReplaySource.skipped_rows`, and the `previous_state`
-/ `new_state` fields of quality events.
+`frames_unhandled`, ...), skipped/dropped source rows, unresolved ordering
+ties, and the `previous_state` / `new_state` / lineage keys of quality events.
+Equal digests therefore prove equal *output*, not equal or clean *inputs*: a
+replay that skipped foreign-venue rows, dropped REST rows or relied on
+same-millisecond ties has the same digest as a pristine one when the book it
+built is the same. The digest value is unchanged by the P1 integrity work
+(pinned in `tests/test_p1_replay_integrity.py`).
+
+Two further concepts sit beside it on `ReplayResult`:
+
+| Field | Question it answers |
+|---|---|
+| `digest` | what output state was produced |
+| `input_fingerprint` | which replay frames were fed to the engine (kind, recorded stamps, lineage, success flags, truncated flag, payload hashes, in replay order) **plus the exclusion accounting** (counts of skipped foreign-venue rows and dropped REST rows by key). It does **not** fingerprint the content of excluded rows: inputs that differ only in what an excluded row contained, with the same counts, share a fingerprint |
+| `integrity_issues()` / `is_pristine` | whether the replay is fully evidenced. `is_pristine=False` means **not fully evidenced** (something was excluded, refused, rejected or order-ambiguous); it does **not** mean the replay is unusable, invalid for every research use, or that the retained evidence is wrong. A replay whose only issue is a same-millisecond tie still reaches the same book. Callers judge fitness from the listed conditions; the flag is not a gate. Lists `frames_undecodable`, `frames_unhandled`, `frames_truncated`, `snapshots_rejected`, `oi_rejected`, `skipped_rows`, `dropped_rest_rows`, `unresolved_order_ties`, `empty_replay` |
+
+Replay-originated quality events also carry `replay_ts_ms` (the recorded
+availability time of the frame being handled, never the wall clock),
+`replay_source_index`, `replay_frame_kind` and, when recorded,
+`replay_connection_id`. These do not enter the digest.
 
 ```bash
 python -m collector.scripts.replay 2026-06-03 --data-dir data --venue BYBIT --verify-determinism
@@ -135,7 +188,8 @@ python -m collector.scripts.replay 2026-06-03 --data-dir data --venue BYBIT --ve
 `replay_directory(..., venue=...)`) resolves the venue's own stream directories
 (see `STORAGE_NAMESPACES.md`) and keeps a row only if its own `venue` column
 matches the requested venue. Excluded rows are counted in
-`ReplaySource.skipped_rows` and logged. For OKX this includes the legacy
+`ReplaySource.skipped_rows`, copied onto `ReplayResult.skipped_rows` (so
+`replay_directory()` callers see them too), and logged. For OKX this includes the legacy
 unprefixed `raw_wire`, where captures made before storage namespacing share a
 directory with Binance's frames.
 
@@ -152,7 +206,9 @@ segments. Enforced by an AST-based test over the module's own imports
 | frame was undecodable when recorded | stays undecodable; counted, never re-parsed |
 | adapter cannot produce a valid event (malformed / missing required field) | `frames_unhandled` and a quality event; **no event is fabricated** (tested for OKX funding-rate) |
 | snapshot request failed | recorded as an attempt; bridges nothing |
-| snapshot never returned | excluded from the stream entirely |
+| snapshot never returned (a stored null reads back as `NaT`/`NaN`, not `None`) | excluded from the stream entirely and counted in `dropped_rest_rows`; it no longer aborts the replay |
+| REST row with a purpose replay does not drive | excluded and counted in `dropped_rest_rows` |
+| recorded `truncated` payload (capture clipped it; live saw the whole frame) | refused as `replay_truncated_frame`, counted in `frames_truncated` and `frames_undecodable` |
 | snapshot malformed or empty | rejected, counted |
 | `depth10` partial | refused as non-authoritative, as live does |
 | broken chain, later tidy increments | stays non-VALID; increments cannot repair it |
@@ -167,7 +223,10 @@ segments. Enforced by an AST-based test over the module's own imports
 - A full live-vs-replay parity harness over a captured production session does
   not exist. Parity is demonstrated by driving the same adapter and book
   engine over the same frames.
-- OKX order-book replay is untested and has no live collector (above).
+- OKX order-book replay is fixture-tested but has no live collector (above).
+- REST stamps have whole-millisecond resolution; same-millisecond WIRE-vs-REST order cannot be established and is reported, not resolved (see Causality).
+- `input_fingerprint` identifies the frames a replay consumed plus the exclusion counts. It is not a content fingerprint of excluded rows, and it does not prove the evidence is complete (a missing capture is not detectable from the capture itself).
+- Replay-side REST ordering resolution (`response_receive_ns`) is a separate, deferred task; nothing in this document describes it as implemented.
 - Non-book events are preserved, not featurised or quality-gated.
 - Bybit and OKX sequence semantics are exercised against documented protocol
   behaviour, not against real sequence-reset or gap events from the venues.
