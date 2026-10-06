@@ -23,7 +23,7 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Optional
 
 from ..canonical import CanonicalEvent, CanonicalTradeEvent
-from ..segment_dedup import dedup_identity_key
+from ..segment_dedup import DedupStateError, dedup_identity_key
 from ..instrument import InstrumentId, InstrumentIdError
 
 #: Bounded so a misbehaving venue cannot grow this without limit.
@@ -194,7 +194,13 @@ class ExchangeAdapter(ABC):
                 # segment; history is the persistent index. The lifetime set
                 # below is NOT touched (no unbounded RAM). A DedupStateError
                 # propagates -- never mapped to "new" or "duplicate".
-                is_new = self._trade_dedup.check_and_admit(dedup_identity_key(*key))
+                backend = self._trade_dedup
+                if isinstance(backend, dict):
+                    backend = backend.get(event.stream)
+                    if backend is None:   # a stream with no durable anchor must not silently bypass dedup
+                        raise DedupStateError(
+                            f"no segment-dedup backend registered for trade stream {event.stream!r}")
+                is_new = backend.check_and_admit(dedup_identity_key(*key))
             else:
                 is_new = key not in self._seen_trade_ids
                 if is_new:

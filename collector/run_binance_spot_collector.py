@@ -79,6 +79,7 @@ import signal
 import time
 
 from collector.collector.adapters.binance_spot import BinanceSpotAdapter
+from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
 from collector.collector.backoff import ExponentialBackoff
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import CanonicalOrderBookEvent, CanonicalTradeEvent
@@ -109,7 +110,8 @@ VENUE = "BINANCE_SPOT"
 
 class BinanceSpotCollectorApp:
     def __init__(self, data_dir: str = "data", url: str = BINANCE_SPOT_WS_URL,
-                 snapshot_url: str = BINANCE_SPOT_DEPTH_SNAPSHOT_URL) -> None:
+                 snapshot_url: str = BINANCE_SPOT_DEPTH_SNAPSHOT_URL,
+                 enable_segment_dedup: bool = True) -> None:
         self.url = url
         self.snapshot_url = snapshot_url
 
@@ -134,6 +136,12 @@ class BinanceSpotCollectorApp:
 
         self.adapter = BinanceSpotAdapter()
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
+        # P0-4: trades_writer is this runner's ONLY trade writer.
+        self.segment_dedup = None
+        if enable_segment_dedup:
+            self.segment_dedup = attach_segment_dedup(self.adapter, [
+                StreamSpec("spot_trades", self.trades_writer, "BINANCE", "spot"),
+            ])
         self.book = LocalBook(VENUE)
         self._book_lock = asyncio.Lock()
         self._recovery_task: asyncio.Task | None = None
@@ -268,9 +276,15 @@ class BinanceSpotCollectorApp:
                 "local_receive_ts": local_receive_ts, "local_ts": local_receive_ts,
             })
 
-        events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
-        for event in events:
-            await self._persist_event(event)
+        try:
+            events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
+            for event in events:
+                await self._persist_event(event)
+        finally:
+            # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
 
     async def _persist_event(self, event) -> None:
         if isinstance(event, CanonicalTradeEvent):
@@ -285,7 +299,7 @@ class BinanceSpotCollectorApp:
                 # generic ExchangeAdapter.__init_subclass__ mechanism (see
                 # adapters/base.py) -- not re-derived here.
                 "instrument_key": event.instrument.key if event.instrument is not None else None,
-            })
+            }, bind=bind_arg(getattr(self, "segment_dedup", None), event))
             self.stream_counters["trades"]["written"] += 1
             return
 

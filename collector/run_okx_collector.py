@@ -40,6 +40,7 @@ import signal
 import time
 
 from collector.collector.adapters.okx import OKXAdapter
+from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
 from collector.collector.canonical import (
     CanonicalLiquidationEvent,
     CanonicalMarkPriceEvent,
@@ -83,7 +84,7 @@ class OKXCollectorApp:
     def __init__(self, data_dir: str = "data", url: str = OKX_PUBLIC_WS_URL,
                  inst_id: str = OKX_BTC_SWAP_INST_ID,
                  index_inst_id: str = OKX_BTC_INDEX_INST_ID,
-                 channels=D11_CHANNELS) -> None:
+                 channels=D11_CHANNELS, enable_segment_dedup: bool = True) -> None:
         self.url = url
         self.inst_id = inst_id
         self.channels = tuple(channels)
@@ -116,6 +117,17 @@ class OKXCollectorApp:
             venue_stream("OKX", "liquidation"), OKX_LIQUIDATION_SCHEMA, base_dir=data_dir, exchange="OKX")
 
         self.adapter = OKXAdapter(inst_id=inst_id, index_inst_id=index_inst_id)
+        # P0-4: two independent trade representations, two anchors -- OKX's
+        # "trades" and "trades-all" are distinct streams (never merged, see
+        # adapters/okx.py's own docstring on why that question stays open),
+        # each with its own writer that receives every admitted event for
+        # that stream unconditionally.
+        self.segment_dedup = None
+        if enable_segment_dedup:
+            self.segment_dedup = attach_segment_dedup(self.adapter, [
+                StreamSpec("trades", self.trades_writer, "OKX", "linear_perpetual"),
+                StreamSpec("trades-all", self.trades_all_writer, "OKX", "linear_perpetual"),
+            ])
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
         self.messages_handled = 0
 
@@ -194,9 +206,15 @@ class OKXCollectorApp:
 
     async def _handle_message(self, data: dict, local_receive_ts: int, connection_id=None) -> None:
         self.messages_handled += 1
-        events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
-        for event in events:
-            self._persist_event(event)
+        try:
+            events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
+            for event in events:
+                self._persist_event(event)
+        finally:
+            # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
 
     def _persist_event(self, event) -> None:
         if isinstance(event, CanonicalOrderBookEvent):
@@ -221,7 +239,7 @@ class OKXCollectorApp:
                    "venue_sequence": event.venue_sequence}
             if event.stream == "trades-all":
                 row["source"] = event.source
-            writer.write(row)
+            writer.write(row, bind=bind_arg(getattr(self, "segment_dedup", None), event))
         elif isinstance(event, CanonicalMarkPriceEvent):
             if event.stream == "mark-price":
                 self.mark_writer.write({**base, "mark_price": event.mark_price})

@@ -53,6 +53,7 @@ import signal
 import time
 
 from collector.collector.adapters.bybit import BybitAdapter
+from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
 from collector.collector.book_engine import LocalBook
 from collector.collector.canonical import (
     CanonicalLiquidationEvent,
@@ -98,7 +99,8 @@ def _topics() -> list[str]:
 
 
 class BybitCollectorApp:
-    def __init__(self, data_dir: str = "data", url: str = BYBIT_PUBLIC_WS_URL) -> None:
+    def __init__(self, data_dir: str = "data", url: str = BYBIT_PUBLIC_WS_URL,
+                enable_segment_dedup: bool = True) -> None:
         self.url = url
         self.quality_writer = ParquetWriter(
             "bybit_quality_events", QUALITY_EVENTS_SCHEMA, base_dir=data_dir,
@@ -123,6 +125,14 @@ class BybitCollectorApp:
 
         self.adapter = BybitAdapter()
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
+        # P0-4: trades_writer is this runner's ONLY trade writer and
+        # receives every admitted trade unconditionally -- the correct
+        # recovery anchor (see run_collector.py's identical reasoning).
+        self.segment_dedup = None
+        if enable_segment_dedup:
+            self.segment_dedup = attach_segment_dedup(self.adapter, [
+                StreamSpec("trades", self.trades_writer, "BYBIT", "linear_perpetual"),
+            ])
         self.book = LocalBook("BYBIT")
         self.running = False
         self.messages_handled = 0
@@ -217,9 +227,15 @@ class BybitCollectorApp:
 
     async def _handle_message(self, data: dict, local_receive_ts: int, connection_id=None) -> None:
         self.messages_handled += 1
-        events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
-        for event in events:
-            self._persist_event(event)
+        try:
+            events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
+            for event in events:
+                self._persist_event(event)
+        finally:
+            # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
+            segment_dedup = getattr(self, "segment_dedup", None)
+            if segment_dedup is not None:
+                segment_dedup.end_message()
 
     def _persist_event(self, event) -> None:
         base = {
@@ -251,7 +267,7 @@ class BybitCollectorApp:
                 "venue_sequence": event.venue_sequence,
                 "block_trade": bool(event.block_trade) if event.block_trade is not None else None,
                 "rpi": bool(event.rpi) if event.rpi is not None else None,
-            })
+            }, bind=bind_arg(getattr(self, "segment_dedup", None), event))
         elif isinstance(event, CanonicalMarkPriceEvent):
             self.mark_writer.write({
                 **base, "mark_price": event.mark_price, "index_price": event.index_price,
