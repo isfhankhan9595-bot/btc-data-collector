@@ -24,6 +24,10 @@ after.
 buy_volume, sell_volume, trade_count, last_trade_local_receive_ts, age_ms,
 frames_considered)`.
 
+For many observations over one frame set use `TradeFlowObserver(frames, venue=...)`
+(one replay, value-identical answers); see the Performance section of
+`WINDOWED_TRADE_FLOW_OBSERVATION.md`.
+
 ## Real finding: cross-venue side-casing is not consistent
 
 The three adapters do not agree on `CanonicalTradeEvent.side` casing —
