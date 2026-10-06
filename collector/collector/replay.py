@@ -37,19 +37,37 @@ into **one** time-ordered stream:
 * a websocket frame becomes available at its ``local_receive_ts``
 * a REST snapshot becomes available at its ``response_receive_ts``
 
-This mirrors live exactly, where a snapshot requested during a gap arrives
+This mirrors live, where a snapshot requested during a gap arrives
 asynchronously and can only bridge the book once it has actually landed. A
 snapshot is therefore never visible to the engine before the moment it
 arrived in the recorded run, so replay cannot repair a gap using information
 from the future.
 
+What the evidence does NOT establish: REST rows are stamped in whole
+milliseconds, so within a millisecond shared by a WIRE frame and a REST row
+the true order is unobservable. ``order_key`` places the WIRE frame first --
+a deterministic convention, not a measurement. Replay reports each place it
+relied on that convention in ``ReplayResult.unresolved_order_ties`` rather
+than letting the result look fully evidenced.
+
 Determinism
 -----------
 
-Frames are ordered by a total key -- ``(timestamp, kind_rank, source_index)``
--- so ties never depend on filesystem iteration order, dict ordering or
-sort instability. Running the same input twice produces the same
-:attr:`ReplayResult.digest`.
+Frames are ordered by a total key --
+``(timestamp_ms, kind_rank, ns_tiebreak, source_index)`` -- so ties never
+depend on filesystem iteration order, dict ordering or sort instability.
+Running the same input twice produces the same :attr:`ReplayResult.digest`.
+
+Determinism is not causal truth. The key is deterministic everywhere; it is
+evidence-based only where the recorded stamps distinguish the frames.
+
+Three separate questions, three separate answers on :class:`ReplayResult`:
+
+* what was produced -- ``digest`` (output state only);
+* which recorded evidence produced it -- ``input_fingerprint``;
+* how trustworthy that evidence and ordering were -- ``integrity_issues()``
+  / ``is_pristine`` (skipped foreign rows, dropped REST rows, truncated,
+  undecodable or unhandled frames, rejected snapshots, unresolved ties).
 
 No network
 ----------
@@ -124,6 +142,10 @@ class ReplayFrame:
     #: Recorded monotonic ns; meaningful only relative to other frames of the
     #: same connection lineage in the same process run. Never an epoch value.
     receive_mono_ns: Optional[int] = None
+    #: Recorded ``truncated`` flag: the stored payload is a clipped prefix of
+    #: what the collector actually received (raw_capture bounds frame size).
+    #: Live saw the whole frame; replay can only see the prefix.
+    truncated: bool = False
 
     @property
     def order_key(self) -> tuple[int, int, int, int]:
@@ -168,6 +190,14 @@ class BookUpdate:
     quality_state: str
     event_kind: str
     recovery_generation: int
+    #: Recorded time at which this state first became AVAILABLE to the
+    #: collector: the ``timestamp_ms`` of the replay frame being handled when
+    #: the update was committed. ``timestamp_ms`` is the diff's own receive
+    #: time; for ``RECOVERY_BRIDGE`` / ``RECOVERY_INCREMENTAL`` updates the
+    #: book only became VALID when the bridging snapshot landed, which can be
+    #: later. Consumers joining on availability must use this, not
+    #: ``timestamp_ms``. Not part of ``digest_tuple`` (digest unchanged).
+    available_ts_ms: Optional[int] = None
 
     def digest_tuple(self) -> tuple:
         return (
@@ -199,15 +229,59 @@ class ReplayResult:
     oi_observations: int = 0
     oi_rejected: int = 0
     final_state: str = BookQuality.VALID.value
+    #: --- input provenance / integrity (NOT part of ``digest``) -----------
+    #: Recorded frames whose stored payload is a truncated prefix.
+    frames_truncated: int = 0
+    #: Rows a directory read refused because they named another venue.
+    skipped_rows: dict[str, int] = field(default_factory=dict)
+    #: REST rows excluded before becoming frames, by reason (request never
+    #: returned; purpose replay does not drive).
+    dropped_rest_rows: dict[str, int] = field(default_factory=dict)
+    #: Same-millisecond frame pairs whose true relative order the recorded
+    #: evidence cannot establish (see ``ReplaySource.unresolved_order_ties``).
+    unresolved_order_ties: dict[str, int] = field(default_factory=dict)
+    #: SHA-256 over the ordered input evidence plus the skip accounting.
+    input_fingerprint: Optional[str] = None
+
+    def integrity_issues(self) -> dict[str, Any]:
+        """Every condition under which this replay is NOT a clean,
+        fully-evidenced reconstruction. Empty means pristine.
+
+        Deliberately separate from :attr:`digest`: the digest says *what was
+        produced*; this says *how trustworthy the inputs and ordering were*.
+        """
+        issues: dict[str, Any] = {}
+        for name in ("frames_undecodable", "frames_unhandled", "frames_truncated",
+                     "snapshots_rejected", "oi_rejected"):
+            if getattr(self, name):
+                issues[name] = getattr(self, name)
+        for name in ("skipped_rows", "dropped_rest_rows", "unresolved_order_ties"):
+            if getattr(self, name):
+                issues[name] = dict(getattr(self, name))
+        if self.frames_total == 0:
+            issues["empty_replay"] = True
+        return issues
+
+    @property
+    def is_pristine(self) -> bool:
+        return not self.integrity_issues()
 
     @property
     def digest(self) -> str:
-        """Stable hash of the full output sequence.
+        """Stable hash of the replay's OUTPUT state sequence.
 
-        Covers book states, non-book canonical events, *and* quality
-        transitions, so a replay that produced the same prices via a
-        different quality path -- or the same book but a changed trade,
-        funding rate, OI reading, or liquidation -- does not compare equal.
+        Covers book states, non-book canonical events, *and* the
+        ``(event_type, reason, quality_state)`` of each quality event, so a
+        replay that produced the same prices via a different quality path --
+        or the same book but a changed trade, funding rate, OI reading, or
+        liquidation -- does not compare equal.
+
+        It is an output digest only. It does NOT cover the input evidence
+        (use :attr:`input_fingerprint`), the frame counters, skipped or
+        dropped source rows, unresolved ordering ties
+        (:meth:`integrity_issues`), or quality-event ``previous_state`` /
+        ``new_state`` / lineage keys. Equal digests therefore prove equal
+        output, not equal or clean inputs.
         """
         hasher = hashlib.sha256()
         for update in self.book_updates:
@@ -242,8 +316,12 @@ class ReplayResult:
             "snapshots_rejected": self.snapshots_rejected,
             "oi_observations": self.oi_observations,
             "oi_rejected": self.oi_rejected,
+            "frames_truncated": self.frames_truncated,
             "final_state": self.final_state,
             "digest": self.digest,
+            "input_fingerprint": self.input_fingerprint,
+            "pristine": self.is_pristine,
+            "integrity_issues": self.integrity_issues(),
         }
 
 
@@ -260,6 +338,69 @@ class ReplaySource:
         #: Rows a directory read refused because their ``venue`` column named
         #: a different venue (or none). Empty for a clean read; never silent.
         self.skipped_rows: dict[str, int] = {}
+        #: REST rows excluded before becoming frames, keyed by reason. Empty
+        #: for a source built from frames directly.
+        self.dropped_rest_rows: dict[str, int] = {}
+
+    def unresolved_order_ties(self) -> dict[str, int]:
+        """Count frames whose order against a same-millisecond neighbour is
+        a deterministic convention, not something the evidence establishes.
+
+        * ``wire_vs_rest_snapshot_same_ms`` / ``wire_vs_rest_oi_same_ms``:
+          REST rows are stamped in whole milliseconds, so a REST response
+          that shares a millisecond with a websocket frame may have landed
+          before or after it. ``order_key`` places the REST row second; that
+          is a tie-break, not an observation.
+        * ``wire_ns_vs_legacy_same_ms``: a WIRE frame with no ``receive_ns``
+          shares a millisecond with WIRE frames that have one; its position
+          among them is likewise unobservable.
+
+        Only non-zero keys are returned.
+        """
+        wire_ms: set[int] = set()
+        wire_with_ns_ms: set[int] = set()
+        for frame in self._frames:
+            if frame.kind == FrameKind.WIRE:
+                wire_ms.add(frame.timestamp_ms)
+                if frame.receive_ns is not None:
+                    wire_with_ns_ms.add(frame.timestamp_ms)
+        ties = {
+            "wire_vs_rest_snapshot_same_ms": sum(
+                1 for f in self._frames
+                if f.kind == FrameKind.REST_SNAPSHOT and f.timestamp_ms in wire_ms),
+            "wire_vs_rest_oi_same_ms": sum(
+                1 for f in self._frames
+                if f.kind == FrameKind.REST_OI and f.timestamp_ms in wire_ms),
+            "wire_ns_vs_legacy_same_ms": sum(
+                1 for f in self._frames
+                if f.kind == FrameKind.WIRE and f.receive_ns is None
+                and f.timestamp_ms in wire_with_ns_ms),
+        }
+        return {key: count for key, count in ties.items() if count}
+
+    def input_fingerprint(self) -> str:
+        """SHA-256 identifying exactly which recorded evidence this source
+        holds: every frame's kind, recorded timestamps, lineage, success
+        flags and payload hash, in replay order, plus the skip accounting.
+
+        This is the INPUT counterpart of ``ReplayResult.digest``. Two sources
+        with the same fingerprint present the engine identical evidence; the
+        output digest alone cannot say that (an unconsumed or ignored frame
+        changes nothing in it).
+        """
+        hasher = hashlib.sha256()
+        for frame in self._frames:
+            payload_hash = hashlib.sha256(
+                str(frame.payload).encode("utf-8", errors="surrogatepass")).hexdigest()
+            hasher.update(repr((
+                frame.kind, frame.timestamp_ms, frame.receive_ns,
+                frame.receive_mono_ns, frame.source_index, frame.connection_id,
+                frame.decode_ok, frame.http_ok, frame.endpoint, frame.truncated,
+                payload_hash,
+            )).encode())
+        hasher.update(repr(("skipped_rows", sorted(self.skipped_rows.items()))).encode())
+        hasher.update(repr(("dropped_rest_rows", sorted(self.dropped_rest_rows.items()))).encode())
+        return hasher.hexdigest()
 
     def __iter__(self) -> Iterator[ReplayFrame]:
         return iter(self._frames)
@@ -278,6 +419,7 @@ class ReplaySource:
         rest_rows: Sequence[dict] = (),
     ) -> "ReplaySource":
         frames: list[ReplayFrame] = []
+        dropped: dict[str, int] = {}
         index = 0
         for row in wire_rows:
             recv_ms = _as_ms(row.get("local_receive_ts") or row.get("timestamp"))
@@ -296,14 +438,18 @@ class ReplaySource:
                 decode_ok=bool(row.get("decode_ok", True)),
                 receive_ns=recv_ns,
                 receive_mono_ns=_optional_ns(row.get("receive_mono_ns"), "receive_mono_ns", epoch=False),
+                truncated=_recorded_flag(row.get("truncated")),
             ))
             index += 1
         for row in rest_rows:
             purpose = row.get("purpose")
             landed = row.get("response_receive_ts")
-            if landed is None:
+            if _is_missing(landed):
                 # A request that never returned was never available live,
-                # so it cannot become available in replay either.
+                # so it cannot become available in replay either. A stored
+                # null comes back from parquet as NaT/NaN, not None; both are
+                # "missing", and the exclusion is counted, never silent.
+                dropped["rest_request_never_returned"] = dropped.get("rest_request_never_returned", 0) + 1
                 continue
             if purpose == "orderbook_snapshot":
                 kind = FrameKind.REST_SNAPSHOT
@@ -316,15 +462,21 @@ class ReplaySource:
                 # Recorded lineage for a purpose replay does not yet drive
                 # (e.g. a future REST stream). Kept out of the frame stream
                 # deliberately, not silently: nothing currently claims to
-                # replay it, so nothing should quietly start doing so.
+                # replay it, so nothing should quietly start doing so. It is
+                # counted in ``dropped_rest_rows`` so the exclusion is visible.
+                key = f"rest_unsupported_purpose:{purpose}"
+                dropped[key] = dropped.get(key, 0) + 1
                 continue
             frames.append(ReplayFrame(
                 timestamp_ms=_as_ms(landed), kind=kind,
                 source_index=index, payload=row.get("payload") or "",
                 http_ok=bool(row.get("ok", False)), endpoint=row.get("endpoint"),
+                truncated=_recorded_flag(row.get("truncated")),
             ))
             index += 1
-        return cls(frames)
+        source = cls(frames)
+        source.dropped_rest_rows = dropped
+        return source
 
     @classmethod
     def from_directory(
@@ -420,6 +572,21 @@ def _optional_ns(value, name: str, *, epoch: bool = True):
     return value
 
 
+def _is_missing(value: Any) -> bool:
+    """None, NaN, or pandas NaT/NA: a stored null in any of the shapes a
+    parquet read can produce. ``value is None`` alone misses NaT."""
+    if value is None:
+        return True
+    if type(value).__name__ in ("NaTType", "NAType"):
+        return True
+    return isinstance(value, float) and value != value
+
+
+def _recorded_flag(value: Any) -> bool:
+    """A recorded boolean flag; a missing value is False (not flagged)."""
+    return False if _is_missing(value) else bool(value)
+
+
 def _row_venue(row: dict) -> str:
     """A stored row's venue, upper-cased; ``""`` when it names none.
 
@@ -482,6 +649,8 @@ class ReplayEngine:
         self.adapter = adapter_cls()
         self.book = LocalBook(self.venue, max_buffer_events=max_buffer_events)
         self.result = ReplayResult()
+        #: Recorded time of the frame currently being handled.
+        self._frame_ts_ms: Optional[int] = None
         self.adapter.set_unhandled_sink(self._on_unhandled)
 
     # -- recording helpers ------------------------------------------------
@@ -529,6 +698,7 @@ class ReplayEngine:
             quality_state=applied.quality_state,
             event_kind=event_kind,
             recovery_generation=generation,
+            available_ts_ms=self._frame_ts_ms,
         ))
 
     # -- frame handling ---------------------------------------------------
@@ -542,6 +712,18 @@ class ReplayEngine:
             self.result.quality_events.append({
                 "event_type": QualityEventType.ERROR.value,
                 "reason": "replay_undecodable_frame",
+                "quality_state": self.book.state.state.value,
+            })
+            return
+        if frame.truncated:
+            # Capture clipped this payload to bound its size. Live handled the
+            # complete frame; replay holds only a prefix and must not guess
+            # the rest. Refused under its own reason so a clipped recording
+            # is never mistaken for a frame that was undecodable on arrival.
+            self.result.frames_undecodable += 1
+            self.result.quality_events.append({
+                "event_type": QualityEventType.ERROR.value,
+                "reason": "replay_truncated_frame",
                 "quality_state": self.book.state.state.value,
             })
             return
@@ -766,25 +948,59 @@ class ReplayEngine:
 
     # -- driver -----------------------------------------------------------
 
+    def _stamp_lineage(self, first_new: int, frame: ReplayFrame) -> None:
+        """Attach source lineage to quality events raised while handling
+        ``frame``. Additive keys only (``setdefault``): an event's own
+        fields are never overwritten, and ``digest`` reads none of these.
+
+        ``replay_ts_ms`` is the frame's recorded availability time -- what
+        the collector could have known when the event fired -- never the
+        time replay ran.
+        """
+        for event in self.result.quality_events[first_new:]:
+            if not isinstance(event, dict):
+                continue
+            event.setdefault("replay_ts_ms", frame.timestamp_ms)
+            event.setdefault("replay_source_index", frame.source_index)
+            event.setdefault("replay_frame_kind", frame.kind)
+            if frame.connection_id is not None:
+                event.setdefault("replay_connection_id", frame.connection_id)
+
     def run(self, source: ReplaySource | Iterable[ReplayFrame]) -> ReplayResult:
         frames = source if isinstance(source, ReplaySource) else ReplaySource(source)
+        # Input provenance travels with the result. Without this, a replay
+        # that skipped foreign-venue rows or dropped REST rows was
+        # indistinguishable from a pristine one once ``from_directory``'s
+        # source object went out of scope (see ``replay_directory``).
+        self.result.skipped_rows = dict(frames.skipped_rows)
+        self.result.dropped_rest_rows = dict(frames.dropped_rest_rows)
+        self.result.unresolved_order_ties = frames.unresolved_order_ties()
+        self.result.input_fingerprint = frames.input_fingerprint()
         for frame in frames:
             self.result.frames_total += 1
-            if frame.kind == FrameKind.WIRE:
-                self._handle_wire(frame)
-            elif frame.kind == FrameKind.REST_SNAPSHOT:
-                self._handle_snapshot(frame)
-            elif frame.kind == FrameKind.REST_OI:
-                self._handle_rest_oi(frame)
-            else:
-                self.result.quality_events.append({
-                    "event_type": QualityEventType.DATA_DROP.value,
-                    "reason": f"replay_unknown_frame_kind:{frame.kind}",
-                    "quality_state": self.book.state.state.value,
-                })
+            if frame.truncated:
+                self.result.frames_truncated += 1
+            first_new_event = len(self.result.quality_events)
+            self._dispatch(frame)
+            self._stamp_lineage(first_new_event, frame)
         self._drain_book_quality()
         self.result.final_state = self.book.state.state.value
         return self.result
+
+    def _dispatch(self, frame: ReplayFrame) -> None:
+        self._frame_ts_ms = frame.timestamp_ms
+        if frame.kind == FrameKind.WIRE:
+            self._handle_wire(frame)
+        elif frame.kind == FrameKind.REST_SNAPSHOT:
+            self._handle_snapshot(frame)
+        elif frame.kind == FrameKind.REST_OI:
+            self._handle_rest_oi(frame)
+        else:
+            self.result.quality_events.append({
+                "event_type": QualityEventType.DATA_DROP.value,
+                "reason": f"replay_unknown_frame_kind:{frame.kind}",
+                "quality_state": self.book.state.state.value,
+            })
 
 
 def replay_directory(
