@@ -333,7 +333,7 @@ def test_non_strict_split_parquet_write_degrades_gracefully_not_crashes(tmp_path
     _corrupt_one_file(tmp_path, "2026-01-10")
     manifest = generate_splits(str(tmp_path), embargo_days=0, strict=False)
     assert manifest is not None
-    train_path = tmp_path / "splits" / "train.parquet"
+    train_path = tmp_path / "splits" / _manifest_json(tmp_path)["artifacts"]["train"]["path"]
     assert train_path.exists()
     assert any("2026-01-10" in w and "excluded" in w for w in manifest.warnings)
 

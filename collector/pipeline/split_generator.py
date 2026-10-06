@@ -43,8 +43,11 @@ producing a mislabelled artifact.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import math
+import shutil
 
 from collector.pipeline.label_generator import (
     LabelDiscoveryError,
@@ -83,12 +86,113 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        # The rename lives in the parent directory's metadata: make it
+        # durable, and fail closed (raise) if that cannot be established.
+        _fsync_dir(directory)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+
+
+def _fsync_dir(path: str) -> None:
+    """Fsync a directory so a rename/creation inside it is durable.
+
+    FAIL CLOSED: an ``OSError`` from opening or fsyncing the directory (e.g.
+    ``EIO``) propagates, so a caller can never report a publication as durable
+    when durability could not be established. The only exemption is Windows,
+    where a directory cannot be opened for fsync at all (a platform
+    capability, not a runtime failure).
+    """
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _publish_generation(out_dir: str, blobs: dict[str, bytes]) -> tuple[str, dict]:
+    """Publish a complete set of split Parquets as one immutable generation.
+
+    Several fixed-name files cannot be swapped atomically with ``os.replace``
+    (each rename is atomic, the sequence is not), so the files are never
+    replaced in place. Instead the whole set is written into a private temp
+    directory and published with a single directory rename to
+    ``generations/<id>``, where ``<id>`` is derived from the artifact bytes
+    (deterministic: identical data -> identical id). A generation directory is
+    therefore either absent or complete, and is never modified afterwards.
+
+    Nothing here is visible to readers until ``split_manifest.json`` -- the
+    commit record, written last by the caller -- names it. A crash at any
+    point leaves the previous manifest and the generation it names untouched.
+
+    Returns ``(generation_id, artifacts)`` where ``artifacts`` maps split name
+    to ``{path, sha256, bytes}`` with ``path`` relative to ``out_dir``.
+    """
+    digests = {name: _sha256(data) for name, data in sorted(blobs.items())}
+    generation = _sha256(json.dumps(digests, sort_keys=True).encode("utf-8"))[:16]
+    artifacts = {
+        name: {
+            "path": f"generations/{generation}/{name}.parquet",
+            "sha256": digests[name],
+            "bytes": len(blobs[name]),
+        }
+        for name in sorted(blobs)
+    }
+    gens_dir = os.path.join(out_dir, "generations")
+    os.makedirs(gens_dir, exist_ok=True)
+    final = os.path.join(gens_dir, generation)
+
+    if os.path.isdir(final):
+        # Content-addressed: same id means the same bytes were published
+        # before. Trust nothing -- re-check, and fail closed on a mismatch.
+        for name, info in artifacts.items():
+            existing = os.path.join(out_dir, info["path"])
+            try:
+                with open(existing, "rb") as handle:
+                    ok = _sha256(handle.read()) == info["sha256"]
+            except OSError:
+                ok = False
+            if not ok:
+                raise RuntimeError(
+                    f"existing split generation {final!r} does not match its "
+                    f"content address ({name}.parquet missing or altered); refusing "
+                    "to publish a manifest that references it"
+                )
+        # A prior attempt may have renamed the generation into place and then
+        # failed (or crashed) before its directory entries were made durable.
+        # The content is verified; make the directory chain durable too.
+        _fsync_dir(final)
+        _fsync_dir(gens_dir)
+        _fsync_dir(out_dir)
+        return generation, artifacts
+
+    tmp_dir = tempfile.mkdtemp(dir=gens_dir, prefix=".tmp-")
+    try:
+        for name, data in blobs.items():
+            with open(os.path.join(tmp_dir, f"{name}.parquet"), "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        _fsync_dir(tmp_dir)
+        os.rename(tmp_dir, final)
+        # Rename durable in generations/, then generations/ itself (which may
+        # have just been created) durable in out_dir -- BEFORE any manifest
+        # naming this generation can be written. Failures propagate.
+        _fsync_dir(gens_dir)
+        _fsync_dir(out_dir)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    return generation, artifacts
 
 #: Longest label horizon produced by ``label_generator`` today.
 
@@ -118,6 +222,13 @@ class SplitManifest:
     #: measured off the label columns, so the distinction is persisted.
     max_label_horizon_source: str = "caller_supplied"
     warnings: list[str] = field(default_factory=list)
+    #: Id of the published Parquet generation this manifest commits, or None
+    #: when no Parquet artifacts were published. ``artifacts`` maps each
+    #: published split to its relative path, sha256 and size. The manifest is
+    #: the commit record: it is written only after every artifact it names is
+    #: durably in place, so it can never describe a partial set.
+    generation: Optional[str] = None
+    artifacts: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -453,6 +564,31 @@ def generate_splits(
                     manifest.warnings.append(message)
             split_frames[split_name] = frames
 
+    # Serialise EVERY artifact in memory first: a serialisation failure must
+    # happen before anything new touches disk.
+    blobs: dict[str, bytes] = {}
+    rows: dict[str, int] = {}
+    if write_parquet:
+        for split_name, frames in split_frames.items():
+            if not frames:
+                print(f"WARNING: {split_name}.parquet has no readable days -- skipped entirely")
+                continue
+            combined = pd.concat(frames, ignore_index=True)
+            buffer = io.BytesIO()
+            combined.to_parquet(buffer, compression="snappy")
+            blobs[split_name] = buffer.getvalue()
+            rows[split_name] = len(combined)
+
+    # Publish artifacts first (one atomic directory rename), the manifest LAST.
+    # The manifest is the commit record: until its single atomic replace
+    # succeeds, readers keep seeing the previous manifest and the previous,
+    # untouched generation it names.
+    if blobs:
+        manifest.generation, manifest.artifacts = _publish_generation(out_dir, blobs)
+        for split_name, info in manifest.artifacts.items():
+            info["rows"] = rows[split_name]
+            print(f"Published {split_name}.parquet -> {info['path']}")
+
     _atomic_write_bytes(
         os.path.join(out_dir, "split_manifest.json"),
         json.dumps(manifest.to_dict(), indent=2).encode("utf-8"),
@@ -467,19 +603,6 @@ def generate_splits(
           f"Test: {len(manifest.test)} days")
     for warning in manifest.warnings:
         print(f"WARNING: {warning}")
-
-    if write_parquet:
-        import io
-
-        for split_name, frames in split_frames.items():
-            if not frames:
-                print(f"WARNING: {split_name}.parquet has no readable days -- skipped entirely")
-                continue
-            combined = pd.concat(frames, ignore_index=True)
-            buffer = io.BytesIO()
-            combined.to_parquet(buffer, compression="snappy")
-            _atomic_write_bytes(os.path.join(out_dir, f"{split_name}.parquet"), buffer.getvalue())
-            print(f"Saved {split_name}.parquet")
 
     return manifest
 
