@@ -504,6 +504,12 @@ class BybitCollectorApp:
             })
         if applied is None:
             return
+        if applied.quality_state != BookQuality.VALID.value:
+            # The orderbook row has no quality_state column, so a row written
+            # from an untrusted book would be indistinguishable from an
+            # authoritative one. Persist only VALID state, whatever apply()
+            # returned.
+            return
         bids, asks = applied.bids, applied.asks
         self.ob_writer.write({
             **base,
