@@ -163,14 +163,13 @@ P0-7: both `"timestamp"` and `"local_timestamp"` are `event.local_receive_ts`.
   distinguishes a day with **no liquidation segment collected at all**
   (`False` — the zero columns carry no evidentiary weight, we simply don't
   know) from a day where the stream **was** collected and a bin genuinely saw
-  no events (`True` — a confidently observed zero). This does not extend to
-  per-bin outage detection (e.g. a mid-day WS reconnect gap within an
-  otherwise-available day) — building that would require joining the
-  collector's persisted quality-event stream against the grid, which is a
-  separate, larger undertaking outside P0-7's scope. The known limitation:
-  liquidations, like trades, rely on the same real-time WS capture with no
-  separate per-bin coverage record; an empty bin within an "available" day is
-  only as trustworthy as that connection's own uptime for that window.
+  no events (`True`). **Superseded for per-bin claims**: that flag is
+  day-level, and a `True` does NOT make an empty bin a confidently observed zero
+  (a mid-day market-socket outage leaves it `True`). Per-bin outage detection is
+  now `liquidation_bin_observed` (see "Availability truth" below). The earlier
+  assumption that this needed a join against the quality-event stream was
+  unnecessary: the market socket's own receive-time frames already bound an
+  outage.
 
 ### Instrument/venue isolation
 
@@ -241,12 +240,15 @@ forward, which is causal.
 
 ### Stream availability
 
-`trades_stream_available` (new) mirrors `liquidation_stream_available`: `False`
-means no trades segment was collected for the day, so the zero trade columns
-carry no evidentiary weight. `True` with `trade_count == 0` is an observed empty
-bin, as trustworthy as the WS connection's own coverage (no per-bin coverage
-record is persisted, unchanged). `trade_flow_imbalance` is `0.0` for an empty bin
-(unchanged); use `trade_count` to tell "balanced" from "no trades".
+`trades_stream_available` mirrors `liquidation_stream_available`: `False` means
+no trades segment was collected for the day, so the zero trade columns carry no
+evidentiary weight. **`True` is a day-level fact only ("a segment exists") and is
+NOT proof that an empty bin was observed**: a mid-day disconnect leaves it `True`
+while every bin in the outage reads `trade_count == 0`, bit-for-bit identical to a
+bin where the stream was alive and nothing traded (demonstrated, see "Availability
+truth" below). The per-bin proof is `trades_bin_observed`. `trade_flow_imbalance`
+is `0.0` for an empty bin (unchanged); use `trade_count` to tell "balanced" from
+"no trades", and `trades_bin_observed` to tell "no trades" from "no evidence".
 
 ### Liquidation dedup (heuristic, now measurable)
 
@@ -291,3 +293,102 @@ produced a hugely negative sentinel that silently fell out of every join.
   than `"BUY"` (including empty/unknown) to side `-1`.
 
 Tests: `tests/test_dataset_assembler_integrity_audit.py`.
+
+## Availability truth: observed zero vs no evidence (Agent 10)
+
+Rule: *absence of an event is not evidence of zero activity unless the stream was
+demonstrably delivering for that interval.* Until this section the assembler could
+not state that per bin. Reproduced against the real assembler (1 s grid): a trades
+stream with a 05:00-05:10 collector outage and one alive-but-quiet second at
+12:00:10 produced, for 05:05:00 and 12:00:10, **identical values in every trade
+column including `trades_stream_available == True`**. Same for liquidations over a
+20-minute market-socket outage.
+
+### What is proven, and from what
+
+Per-bin proof reuses the repository's one evidence-interval model,
+`collector/collector/coverage.py::compute_coverage` (an observation at `t` covers
+`[t, t + tolerance)`; leading, interior, trailing and total-absence gaps). The
+assembler only maps that model's gaps onto the grid; it defines no second
+availability system. Evidence is always the receive-time availability clock
+(`<stream>_ts`), never exchange or processing time.
+
+A grid row `T` owns the receive-time bin `(T - grid_ms, T]`, clipped to the
+requested day (the bin `_grid_bin` assigns events to). It is **observed only if
+every millisecond of that bin is covered**. A millisecond `x` is covered only by
+receipts at or before `x`, so a row's flag depends only on frames received at or
+before `T`; a later frame can never back-fill an earlier bin.
+
+### New fields
+
+| | `trades_bin_observed` | `liquidation_bin_observed` |
+|---|---|---|
+| meaning | the trades stream demonstrably delivered throughout the bin | the shared market WebSocket demonstrably delivered throughout the bin |
+| input evidence | receive time of every trade row in the day's trades segments | receive time of every trade, markPrice and liquidation row (duplicates included) |
+| availability clock | `local_timestamp` (receive time); legacy fallback to `timestamp` is flagged by `trades_time_unknown` | same |
+| aggregation | `compute_coverage` gaps over the day, mapped to bins; bin observed iff no gap overlaps it | same, over the union of the three streams' receipts |
+| tolerance (staleness budget) | `config.TRADES_STALE_MS` = 5000 ms | `config.MARKPRICE_STALE_MS` = 5000 ms |
+| missing behavior | no trades segment, or no usable receipt: `False` for every bin | no liquidation segment, or no usable receipt: `False` for every bin |
+| stale behavior | more than the tolerance after the last receipt: `False` | same |
+| invalid behavior | null/non-numeric receive time is dropped (counted, existing WARNING) and is not evidence | same |
+| units / type | bool (never null) | bool (never null) |
+| causal guarantee | depends only on receipts `<= T`; future receipts, exchange time and processing time never contribute | same |
+
+Why the market socket: `aggTrade`, `markPrice@1s` and `forceOrder` are subscribed
+on ONE WebSocket (`BINANCE_MARKET_WS_URL`, `stream_group="market"`;
+`run_collector.py` builds one `WebSocketClient` for it and `_route_stream` fans the
+frames out). Liquidations are event-sparse (`LIQUIDATION_STALE_MS` is 30 min), so
+the stream's own frames cannot bound an outage; markPrice's 1 s cadence can. The
+order book rides a **separate** socket (`BINANCE_PUBLIC_WS_URL`) and is never
+evidence for these two streams.
+
+### Semantic matrix
+
+| Condition | Value columns (`trade_count`, `*_volume`, `liquidation_*`) | Flag that carries the truth |
+|---|---|---|
+| stream observed, genuinely zero | `0` | `*_bin_observed == True` |
+| stream/connection down inside the bin | `0` (**not evidence**) | `*_bin_observed == False` |
+| no segment for the day | `0` (**not evidence**) | `*_stream_available == False`, `*_bin_observed == False` |
+| bin only partly covered, events present | real events, **lower bound** | `*_bin_observed == False`, `trade_count > 0` possible |
+| receive time unknown (legacy column absent) | value present | `*_time_unknown == True` |
+| receive time null | row dropped, counted | n/a |
+| stale beyond tolerance | `0` (**not evidence**) | `*_bin_observed == False` |
+| future receipt | never aggregated into an earlier row, never evidence for it | n/a |
+| unreadable source file | assembly raises; no dataset is written | n/a |
+
+`*_bin_observed == True` implies `*_stream_available == True`; never the reverse.
+Count and volume columns are deliberately **not** changed to NaN: an unobserved bin
+still stores `0`, and consumers must gate on `*_bin_observed`. A zero with
+`*_bin_observed == False` is "no evidence", never "observed none".
+
+### Known limits (not hidden)
+
+* **Tolerance is a declared budget, not a measurement.** A bin up to 5 s after a
+  real drop can still read `observed` with a zero count, because the last receipt's
+  evidence interval has not yet expired. Bounded, not eliminated.
+* **Liquidation proof is connection liveness.** It proves the shared socket was
+  delivering, not that the `forceOrder` subscription alone was healthy; Binance
+  sends no `forceOrder` heartbeat, so a per-subscription stall is undetectable here.
+* **No liquidation segment for a whole day is never observed**, even if the market
+  was quiet (fail-closed; BTCUSDT normally has liquidations daily).
+* **Order-book validity is not provable from the parquet.** `ORDERBOOK_SCHEMA` has
+  no `quality_state`. The guarantee is producer-side and executable:
+  `run_collector._handle_binance_orderbook` returns before writing when
+  `book_source != "DIFF_DEPTH_RECONSTRUCTED"` and when `LocalBook.apply()` (the
+  `binance_book`) returns `None` (gap/recovery/invalid), so invalid books are
+  *absent*, not marked.
+  `orderbook_gap == False` therefore means "a row was received within 500 ms", never
+  "validated". Rows written before that guard existed (the legacy
+  `_handle_orderbook` partial-depth path has no production caller now) cannot be
+  identified from the data.
+* **`*_time_unknown` is generated, not enforced.** No code outside tests reads these
+  flags. `orderbook_/markprice_/openinterest_time_unknown` are nullable (`None` in a
+  gap row, where there is no observation) while `trades_`/`liquidation_` are
+  coerced to bool. In a day mixing legacy segments (no `local_timestamp`) with
+  modern ones, the legacy rows are dropped (WARNING) rather than flagged, so their
+  bins read `orderbook_gap == True`; fail-closed, but the loss is only in the log.
+* **`scripts/gap_report.py` measures coverage on `timestamp` (processing time)**,
+  while this assembler uses `local_timestamp`. Its OI tolerance (300 000 ms) is also
+  60x the assembler's (`OI_STALE_MS = 5000`). Not changed here.
+
+Tests: `tests/test_dataset_assembler_availability_truth.py`.
