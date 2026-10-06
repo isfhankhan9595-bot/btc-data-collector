@@ -212,3 +212,82 @@ caller passes no `local_receive_ts`. The live path (`WebSocketClient`) and
 replay always supply one, so the fallback only affects ad-hoc direct
 calls; it is a fabrication risk for such callers and is recorded as a
 remaining issue rather than widened into this change.
+
+## P1 assembler integrity audit
+
+### Day boundary (fixed)
+
+Trades and liquidations are binned to `(T - grid_ms, T]` with `T = start_ts +
+ceil((t - start_ts) / grid_ms) * grid_ms`, on the availability clock. Segment
+files are partitioned by the **wall-clock hour of the write call**
+(`ParquetWriter._get_current_hour_str`), not by row receive time, so a row
+received just before midnight but written just after it sits in the new day's
+segment with `local_timestamp < start_ts`. Previously `ceil` clamped any event
+in `(start_ts - grid_ms, start_ts)` into the **first bin of the day**, and an
+in-day event in `(last_grid, end_ts)` mapped to a bin label `>= end_ts` that has
+no row and was dropped without a trace.
+
+Now only events with `start_ts <= t <= last_grid` are binned. Everything else is
+excluded **and counted** in a `WARNING` line: before `start_ts`, in the trailing
+partial bin (no grid row exists), or at/after `end_ts`. A consequence worth
+stating: the final `< grid_ms` of each day cannot be represented in that day's
+dataset, and the previous day's tail is no longer carried into the next day's
+first row. Carrying it would require attributing out-of-day evidence to the
+requested day, which this contract forbids.
+
+`merge_asof` streams (orderbook, markprice, OI) are unaffected: a backward join
+on receive time within a tolerance only ever carries earlier-available state
+forward, which is causal.
+
+### Stream availability
+
+`trades_stream_available` (new) mirrors `liquidation_stream_available`: `False`
+means no trades segment was collected for the day, so the zero trade columns
+carry no evidentiary weight. `True` with `trade_count == 0` is an observed empty
+bin, as trustworthy as the WS connection's own coverage (no per-bin coverage
+record is persisted, unchanged). `trade_flow_imbalance` is `0.0` for an empty bin
+(unchanged); use `trade_count` to tell "balanced" from "no trades".
+
+### Liquidation dedup (heuristic, now measurable)
+
+The `(exchange_timestamp, side, price, quantity)` key cannot prove identity.
+Changes: rows are ordered by availability time **before** `keep="first"` (so the
+earliest-received copy survives regardless of segment file order); rows with a
+null `exchange_timestamp` are never collapsed (NaN compared equal to NaN);
+`liquidation_dup_dropped` (new, int32) counts rows the heuristic collapsed, in
+the bin of the collapsed row's own receive time. A nonzero value is a lower bound
+on possible over-collapse, not an error count.
+
+### Null availability time
+
+A row whose `local_timestamp` is null (or null `timestamp` on the legacy
+fallback path) is dropped with a `WARNING` count. Previously `NaT.astype("int64")`
+produced a hugely negative sentinel that silently fell out of every join.
+
+### Audited, no change
+
+* Legacy fallback to `timestamp`: in every writer in this repository `timestamp`
+  is processing time (`time.time()` at handling), which is never earlier than
+  receive time, so the fallback can only delay availability, never advance it.
+  It cannot create false historical causality; rows are retained and flagged
+  `*_time_unknown`. **No downstream consumer (`label_generator`,
+  `split_generator`, `stats_computer`) reads these flags**, so they document
+  uncertainty without enforcing anything. Rows written before P0-6/P0-7 may carry
+  `local_timestamp == timestamp` (processing time) and are *not* flagged.
+* Orderbook validity: `ORDERBOOK_SCHEMA` carries no `quality_state`. The live
+  handler only persists rows after the book applied a diff in a valid state
+  (`run_collector._handle_binance_orderbook` returns before writing on a gap or
+  recovery), so invalid books are absent rather than marked. The assembler cannot
+  verify this from the parquet and invents no signal; staleness is bounded only by
+  the 500 ms tolerance. `bids_*`/`asks_*` are dropped, `bid_depth`/`ask_depth` kept.
+* Unknown trade side: a null `is_buyer_maker` raises; it is never guessed.
+  Upstream (`validator.validate_trade`) rejects `quantity <= 0`, so the assembler
+  has no non-positive-quantity guard of its own (a negative quantity would subtract
+  from `buy_volume`).
+* Equal availability timestamps: the stable sort keeps input order and
+  `merge_asof` takes the last row, so the last-written row wins; earlier states at
+  the same millisecond are overwritten without a trace. Deterministic, not lossless.
+* Upstream, not changed here: `compute_liquidation_features` maps any `S` other
+  than `"BUY"` (including empty/unknown) to side `-1`.
+
+Tests: `tests/test_dataset_assembler_integrity_audit.py`.
