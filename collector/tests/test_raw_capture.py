@@ -346,3 +346,66 @@ def test_base_adapter_exposes_the_contract():
 
 def test_default_payload_limit_is_generous_enough_for_a_depth1000_snapshot():
     assert DEFAULT_MAX_PAYLOAD_BYTES >= 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# Truncation event semantics: rows_lost is a ROW count, bytes are separate
+# ---------------------------------------------------------------------------
+
+
+def _truncation_events(events):
+    return [e for e in events if e["reason"] == "raw_payload_truncated"]
+
+
+@pytest.mark.parametrize("kind", ["wire", "rest"])
+def test_truncation_event_counts_one_row_and_keeps_byte_length_separately(kind):
+    events = []
+    writer = _Writer()
+    cap = RawCapture(
+        writer if kind == "wire" else None,
+        writer if kind == "rest" else None,
+        quality_event_sink=events.append,
+        max_payload_bytes=100,
+    )
+    if kind == "wire":
+        assert cap.capture_wire(RawWireRecord(1, "z" * 5000, "BINANCE", connection_id="c1"))
+    else:
+        assert cap.capture_rest(RawRestRecord(1, 2, "/x", "test", payload="z" * 5000))
+    (event,) = _truncation_events(events)
+    assert event["event_type"] == "DATA_DROP"
+    assert event["rows_lost"] == 1, "one truncated frame is ONE affected row, not N bytes"
+    assert event["payload_bytes"] == 5000, "original byte length stays available, separately"
+    # The raw row itself still carries the same true length and the flag.
+    (row,) = writer.rows
+    assert row["truncated"] is True and row["payload_bytes"] == 5000
+    assert len(row["payload"]) <= 100
+
+
+def test_truncation_event_rows_lost_is_independent_of_payload_size():
+    events = []
+    cap = RawCapture(_Writer(), quality_event_sink=events.append, max_payload_bytes=10)
+    cap.capture_wire(RawWireRecord(1, "a" * 11, "BINANCE"))
+    cap.capture_wire(RawWireRecord(2, "b" * 100_000, "BINANCE"))
+    small, large = _truncation_events(events)
+    assert small["rows_lost"] == large["rows_lost"] == 1
+    assert (small["payload_bytes"], large["payload_bytes"]) == (11, 100_000)
+
+
+def test_non_truncated_payload_emits_no_truncation_event_and_stats_stay_correct():
+    events = []
+    cap = RawCapture(_Writer(), _Writer(), quality_event_sink=events.append, max_payload_bytes=100)
+    cap.capture_wire(RawWireRecord(1, "ok", "BINANCE"))
+    cap.capture_wire(RawWireRecord(2, "q" * 100, "BINANCE"))  # exactly at the cap
+    assert _truncation_events(events) == []
+    assert cap.stats() == {"wire_captured": 2, "rest_captured": 0,
+                           "capture_failures": 0, "truncations": 0}
+
+
+def test_truncation_stats_count_frames_not_bytes_and_ingestion_stays_fail_open():
+    def bad_sink(_event):
+        raise RuntimeError("sink down")
+
+    cap = RawCapture(_Writer(), quality_event_sink=bad_sink, max_payload_bytes=10)
+    assert cap.capture_wire(RawWireRecord(1, "w" * 1000, "BINANCE")) is True
+    assert cap.stats()["truncations"] == 1
+    assert cap.stats()["wire_captured"] == 1 and cap.stats()["capture_failures"] == 0

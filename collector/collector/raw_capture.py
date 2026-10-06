@@ -396,7 +396,16 @@ class RawCapture:
                     "stream": "raw_capture",
                     "event_type": "DATA_DROP",
                     "reason": "raw_payload_truncated",
-                    "rows_lost": row.get("payload_bytes"),
+                    # ``rows_lost`` is a ROW count everywhere else in the
+                    # quality-event contract (1/0/N events). One truncated
+                    # frame is one affected row -- never its byte length.
+                    "rows_lost": 1,
+                    # The original (pre-truncation) byte length is separate
+                    # evidence. It is carried on the event as an extra key
+                    # (unknown keys are ignored by the quality-event writers,
+                    # so this is schema-compatible) and is durably recorded on
+                    # the raw row itself as ``payload_bytes`` + ``truncated``.
+                    "payload_bytes": row.get("payload_bytes"),
                     "connection_id": row.get("connection_id"),
                     "local_ts": int(time.time() * 1000),
                 }
