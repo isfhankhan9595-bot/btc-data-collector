@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import importlib
 from unittest.mock import AsyncMock, MagicMock, patch
 from collector.collector.websocket_client import WebSocketClient
 
@@ -547,12 +548,31 @@ async def test_drain_that_completes_in_time_abandons_nothing_and_reports_nothing
 @pytest.mark.asyncio
 async def test_on_message_receives_the_arrival_timestamp_not_the_processing_timestamp():
     """Research eligibility is `local_receive_ts <= observation_ts`. A frame
-    that arrives at T1 and is processed at T2 must reach on_message stamped
-    T1: queueing delay must never rewrite when the data was actually
-    available. The clock is controlled, so a regression that re-reads the
-    clock at processing time is a hard, deterministic failure."""
+    arrives once, is stamped once (P0-11's `capture_receive_stamp`, called
+    exactly once per frame at the receive boundary -- see clock.py's own
+    docstring), and queueing delay before processing must never rewrite
+    that stamp.
+
+    `capture_receive_stamp`'s default clock callables
+    (`time.time_ns`/`time.monotonic_ns`) are bound once, at function
+    *definition* time -- not late-binding -- so patching `time.time_ns`
+    afterwards (the old test's approach, applied to the wrong function
+    entirely) has no effect on what the function actually calls. The
+    correct seam is `capture_receive_stamp` itself, as imported into
+    `websocket_client`'s own module namespace (`from .clock import ...
+    capture_receive_stamp`) -- patching the name the call site resolves.
+
+    `side_effect=[...]` with exactly one value (rather than a plain
+    `return_value`) makes this a real regression test, not just a
+    functional one: if production ever calls `capture_receive_stamp` a
+    second time (e.g. a bug that re-stamps during processing), the mock
+    raises `StopIteration` on that second call -- a hard, deterministic
+    failure -- rather than silently returning a second plausible value.
+    """
     from collector.collector import websocket_client as wsc
-    clock = {"t": 1000.000}
+    from collector.collector.clock import ReceiveStamp
+
+    arrival = ReceiveStamp(wall_ns=1_000_000_000_000, mono_ns=1)   # wall_ms == 1_000_000
     seen = []
 
     async def on_message(data, ts, connection_id=None):
@@ -560,14 +580,17 @@ async def test_on_message_receives_the_arrival_timestamp_not_the_processing_time
 
     client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
     client.running = True
-    with patch.object(wsc.time, "time", new=lambda: clock["t"]):
-        await client._consume(_FakeSocket(['{"n":1}']))     # arrives at t=1000.000 s
-        clock["t"] = 1005.000                                # 5 s of queueing delay passes
+    with patch.object(wsc, "capture_receive_stamp", side_effect=[arrival]) as stamp_mock:
+        await client._consume(_FakeSocket(['{"n":1}']))     # the one and only stamp call
+        # Simulated queueing delay: real wall-clock time passing while the
+        # item sits in the queue -- no second clock read happens in
+        # production for this, so nothing here needs to advance a mock.
         client._worker_task = asyncio.ensure_future(client._process_queue())
         client.running = False
         await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
 
-    assert seen == [1_000_000], f"on_message got {seen}; processing time leaked into the receive timestamp"
+    assert seen == [1_000_000], f"on_message got {seen}; processing leaked into the receive timestamp"
+    assert stamp_mock.call_count == 1, "capture_receive_stamp was called more than once for one frame"
 
 
 @pytest.mark.asyncio
@@ -576,7 +599,9 @@ async def test_receive_timestamp_also_holds_for_handlers_that_take_no_connection
     whether the handler accepts connection_id. The timestamp invariant must
     hold on both; the first version of the test above only covered one."""
     from collector.collector import websocket_client as wsc
-    clock = {"t": 2000.000}
+    from collector.collector.clock import ReceiveStamp
+
+    arrival = ReceiveStamp(wall_ns=2_000_000_000_000, mono_ns=1)   # wall_ms == 2_000_000
     seen = []
 
     async def on_message(data, ts):                 # no connection_id parameter
@@ -585,13 +610,66 @@ async def test_receive_timestamp_also_holds_for_handlers_that_take_no_connection
     client = WebSocketClient("ws://localhost:9999", on_message, ingest_queue_maxsize=10)
     assert client._on_message_takes_connection is False
     client.running = True
-    with patch.object(wsc.time, "time", new=lambda: clock["t"]):
+    with patch.object(wsc, "capture_receive_stamp", side_effect=[arrival]) as stamp_mock:
         await client._consume(_FakeSocket(['{"n":1}']))
-        clock["t"] = 2009.000
         client._worker_task = asyncio.ensure_future(client._process_queue())
         client.running = False
         await asyncio.wait_for(client._drain_and_stop_worker(), timeout=5.0)
     assert seen == [2_000_000]
+    assert stamp_mock.call_count == 1
+
+
+def test_receive_timestamp_comes_from_the_injected_stamp_not_from_wall_clock_elsewhere():
+    """Directly proves the value on the wire is exactly the mocked stamp's
+    wall_ms -- not some other wall-clock access this test's two timestamp
+    tests above might have missed (e.g. a second, independent time.time()
+    call somewhere in _consume that happens to coincidentally agree)."""
+    from collector.collector.clock import ReceiveStamp
+
+    for wall_ns, expected_ms in [(0, 0), (1, 0), (999_999, 0), (1_000_000, 1),
+                                 (1_234_567_890_123_456_789, 1_234_567_890_123)]:
+        assert ReceiveStamp(wall_ns=wall_ns, mono_ns=0).wall_ms == expected_ms
+
+
+def test_mutation_restamping_during_processing_is_caught():
+    """Real source mutation (not simulated), run as a clean subprocess to
+    avoid nesting an async test run inside another event loop: makes
+    _process_item call capture_receive_stamp again and overwrite the
+    item's timestamp before calling on_message -- exactly the regression
+    class this invariant guards against. Confirms the test above fails
+    under the mutation, then restores the source and verifies it is
+    byte-identical."""
+    import pathlib
+    import subprocess
+    import sys
+
+    path = pathlib.Path(__file__).resolve().parent.parent / "collector" / "websocket_client.py"
+    original = path.read_text()
+    anchor = "await self.on_message(item.data, item.local_receive_ts, connection_id=item.connection_id)"
+    assert anchor in original, "test anchor text not found; _process_item's shape changed"
+    mutated = original.replace(
+        anchor,
+        "import dataclasses as _dc\n"
+        "            item = _dc.replace(item, local_receive_ts=capture_receive_stamp().wall_ms)\n"
+        "            " + anchor,
+        1,
+    )
+    assert mutated != original
+    path.write_text(mutated)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--no-header",
+             str(pathlib.Path(__file__).resolve()) +
+             "::test_on_message_receives_the_arrival_timestamp_not_the_processing_timestamp"],
+            cwd=str(path.resolve().parents[2]), capture_output=True, text=True,
+        )
+    finally:
+        path.write_text(original)
+    assert result.returncode != 0, (
+        "mutation (re-stamping during processing) was NOT caught by the timestamp test:\n"
+        + result.stdout[-2000:]
+    )
+    assert path.read_text() == original
 
 
 @pytest.mark.asyncio
