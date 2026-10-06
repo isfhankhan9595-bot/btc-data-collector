@@ -72,14 +72,14 @@ aligned with the exact same rule as every other stream: their own
 * Liquidations are sparse, irregular events. They are aggregated per grid
   bin the same way trades are (count/volumes/notional, keyed on the
   availability clock, never fabricated for a bin with no events) -- see
-  ``docs/RESEARCH_DATASET_TIME_CONTRACT.md`` for the explicit, documented
-  limitation this shares with the trades aggregation: an empty bin means
-  "no liquidation was received in this window", which is only as trustworthy
-  as the forceOrder stream's own connection coverage for that window (the
-  same real-time WS capture as trades, with no separate per-bin coverage
-  record persisted to prove it). This is not new to P0-7 -- it is the same
-  assumption the trades aggregation already makes -- but it is called out
-  explicitly here rather than silently inherited.
+  ``docs/RESEARCH_DATASET_TIME_CONTRACT.md``: an empty bin means "no
+  liquidation was received in this window", which is only a statement about
+  the market if the connection was demonstrably delivering. A day-level
+  "segment exists" flag cannot prove that, so ``trades_bin_observed`` /
+  ``liquidation_bin_observed`` carry the per-bin proof (evidence-interval
+  gaps from ``coverage.py`` over receive-time stamps; for liquidations, the
+  shared market WebSocket's frames). Count/volume columns are still ``0``
+  in an unobserved bin -- that zero is "no evidence", never "observed none".
 
 Neither stream's absence blocks assembly: like trades, both are optional
 inputs (a quiet day with zero liquidations, or an OI poll outage, does not
@@ -92,6 +92,21 @@ import numpy as np
 from datetime import datetime, timedelta
 from collector.collector.storage_layout import iter_segments
 from collector.collector.instrument import BINANCE_USDM_BTCUSDT
+from collector.collector.coverage import NormalizedObservations, compute_coverage
+from collector.collector.config import MARKPRICE_STALE_MS, TRADES_STALE_MS
+
+#: Staleness budgets for the per-bin availability evidence (see
+#: ``_bin_observed``). They are the SAME declared budgets ``coverage.py``'s
+#: consumers use (``scripts/gap_report.DEFAULT_TOLERANCES_MS``): an
+#: observation is evidence the stream was alive for this long afterwards.
+#: ``aggTrade``, ``markPrice@1s`` and ``forceOrder`` are subscribed on ONE
+#: WebSocket (``BINANCE_MARKET_WS_URL`` / ``stream_group="market"`` in
+#: run_collector.py), so a frame of any of them is evidence that the shared
+#: connection was delivering; markPrice's 1 s cadence is what makes that
+#: evidence dense enough to bound an outage for the event-sparse
+#: liquidation stream.
+_TRADES_EVIDENCE_TOLERANCE_MS = TRADES_STALE_MS
+_MARKET_CONNECTION_EVIDENCE_TOLERANCE_MS = MARKPRICE_STALE_MS
 
 #: This assembler is intentionally single-venue, single-instrument
 #: (Binance USD-M BTCUSDT). ``instrument_key`` is validated at write time
@@ -241,6 +256,52 @@ def _grid_bin(avail: pd.Series, start_ts: int, end_ts: int, grid_ms: int, prefix
     return start_ts + (-((-offset) // grid_ms)) * grid_ms
 
 
+def _bin_observed(evidence_ts, grid: np.ndarray, start_ts: int, end_ts: int,
+                  grid_ms: int, tolerance_ms: int, stream: str) -> np.ndarray:
+    """Per-grid-row proof that a stream was delivering for the WHOLE bin.
+
+    ``evidence_ts`` are availability (receive-time) stamps of frames that
+    demonstrate the stream/connection was alive. The gaps come straight from
+    ``coverage.compute_coverage`` -- the repository's one evidence-interval
+    model (each observation covers ``[t, t + tolerance_ms)``; leading,
+    interior, trailing and total absence are all gaps) -- so no second
+    availability definition exists. This function only maps those gaps onto
+    the grid.
+
+    A grid row ``T`` owns the receive-time bin ``(T - grid_ms, T]`` clipped to
+    the requested day (the same bin ``_grid_bin`` assigns events to). The row
+    is observed iff NO coverage gap overlaps any millisecond of that bin.
+    Causality: a millisecond ``x`` is covered only by observations at or
+    before ``x``, so a row's flag depends only on frames received at or
+    before ``T``; a later frame can never back-fill an earlier bin.
+
+    Fail closed: no evidence at all is "nothing observed", never "all
+    observed".
+    """
+    n = len(grid)
+    values = np.unique(np.asarray(pd.Series(evidence_ts).dropna(), dtype=np.int64))
+    if values.size == 0:
+        return np.zeros(n, dtype=bool)
+    report = compute_coverage(
+        NormalizedObservations(timestamps=tuple(int(v) for v in values)),
+        window_start_ms=start_ts, window_end_ms=end_ts,
+        tolerance_ms=tolerance_ms, stream=stream, source_count=1,
+    )
+    if not report.gaps:
+        return np.ones(n, dtype=bool)
+    gap_start = np.fromiter((g.start_ms for g in report.gaps), dtype=np.int64)
+    gap_end = np.fromiter((g.end_ms for g in report.gaps), dtype=np.int64)
+    # Bin is the inclusive integer-ms span [lo, T]; a half-open gap [a, b)
+    # overlaps it iff a <= T and b > lo. Gaps are disjoint and sorted, so the
+    # first gap ending after ``lo`` is the only candidate.
+    lo = np.maximum(grid - grid_ms + 1, start_ts)
+    first = np.searchsorted(gap_end, lo + 1, side="left")
+    overlaps = np.zeros(n, dtype=bool)
+    has = first < len(gap_start)
+    overlaps[has] = gap_start[first[has]] <= grid[has]
+    return ~overlaps
+
+
 def _read_stream(data_dir: str, stream: str, date_str: str) -> list[pd.DataFrame]:
     """Read one unambiguous representation for each raw logical hour."""
     frames = []
@@ -388,7 +449,17 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     # Stream availability is decided by whether a trades segment was collected
     # for this day -- not by whether any row survives the day filter below.
     trades_available = bool(trades_dfs)
+    trades_evidence = np.empty(0, dtype=np.int64)
     if trades_available:
+        # Per-bin availability proof (see ``_bin_observed``). Taken from EVERY
+        # trade row's availability time, before df_trades is narrowed to the
+        # in-grid events below: a frame received just outside the day grid
+        # still proves the stream was alive, it just cannot be aggregated.
+        trades_evidence = df_trades["trades_ts"].to_numpy(dtype=np.int64)
+        df_aligned["trades_bin_observed"] = _bin_observed(
+            trades_evidence, df_aligned["timestamp"].to_numpy(dtype=np.int64),
+            start_ts, end_ts, grid_ms, _TRADES_EVIDENCE_TOLERANCE_MS, "trades")
+
         # Bin trades by grid timestamp, using the causal availability clock
         # (trades_ts), never the processing timestamp. A trade at t falls
         # into the bin (t_grid-grid_ms, t_grid]. Events outside the requested
@@ -433,10 +504,14 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_aligned["vwap"] = np.nan
         df_aligned["last_price"] = np.nan
         df_aligned["trades_time_unknown"] = False
+        df_aligned["trades_bin_observed"] = False
 
     # True iff a trades segment was collected for this day. False means the
     # zero trade columns are "no evidence", NOT "observed no trades" -- the
-    # same distinction ``liquidation_stream_available`` makes.
+    # same distinction ``liquidation_stream_available`` makes. This is a
+    # DAY-LEVEL fact only: True says nothing about whether the stream was
+    # delivering at any particular bin (a mid-day disconnect leaves it True).
+    # ``trades_bin_observed`` is the per-bin authority; it implies this flag.
     df_aligned["trades_stream_available"] = trades_available
 
     # Fill NaNs for trades where appropriate
@@ -455,6 +530,22 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     # from the trades aggregation.
     liq_available = bool(liq_dfs)
     if liq_available:
+        # Liquidations are event-sparse, so the stream's own frames cannot
+        # bound an outage (a quiet hour is normal). The evidence is liveness
+        # of the one WebSocket that carries aggTrade, markPrice@1s and
+        # forceOrder: any frame from it (including liquidations themselves,
+        # duplicates included) proves the connection was delivering. This
+        # does NOT prove the forceOrder subscription alone was healthy.
+        connection_evidence = np.concatenate([
+            trades_evidence,
+            df_mark["mark_ts"].to_numpy(dtype=np.int64),
+            df_liq["liq_ts"].to_numpy(dtype=np.int64),
+            df_liq_dups["liq_ts"].to_numpy(dtype=np.int64) if len(df_liq_dups) else np.empty(0, dtype=np.int64),
+        ])
+        df_aligned["liquidation_bin_observed"] = _bin_observed(
+            connection_evidence, df_aligned["timestamp"].to_numpy(dtype=np.int64),
+            start_ts, end_ts, grid_ms, _MARKET_CONNECTION_EVIDENCE_TOLERANCE_MS, "market_connection")
+
         liq_labels = _grid_bin(df_liq["liq_ts"], start_ts, end_ts, grid_ms, "liquidation")
         df_liq = df_liq.loc[liq_labels.index].copy()
         df_liq["grid_ts"] = liq_labels.astype(np.int64)
@@ -484,11 +575,13 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
         df_aligned = pd.merge(df_aligned, liq_aggs, left_on="timestamp", right_on="grid_ts", how="left")
         df_aligned = df_aligned.drop(columns=["grid_ts"])
-        # The stream was collected for this day: a bin with no matching
-        # aggregate genuinely had zero liquidations (not "unknown"),
-        # distinct from the whole-stream-absent case below (see
-        # docs/RESEARCH_DATASET_TIME_CONTRACT.md, "empty liquidation
-        # interval" semantics).
+        # A liquidation segment was collected for this day. That is a
+        # DAY-LEVEL fact only and does NOT make an empty bin an observed
+        # zero: whether the bin was actually watched is
+        # ``liquidation_bin_observed`` (per-bin connection-liveness proof,
+        # computed above). An empty bin with ``liquidation_bin_observed ==
+        # False`` is "no evidence", exactly like the whole-stream-absent case
+        # below (see docs/RESEARCH_DATASET_TIME_CONTRACT.md).
         df_aligned["liquidation_stream_available"] = True
     else:
         df_aligned["liquidation_count"] = 0
@@ -498,6 +591,7 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
         df_aligned["liquidation_notional"] = 0.0
         df_aligned["liquidation_time_unknown"] = False
         df_aligned["liquidation_dup_dropped"] = 0
+        df_aligned["liquidation_bin_observed"] = False
         # No liquidation segment exists for this day at all: a count of 0
         # here is NOT the same causal claim as "we watched and saw zero" --
         # it means we have no evidence either way. Never collapse this into
