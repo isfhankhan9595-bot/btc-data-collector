@@ -122,7 +122,23 @@ def _epoch_ms(value: Any) -> Optional[int]:
 
 
 class ParquetWriter:
-    """Write immutable, atomically-published Parquet segments for one stream."""
+    """Write immutable, atomically-published Parquet segments for one stream.
+
+    Publication state machine (one segment at a time)::
+
+        OPEN --write/flush--> OPEN
+        OPEN --publish: fsync(tmp) + rename + dir fsync all succeed--> hooks --> OPEN | CLOSED
+        OPEN --any publish step raises--> FAILED   (``_storage_failure``; terminal)
+        OPEN --publish ok, on_segment_published hook raises--> OPEN but write() refuses
+                                                    (``_publication_failure``; segment IS durable)
+
+    FAILED means durability of the open segment was not established. The
+    writer then refuses write/flush/publish_*/finalize with RuntimeError, keeps
+    the stream lock until close(), leaves the unpublished ``.tmp`` for orphan
+    recovery (-> DATA_DROP on restart), runs no hook, and reports the failure
+    through ``quality_event_sink`` (STORAGE_PUBLICATION_FAILED, plus DATA_DROP
+    for rows that only ever lived in RAM). A failing sink never un-latches it.
+    """
 
     def __init__(
         self, stream_name: str, schema: pa.Schema, base_dir: str = "data", *,
@@ -165,6 +181,15 @@ class ParquetWriter:
         self._age_from_first_row = age_from_first_row
         self._first_row_monotonic: Optional[float] = None
         self._publication_failure: Optional[BaseException] = None
+        #: Fail-closed latch for a segment publication that did not complete
+        #: (flush / pyarrow close / fsync / rename / directory fsync / opening
+        #: the next segment). Distinct from ``_publication_failure``, which
+        #: means the segment IS durable but the dedup hook failed. Once set it
+        #: is never cleared: the writer's on-disk state is uncertain, only a
+        #: restart (orphan recovery) may resolve it. See _fail_closed().
+        self._storage_failure: Optional[BaseException] = None
+        self._storage_failure_stage: Optional[str] = None
+        self._storage_failure_rows: int = 0
         self._lock_handle: Optional[IO[bytes]] = _acquire_writer_lock(self.stream_dir)
         try:
             self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
@@ -298,13 +323,86 @@ class ParquetWriter:
     def _get_filename(self, hour_str: str) -> str:
         return str(segment_path(self.base_dir, self.stream_name, hour_str, self._seq))
 
-    def _emit_drop(self, rows_lost: Optional[int], reason: str = "crashed_segment_discarded") -> None:
+    def _emit_quality_guarded(self, event_type: str, reason: str) -> None:
+        """``_emit_quality`` for paths that run AFTER the writer's state was
+        already settled (latched / durable): a failing sink must never raise
+        out of them, or it would skip the rest of publication (hooks, opening
+        the next segment) or mask the original storage exception. Fail-closed
+        behaviour comes from the latch, never from the sink succeeding."""
+        try:
+            self._emit_quality(event_type, reason)
+        except Exception as exc:  # noqa: BLE001 - the latch, not the sink, enforces fail-closed
+            logger.error("storage_quality_event_sink_failed", stream=self.stream_name,
+                         event_type=event_type, error=f"{type(exc).__name__}: {exc}")
+
+    def _emit_drop(self, rows_lost: Optional[int], reason: str = "crashed_segment_discarded", *,
+                   guarded: bool = False) -> None:
         event = {"exchange": self.exchange, "stream": self.stream_name, "event_type": "DATA_DROP",
                  "reason": reason, "gap_size_ms": None, "rows_lost": rows_lost,
                  "local_ts": int(time.time() * 1000)}
         logger.warning("segment_data_drop", **event)
         if self.quality_event_sink:
-            self.quality_event_sink(event)
+            if not guarded:
+                self.quality_event_sink(event)
+                return
+            try:
+                self.quality_event_sink(event)
+            except Exception as exc:  # noqa: BLE001 - see _emit_quality_guarded
+                logger.error("storage_quality_event_sink_failed", stream=self.stream_name,
+                             event_type="DATA_DROP", error=f"{type(exc).__name__}: {exc}")
+
+    def _fail_closed(self, stage: str, exc: BaseException) -> None:
+        """Latch the writer into the FAILED state after a publication step
+        raised. Never raises. Idempotent: the FIRST failure wins.
+
+        State machine (see also the class docstring)::
+
+            OPEN --publish ok--> OPEN (next segment) | CLOSED
+            OPEN --publish step raises--> FAILED   (terminal; restart recovers)
+
+        The unpublished ``.tmp`` (and its ``.count.json``) is deliberately left
+        on disk: orphan recovery on restart turns it into a DATA_DROP. A segment
+        already renamed into place whose directory fsync failed is left as the
+        filesystem has it -- neither deleted (it may be durable) nor claimed
+        durable (no hook runs). Nothing is fabricated or restored.
+
+        Rows still in RAM were never written anywhere, so no restart can
+        account for them: they are reported as DATA_DROP *now*. Rows already
+        flushed to the ``.tmp`` are left for the restart's DATA_DROP (reporting
+        them here too would count them twice).
+        """
+        if self._storage_failure is not None:
+            return
+        self._storage_failure = exc
+        self._storage_failure_stage = stage
+        unflushed = len(self.buffer)
+        self._storage_failure_rows = self.record_count + unflushed
+        # Release the pyarrow handle (best effort) and drop the reference so no
+        # later call can append to an uncertain writer.
+        handle, self.writer = self.writer, None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception as close_exc:  # noqa: BLE001 - the file is already suspect
+                logger.warning("failed_segment_handle_close_failed", stream=self.stream_name,
+                               error=f"{type(close_exc).__name__}: {close_exc}")
+        reason = (f"segment publication failed at {stage}: {type(exc).__name__}: {exc}; "
+                  f"rows_in_segment={self._storage_failure_rows} rows_unflushed={unflushed}; "
+                  f"writer refuses all further writes until restart")
+        logger.error("segment_publication_failed", stream=self.stream_name, stage=stage,
+                     rows=self._storage_failure_rows, error=f"{type(exc).__name__}: {exc}")
+        self._emit_quality_guarded("STORAGE_PUBLICATION_FAILED", reason)
+        if unflushed:
+            self._emit_drop(unflushed, "unflushed_rows_discarded_on_publication_failure", guarded=True)
+        self.buffer.clear()
+
+    def _raise_if_storage_failed(self) -> None:
+        if self._storage_failure is not None:
+            raise RuntimeError(
+                f"ParquetWriter for {self.stream_name!r} is FAILED: segment publication did not "
+                f"complete (stage={self._storage_failure_stage}, {self._storage_failure!r}); "
+                f"on-disk state is uncertain and the writer refuses all further operations "
+                f"until restart") from self._storage_failure
 
     def _recover_orphans(self) -> None:
         for meta_tmp in self.stream_dir.glob("*.meta.json.tmp"):
@@ -366,6 +464,7 @@ class ParquetWriter:
         token of the segment that will receive the record -- after any hour
         rollover, before the append -- so a caller can attribute the record to
         its segment exactly (a rotation after the append cannot race it)."""
+        self._raise_if_storage_failed()
         if self._publication_failure is not None:
             raise RuntimeError(
                 f"ParquetWriter for {self.stream_name!r} refuses writes: the segment-publication "
@@ -397,7 +496,17 @@ class ParquetWriter:
                     f"({self._publication_failure!r}); dedup/storage state is uncertain"
                 ) from self._publication_failure
             self.current_hour, self._seq = hour, self._next_sequence(hour)
-            self._open_segment()
+            try:
+                self._open_segment()
+            except BaseException as exc:
+                self._fail_closed("open_next_segment", exc)
+                raise
+        if self.writer is None:
+            # No open segment (closed writer): buffering here could never be
+            # published. Refuse instead of silently accepting the row.
+            raise RuntimeError(
+                f"ParquetWriter for {self.stream_name!r} has no open segment "
+                f"({'closed' if self._closed else 'not open'}); refusing to buffer a row it cannot publish")
         if bind is not None:
             bind((self.current_hour, self._seq))
         self.buffer.append(record)
@@ -414,33 +523,60 @@ class ParquetWriter:
             self._close_segment(open_next=True)
 
     def flush(self) -> None:
+        self._raise_if_storage_failed()
         if not self.buffer:
             return
-        assert self.writer is not None
-        columns = {field.name: [column_value(field.name, record) for record in self.buffer] for field in self.schema}
-        self.writer.write_table(pa.Table.from_pydict(columns, schema=self.schema))
-        self.record_count += len(self.buffer)
-        self.buffer.clear()
-        self._persist_counter()
+        if self.writer is None:
+            raise RuntimeError(f"ParquetWriter for {self.stream_name!r} has no open segment to flush into")
+        try:
+            columns = {field.name: [column_value(field.name, record) for record in self.buffer] for field in self.schema}
+            self.writer.write_table(pa.Table.from_pydict(columns, schema=self.schema))
+            self.record_count += len(self.buffer)
+            self.buffer.clear()
+            self._persist_counter()
+        except BaseException as exc:
+            # A half-applied append leaves the segment in an unknown state:
+            # appending again could duplicate or lose rows. Fail closed.
+            self._fail_closed("flush", exc)
+            raise
 
     def _close_segment(self, *, open_next: bool) -> None:
+        self._raise_if_storage_failed()
         if self.writer is None:
             return
-        self.flush()
+        self.flush()  # latches + raises on its own failure
         final, tmp, counter = self._segment_paths()
-        self.writer.close()
-        self.writer = None
-        with tmp.open("rb") as handle:
-            os.fsync(handle.fileno())
-        if final.exists():
-            raise FileExistsError(f"refusing to overwrite published segment: {final}")
-        os.replace(tmp, final)
-        parent_fd = os.open(str(final.parent), os.O_RDONLY)
+        # Publication = fsync(tmp) + rename + directory fsync. Any step raising
+        # means durability was NOT established: latch FAILED (never "healthy"),
+        # leave the .tmp for orphan recovery, run no hook, and re-raise.
+        stage = "writer_close"
         try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        counter.unlink(missing_ok=True)
+            self.writer.close()
+            self.writer = None
+            stage = "tmp_fsync"
+            with tmp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            stage = "overwrite_guard"
+            if final.exists():
+                raise FileExistsError(f"refusing to overwrite published segment: {final}")
+            stage = "rename"
+            os.replace(tmp, final)
+            stage = "dir_fsync"
+            parent_fd = os.open(str(final.parent), os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except BaseException as exc:
+            self._fail_closed(stage, exc)
+            raise
+        # The segment is durable from here on. A stale row-count sidecar that
+        # cannot be removed is harmless (orphan recovery only reads the counter
+        # of a ``.seg.tmp``) and must not skip the hooks below.
+        try:
+            counter.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.error("segment_counter_sidecar_unlink_failed", file=str(counter), error=str(exc))
         # P0-3: durable-publication callback. Placed strictly AFTER the
         # rename and the directory fsync -- the only point at which a caller
         # may treat the rows of this segment as durable.
@@ -468,8 +604,11 @@ class ParquetWriter:
             finally:
                 os.close(parent_fd)
         except (OSError, TypeError, ValueError) as exc:
-            meta_tmp.unlink(missing_ok=True)
-            self._emit_quality(
+            try:
+                meta_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass  # recovery discards stray *.meta.json.tmp on restart
+            self._emit_quality_guarded(
                 "STORAGE_METADATA_FAILED",
                 f"segment published but metadata sidecar failed: {type(exc).__name__}: {exc}",
             )
@@ -479,20 +618,34 @@ class ParquetWriter:
                 self.on_segment_published((self.current_hour, self._seq), final)
             except Exception as exc:  # noqa: BLE001 - segment is durable; fail CLOSED on the next write
                 self._publication_failure = exc
-                self._emit_quality("DEDUP_STATE_FAILED",
-                                   f"segment published but publication hook failed: {type(exc).__name__}: {exc}")
+                self._emit_quality_guarded(
+                    "DEDUP_STATE_FAILED",
+                    f"segment published but publication hook failed: {type(exc).__name__}: {exc}")
         self._sequence_cache[self.current_hour] = self._seq + 1
         if open_next:
             self._seq += 1
-            self._open_segment()
+            try:
+                self._open_segment()
+            except BaseException as exc:
+                # The segment just published is untouched; but a writer with no
+                # open segment must never keep accepting rows.
+                self._fail_closed("open_next_segment", exc)
+                raise
 
     def has_unpublished_rows(self) -> bool:
+        """True while rows exist whose publication has not been confirmed.
+        A FAILED writer reports the rows of the segment that failed (they were
+        never confirmed durable) -- never a misleading False."""
+        if self._storage_failure is not None:
+            return self._storage_failure_rows > 0
         return self.writer is not None and (self.record_count > 0 or bool(self.buffer))
 
     def publish_open_segment(self) -> None:
         """Publish the open segment now (if it holds rows) and open the next.
         A no-op when nothing is pending, so an idle stream never produces an
-        empty segment. Raises if publication fails (nothing is claimed durable)."""
+        empty segment. Raises if publication fails (nothing is claimed durable)
+        and, once the writer is FAILED, always raises."""
+        self._raise_if_storage_failed()
         if not self.has_unpublished_rows():
             return
         self._close_segment(open_next=True)
@@ -501,7 +654,9 @@ class ParquetWriter:
         """Time-based publish. ``segment_seconds`` is otherwise only evaluated
         inside write(); there is no background timer, so a stream that goes
         idle would keep its tail in RAM indefinitely. A caller with an idle
-        tick calls this. Returns True if a segment was published."""
+        tick calls this. Returns True if a segment was published. Raises once
+        the writer is FAILED (it must never look like an idle, healthy stream)."""
+        self._raise_if_storage_failed()
         if self.has_unpublished_rows() and self._segment_age() >= self.segment_seconds:
             self._close_segment(open_next=True)
             return True
@@ -516,6 +671,7 @@ class ParquetWriter:
             self._release_lock()
 
     def _finalize_segment(self) -> None:
+        self._raise_if_storage_failed()
         if self.writer is None:
             return
         if self.record_count == 0 and not self.buffer:
