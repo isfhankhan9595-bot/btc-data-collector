@@ -54,6 +54,8 @@ class LocalBook:
         # `binance_snapshot` for why it is retained rather than discarded.
         self._pending_snapshot=None
         self.pending_snapshot_bridges=0
+        # OKX deltas discarded because the book was not VALID (see `apply`).
+        self.okx_untrusted_discard_count=0
         self._lock=RLock()
         self.comparator={"BINANCE":BinanceSequenceComparator(),"BYBIT":BybitSequenceComparator(),"OKX":OKXSequenceComparator(),"BINANCE_SPOT":SpotSequenceComparator()}[venue]
 
@@ -226,6 +228,19 @@ class LocalBook:
                 return None
             if self.venue in _BUFFER_UNTIL_BRIDGED_VENUES and (self.state.state != BookQuality.VALID or self.previous is None):
                 self._buffer_event(event); return None
+            if (self.venue == "OKX" and not event.is_snapshot
+                    and self.state.state != BookQuality.VALID and self.previous is not None):
+                # Untrusted OKX book. A gap means at least one update was missed,
+                # so a later delta -- even one whose prevSeqId happens to link to
+                # the stale `previous` (e.g. the in-order message that follows a
+                # re-delivered/duplicate frame that tripped the gap) -- cannot
+                # produce a provable book. Only a fresh wire snapshot
+                # (prevSeqId == -1, handled below) restores authority. Discarded,
+                # not buffered: OKX has no bridge that consumes a buffer. No state
+                # transition and no `last_reason` change: the cause was already
+                # recorded when the book became untrusted.
+                self.okx_untrusted_discard_count += 1
+                return None
             if event.is_snapshot:
                 if self.snapshot(event): self.state.recovered(); return self._apply(event)
                 self.state.gap(); return None
