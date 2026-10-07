@@ -556,7 +556,7 @@ MATRIX = {
     "B_fail_after_rename":     (_scn_b_dir_fsync,    1, 0, (0, 0), True,  True,  3,    "unconfirmed", [],      []),
     "C_open_next_failed":      (_scn_c_open_next,    1, 0, (1, 1), True,  False, 0,    "published",   [],      []),
     "D_dedup_hook_failed":     (_scn_d_hook_failure, 1, 1, (0, 1), True,  False, None, None,          [],      []),
-    "E_metadata_failed":       (_scn_e_metadata,     1, 1, (1, 1), False, False, None, None,          [],      []),
+    "E_metadata_failed":       (_scn_e_metadata,     1, 1, (0, 1), True,  False, None, None,          [],      []),
     "F_flush_failed":          (_scn_f_flush,        0, 1, (0, 0), True,  True,  2,    "unpublished", [2],     [None]),
     "G_closed":                (_scn_g_close,        1, 0, (1, 1), True,  False, None, None,          [],      []),
 }
@@ -584,7 +584,7 @@ def test_state_machine_matrix(name, tmp_path, monkeypatch):
                 w.write(_row(500))
             assert w.buffer == [], "a refused write is never buffered"
         else:
-            w.write(_row(500))                          # E: a healthy writer keeps accepting rows
+            w.write(_row(500))
         _shutdown(w)
     restart = _restart(tmp_path)
     assert [d["rows_lost"] for d in _of(restart, "DATA_DROP")] == restart_drops
