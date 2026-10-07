@@ -55,6 +55,21 @@ def _allow_unverified_fs_for_hermetic_tests(monkeypatch):
     monkeypatch.delenv(DEEP_VERIFY_ENV, raising=False)
 
 
+@pytest.fixture
+def fault_mp():
+    """Separate MonkeyPatch scope for crash/spy injection only.
+
+    ``monkeypatch.undo()`` reverts EVERY patch made through the shared fixture,
+    including the autouse filesystem-policy overrides (UNVERIFIED_FS_ENV here and
+    in collector/conftest.py). Tests that simulate a crash and then restart must
+    undo only their fault injection, so they inject through this scope instead."""
+    mp = pytest.MonkeyPatch()
+    try:
+        yield mp
+    finally:
+        mp.undo()
+
+
 class Crash(BaseException):
     """Simulated process death at a syscall (never caught by ``except Exception``)."""
 
@@ -248,8 +263,8 @@ def test_marker_failure_skips_dedup_hook_and_latches_writer(tmp_path, monkeypatc
     assert not list(r.stream_dir.glob("*.meta.json.tmp")) or fault == "dir_fsync"
 
 
-def test_marker_dir_fsync_failure_marker_still_implies_durable_segment(tmp_path, monkeypatch):
-    spy = Spy(monkeypatch).on(nth_dirfsync(2), EIO("marker dir fsync"))
+def test_marker_dir_fsync_failure_marker_still_implies_durable_segment(tmp_path, fault_mp):
+    spy = Spy(fault_mp).on(nth_dirfsync(2), EIO("marker dir fsync"))
     r = Rig(tmp_path)
     r.offer("A")
     r.writer.publish_open_segment()
@@ -258,7 +273,7 @@ def test_marker_dir_fsync_failure_marker_still_implies_durable_segment(tmp_path,
     dirs = [o for o in spy.ops if o[0] == "dirfsync"]
     assert dirs[0][2] == 1 and dirs[1][2] == 2, "marker visibility is preceded by a SUCCESSFUL segment dir fsync"
     assert r.index.identity_count() == 0, "hook withheld"
-    monkeypatch.undo()
+    fault_mp.undo()
     r.restart()
     rep = r.co.last_report
     assert (rep.confirmed_by_refsync, rep.indexed) == (0, 1), "valid marker => indexed with no refsync needed"
@@ -281,29 +296,29 @@ def test_dir_fsync_failure_leaves_seg_unmarked_unindexed(tmp_path, monkeypatch):
 
 # ===================================================================== 6-13: crash / restart matrix
 
-def test_crash_before_tmp_fsync_restart_discards_tmp_redelivery_accepted(tmp_path, monkeypatch):
-    Spy(monkeypatch).on(is_seg_tmp_fsync, Crash())
+def test_crash_before_tmp_fsync_restart_discards_tmp_redelivery_accepted(tmp_path, fault_mp):
+    Spy(fault_mp).on(is_seg_tmp_fsync, Crash())
     r = Rig(tmp_path)
     r.offer("A")
     with pytest.raises(Crash):
         r.writer.publish_open_segment()
-    monkeypatch.undo()
+    fault_mp.undo()
     assert not r.segs() and list(r.stream_dir.glob("*.seg.tmp"))
     r.restart()
     assert of_type(r.events, "DATA_DROP"), "the discarded orphan is reported, never silent"
     assert r.index.identity_count() == 0 and r.offer("A")
 
 
-def test_crash_after_rename_before_dir_fsync_restart_confirms_via_refsync_then_indexes(tmp_path, monkeypatch):
-    Spy(monkeypatch).on(nth_dirfsync(1), Crash())
+def test_crash_after_rename_before_dir_fsync_restart_confirms_via_refsync_then_indexes(tmp_path, fault_mp):
+    Spy(fault_mp).on(nth_dirfsync(1), Crash())
     r = Rig(tmp_path)
     r.offer("A")
     with pytest.raises(Crash):
         r.writer.publish_open_segment()
-    monkeypatch.undo()
+    fault_mp.undo()
     seg = r.segs()[0]
     assert not marker_path(seg).exists() and r.index.identity_count() == 0
-    spy = Spy(monkeypatch)
+    spy = Spy(fault_mp)
     r.restart()
     rep = r.co.last_report
     assert (rep.confirmed_by_refsync, rep.indexed, rep.rebuilt) == (1, 1, False)
@@ -314,13 +329,13 @@ def test_crash_after_rename_before_dir_fsync_restart_confirms_via_refsync_then_i
     assert not r.offer("A")
 
 
-def test_crash_after_dir_fsync_before_marker_confirms_and_indexes(tmp_path, monkeypatch):
-    Spy(monkeypatch).on(is_marker_tmp_fsync, Crash())
+def test_crash_after_dir_fsync_before_marker_confirms_and_indexes(tmp_path, fault_mp):
+    Spy(fault_mp).on(is_marker_tmp_fsync, Crash())
     r = Rig(tmp_path)
     r.offer("A")
     with pytest.raises(Crash):
         r.writer.publish_open_segment()
-    monkeypatch.undo()
+    fault_mp.undo()
     assert not marker_path(r.segs()[0]).exists()
     stray = Path(str(marker_path(r.segs()[0])) + ".tmp")
     stray.write_text("half-written marker")               # what a real kill leaves behind
@@ -370,25 +385,25 @@ def test_crash_after_sqlite_commit_restart_is_noop_and_suppresses_redelivery(tmp
     assert not r.offer("A") and r.index.identity_count() == 1
 
 
-def test_power_loss_after_unconfirmed_rename_never_leaves_index_ahead_of_disk(tmp_path, monkeypatch):
+def test_power_loss_after_unconfirmed_rename_never_leaves_index_ahead_of_disk(tmp_path, fault_mp):
     """D1. rename visible, no marker -> a restart that cannot establish durability
     must index NOTHING; if the rename is then lost (SIMULATED by renaming the
     segment back to ``.tmp``, what an un-journalled rename does) the index must
     not hold the identity, so the redelivery is accepted."""
-    Spy(monkeypatch).on(nth_dirfsync(1), Crash())
+    Spy(fault_mp).on(nth_dirfsync(1), Crash())
     r = Rig(tmp_path)
     r.offer("A")
     with pytest.raises(Crash):
         r.writer.publish_open_segment()
-    monkeypatch.undo()
+    fault_mp.undo()
     seg = r.segs()[0]
     unverified = fs_guard(tmp_path, mountinfo="1 0 0:1 / / rw - tmpfs tmpfs rw", environ={})
-    monkeypatch.setattr(sd, "fs_guard", lambda path: unverified)
+    fault_mp.setattr(sd, "fs_guard", lambda path: unverified)
     with pytest.raises(DedupStateError):
         r.restart()                                       # cannot confirm: fail closed, index nothing
     assert r.index.identity_count() == 0 and not marker_path(seg).exists()
     REAL_REPLACE(seg, str(seg) + ".tmp")                  # SIMULATED loss of the un-durable rename
-    monkeypatch.undo()
+    fault_mp.undo()
     r.restart()
     assert r.index.identity_count() == 0, "index must never be ahead of what is durable on disk"
     assert of_type(r.events, "DATA_DROP") and r.offer("A"), "redelivery accepted: it was never durable"
