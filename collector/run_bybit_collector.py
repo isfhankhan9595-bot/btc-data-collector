@@ -77,6 +77,7 @@ from collector.collector.backoff import ExponentialBackoff
 from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT, InstrumentIdError
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
+from collector.collector.quality_wal import QualityEventWAL, QualityWALCorruption
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
 from collector.collector.utils import logger
 from collector.collector.websocket_client import Keepalive, WebSocketClient
@@ -102,9 +103,24 @@ class BybitCollectorApp:
     def __init__(self, data_dir: str = "data", url: str = BYBIT_PUBLIC_WS_URL,
                 enable_segment_dedup: bool = True) -> None:
         self.url = url
+        # P0-2 parity with run_collector.CollectorApp (PR #94): every event
+        # entering _persist_quality_event is WAL-protected first, and the WAL
+        # checkpoint advances only from on_segment_durable, i.e. after the
+        # segment holding the event is published (fsync + rename + directory
+        # fsync). The state is set up BEFORE the writer exists because the
+        # writer's hook references it. Segmenting is deliberately UNCHANGED
+        # (segment_rows=1 / segment_seconds=1): P0-3 batching is not part of
+        # this change, so each write() still publishes its own segment.
+        self._init_quality_durability_state()
         self.quality_writer = ParquetWriter(
             "bybit_quality_events", QUALITY_EVENTS_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", segment_rows=1, segment_seconds=1)
+            exchange="BYBIT", segment_rows=1, segment_seconds=1,
+            on_segment_durable=self._on_quality_segment_durable)
+        # Replays anything a previous process left un-checkpointed. Needs only
+        # quality_writer, which exists now. It must run before the other writers
+        # are built: their constructors can report orphan recovery through
+        # _persist_quality_event, and those reports must find the WAL already open.
+        self._recover_quality_wal(self.quality_writer.stream_dir / "wal")
         self.raw_wire_writer = ParquetWriter(
             "bybit_raw_wire", RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="BYBIT", quality_event_sink=self._persist_quality_event)
@@ -182,7 +198,168 @@ class BybitCollectorApp:
 
     # -- quality events --------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # P0-2 quality-event durability state (mirrors run_collector.CollectorApp).
+    #
+    # Invariant: wal checkpoint N on disk  =>  every quality event with WAL
+    # seq <= N is durably in a PUBLISHED bybit_quality_events segment.
+    #   _quality_wal_inflight  seqs WAL-appended but not yet in a published
+    #                          segment.
+    #   _quality_segment_seqs  seqs written into the currently open segment.
+    # On publication the open segment's seqs leave inflight and the
+    # checkpoint moves to min(inflight)-1 (or the highest published seq when
+    # nothing is in flight) -- a contiguous prefix, never a max.
+    # ------------------------------------------------------------------
+    def _init_quality_durability_state(self) -> None:
+        self._quality_checkpoint_blocked = False
+        self._quality_checkpoint_block_reason = None
+        self._quality_wal_inflight = set()
+        self._quality_segment_seqs = set()
+        self._quality_published_hwm = None
+
+    def _ensure_quality_state(self) -> None:
+        if not hasattr(self, "_quality_wal_inflight"):
+            self._init_quality_durability_state()
+
+    def _quality_checkpoint_is_blocked(self) -> bool:
+        return getattr(self, "_quality_checkpoint_blocked", False)
+
+    def _block_quality_checkpoint(self, why: str) -> None:
+        """Latch: stop advancing the WAL checkpoint for the rest of this
+        process's life. Everything stays in the WAL and is reconciled (same
+        quality_event_id) by the next startup's recovery. Fail closed."""
+        self._ensure_quality_state()
+        if not self._quality_checkpoint_blocked:
+            self._quality_checkpoint_block_reason = why
+        self._quality_checkpoint_blocked = True
+        logger.error("bybit_quality_checkpoint_blocked", reason=why)
+
+    def _on_quality_segment_durable(self, path, record_count: int) -> None:
+        """Called by quality_writer only after a segment is durably published.
+        Never raises: any failure latches the checkpoint closed instead."""
+        self._ensure_quality_state()
+        durable = self._quality_segment_seqs
+        self._quality_segment_seqs = set()
+        if durable:
+            self._quality_wal_inflight -= durable
+            top = max(durable)
+            if self._quality_published_hwm is None or top > self._quality_published_hwm:
+                self._quality_published_hwm = top
+        wal = getattr(self, "_quality_wal", None)
+        if wal is None or self._quality_checkpoint_is_blocked() or self._quality_published_hwm is None:
+            return
+        inflight = self._quality_wal_inflight
+        target = (min(inflight) - 1) if inflight else self._quality_published_hwm
+        try:
+            wal.checkpoint(up_to_seq=target)
+        except Exception as exc:  # noqa: BLE001 - must not escape the writer hook
+            self._block_quality_checkpoint(f"checkpoint_write_failed:{type(exc).__name__}")
+            return
+        try:
+            wal.maybe_rotate_for_size()
+        except Exception:  # noqa: BLE001 - rotation failure leaves the WAL handle valid
+            logger.error("bybit_quality_wal_rotation_failed")
+
+    def _recover_quality_wal(self, wal_dir) -> None:
+        """Startup recovery: discover the WAL, recover exact event content not
+        yet checkpointed, replay it into Parquet, and checkpoint only the
+        contiguous prefix that actually succeeded (same contract and same
+        reasoning as run_collector.CollectorApp._recover_quality_wal)."""
+        self._ensure_quality_state()
+        self._quality_wal_recovery_error = None
+        resume_seq = QualityEventWAL.highest_recovered_seq(wal_dir)
+        try:
+            recovered_events = QualityEventWAL.recover(wal_dir)
+        except QualityWALCorruption as exc:
+            # Loud, never silently healthy -- but it must not stop market-data
+            # capture. The corrupt file is preserved (never deleted here) and
+            # checkpointing stays off until an operator resolves it, so a
+            # later checkpoint(N) cannot cover its seqs and delete the evidence.
+            recovered_events = []
+            self._quality_wal_recovery_error = str(exc)
+            self._quality_checkpoint_blocked = True
+            self._quality_checkpoint_block_reason = "wal_corruption_on_startup"
+        self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
+        if self._quality_wal_recovery_error is not None:
+            self._persist_quality_event({
+                "stream": "bybit_quality_events", "event_type": QualityEventType.ERROR,
+                "reason": f"quality_wal_corruption_on_startup:{self._quality_wal_recovery_error}",
+                "rows_lost": None})
+        # Strict seq order. Each event is tracked in-flight BEFORE it is
+        # written and leaves in-flight only when its segment is published, so
+        # on a failure at seq k the event and everything after it stay in the
+        # WAL (k remains in-flight, pinning the checkpoint below k).
+        replay_failed = False
+        for recovered in recovered_events:
+            try:
+                # "_wal_seq" = already durably in the WAL (do not append again);
+                # quality_event_id flows through so the replayed row is
+                # reconcilable with any earlier copy by id.
+                self._persist_quality_event({**recovered, "_wal_seq": recovered["seq"]})
+            except Exception:  # noqa: BLE001
+                logger.error("bybit_quality_event_recovery_persist_failed", seq=recovered.get("seq"))
+                replay_failed = True
+                break
+        try:
+            self.quality_writer.publish_open_segment()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("bybit_quality_event_recovery_publish_failed", error=str(exc))
+            self._block_quality_checkpoint("recovery_publish_failed")
+        if replay_failed:
+            self._block_quality_checkpoint("recovery_persist_failed")
+
     def _persist_quality_event(self, event: dict) -> None:
+        """Single choke point for EVERY Bybit quality event (writer sinks,
+        websocket client, adapter-unhandled, book transitions, shutdown
+        reports, recovery replay).
+
+        Durability contract (same as run_collector.CollectorApp): before the
+        event can sit in quality_writer's buffer it is WAL-protected -- unless
+        it already carries WAL provenance (``_wal_seq``: replayed from the
+        WAL). Its seq is tracked in-flight until the segment holding it is
+        published; only then may the checkpoint cover it.
+
+        If the WAL append fails the event is still written (stamped with the
+        id the failed append assigned, so any WAL-resident copy is
+        reconcilable), and since no WAL record is known to back it the open
+        segment is force-published immediately. A write or publish failure
+        latches the checkpoint closed and PROPAGATES -- never swallowed.
+        """
+        self._ensure_quality_state()
+        wal = getattr(self, "_quality_wal", None)
+        wal_seq = event.get("_wal_seq")
+        wal_protected = wal is not None and wal_seq is not None
+        if wal is not None and wal_seq is None:
+            # The row below takes timestamp / local_process_ts from the wall
+            # clock when the event does not carry them. Pin exactly those
+            # values into the WAL record NOW, so a replayed row carries the
+            # original instants instead of the replay time. Same values the
+            # direct path writes; nothing is invented.
+            now_ms = int(time.time() * 1000)
+            event = {k: v for k, v in event.items() if k != "_wal_seq"}
+            event.setdefault("local_ts", now_ms)
+            event.setdefault("local_process_ts", now_ms)
+            event_type_for_wal = event.get("event_type", QualityEventType.ERROR)
+            if isinstance(event_type_for_wal, QualityEventType):
+                event_type_for_wal = event_type_for_wal.value
+            try:
+                event_id = wal.append({**event, "event_type": event_type_for_wal})
+            except Exception as exc:  # noqa: BLE001 - any append failure, not only OSError
+                logger.error("bybit_quality_event_wal_append_failed_in_persist", reason=event.get("reason"))
+                failed_id = getattr(exc, "quality_event_id", None)
+                if failed_id is not None:
+                    # A WAL record may exist for this seq: keep the id on the
+                    # row and hold the checkpoint below it until published.
+                    if event.get("quality_event_id") is None:
+                        event = {**event, "quality_event_id": failed_id}
+                    wal_seq = int(failed_id.rsplit("-", 1)[-1])
+            else:
+                if event.get("quality_event_id") is None:
+                    event = {**event, "quality_event_id": event_id}
+                wal_seq = int(event_id.rsplit("-", 1)[-1])
+                wal_protected = True
+        if wal_seq is not None:
+            self._quality_wal_inflight.add(wal_seq)
         event_type = event.get("event_type", QualityEventType.ERROR)
         if isinstance(event_type, QualityEventType):
             event_type = event_type.value
@@ -198,19 +375,47 @@ class BybitCollectorApp:
             "update_id": event.get("update_id"), "first_update_id": event.get("first_update_id"),
             "previous_update_id": event.get("previous_update_id"),
             "local_receive_ts": event.get("local_receive_ts"),
-            "local_process_ts": int(time.time() * 1000),
+            "local_process_ts": event.get("local_process_ts", int(time.time() * 1000)),
+            "quality_event_id": event.get("quality_event_id"),
         }
+
+        def _bind(_token, _seq=wal_seq):
+            # Called by the writer AFTER any hour rollover and BEFORE the
+            # append: attributes this seq to the segment that will really
+            # contain the row.
+            if _seq is not None:
+                self._quality_segment_seqs.add(_seq)
         try:
-            self.quality_writer.write(row)
-        except Exception as exc:  # noqa: BLE001 - a quality write must not crash ingestion
-            logger.warning("bybit_quality_write_failed", error=str(exc))
+            self.quality_writer.write(row, bind=_bind)
+        except Exception:
+            # Writer state is now uncertain: fail closed, the event stays in
+            # the WAL (if it got there), and the failure is NOT swallowed.
+            self._block_quality_checkpoint("quality_writer_write_failed")
+            raise
+        if not wal_protected:
+            try:
+                self.quality_writer.publish_open_segment()
+            except Exception:
+                self._block_quality_checkpoint("unprotected_event_publish_failed")
+                raise
 
     def _on_client_quality_event(self, event_type: str, reason: str,
                                  connection_id=None, stream_group=None) -> None:
-        self._persist_quality_event({"stream": stream_group or "bybit_websocket",
-                                     "event_type": event_type, "reason": reason,
-                                     "connection_id": connection_id,
-                                     "local_ts": int(time.time() * 1000)})
+        """WebSocketClient calls this UNGUARDED from its connect/disconnect/
+        error paths (a raise here would escape into the client's own handler,
+        and from its except-branch out of the connection loop). So this
+        boundary -- and only this one -- does not re-raise: a persistence
+        failure is logged at ERROR and the checkpoint is already latched by
+        _persist_quality_event, leaving any WAL copy for restart recovery."""
+        try:
+            self._persist_quality_event({"stream": stream_group or "bybit_websocket",
+                                         "event_type": event_type, "reason": reason,
+                                         "connection_id": connection_id,
+                                         "local_ts": int(time.time() * 1000)})
+        except Exception:  # noqa: BLE001
+            logger.error("bybit_websocket_quality_event_persist_failed",
+                         event_type=event_type, reason=reason)
+            self._block_quality_checkpoint("websocket_quality_event_persist_failed")
 
     def _record_adapter_unhandled(self, message) -> None:
         """Wires BybitAdapter's unhandled/duplicate outcomes into durable
@@ -326,9 +531,22 @@ class BybitCollectorApp:
         self._close_writer_reporting_failure(self.mark_writer, "mark_writer", "BYBIT")
         self._close_writer_reporting_failure(self.oi_writer, "oi_writer", "BYBIT")
         self._close_writer_reporting_failure(self.liq_writer, "liq_writer", "BYBIT")
-        self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BYBIT")
+        # quality_writer closes LAST: its close PUBLISHES the final partial
+        # segment and thereby checkpoints that segment's WAL seqs. If that
+        # publish fails its events stay in the WAL, uncheckpointed, to be
+        # replayed by the next startup. Only then is the WAL closed (the
+        # publish hook needs it open).
+        quality_closed = self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BYBIT")
+        if not quality_closed:
+            self._block_quality_checkpoint("quality_writer_close_failed")
+        wal = getattr(self, "_quality_wal", None)
+        if wal is not None:
+            try:
+                wal.close()
+            except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
+                logger.error("bybit_quality_wal_close_failed", error=str(exc))
 
-    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> None:
+    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> bool:
         """Close one writer; on failure, report it and still return.
 
         Hostile-audit finding (this session): none of these close() calls
@@ -341,9 +559,11 @@ class BybitCollectorApp:
         every writer except quality_writer itself, which is always closed
         last precisely so this reporting path works.
         """
+        closed_ok = True
         try:
             writer.close()
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
+            closed_ok = False
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
             if writer_name != "quality_writer":
                 try:
@@ -355,6 +575,7 @@ class BybitCollectorApp:
                 except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
                     logger.error("storage_shutdown_close_failure_report_failed",
                                  writer=writer_name, error=str(sink_exc))
+        return closed_ok
 
 
 async def _main(data_dir: str, url: str) -> None:
