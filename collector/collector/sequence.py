@@ -126,13 +126,34 @@ class BinanceSequenceComparator(SequenceComparator):
 
 
 class BybitSequenceComparator(SequenceComparator):
+    """Bybit v5 order-book ``u`` semantics: monotonic, NOT a ``pu`` chain.
+
+    Contract (docs/EXECUTION_STATUS.md, Phase 7): ``u`` only guarantees
+    non-decrease; an increasing jump is deliberately not a gap, and
+    continuity is restored by a fresh wire snapshot. Bybit's docs do not
+    promise ``u`` is consecutive, so no ``prev + 1`` rule is applied here.
+
+    * ``u`` decreases -> resync signal (service restart / reordering).
+    * ``u`` equal -> duplicate, dropped.
+    * ``update_id_missing`` -> gap. Monotonicity is the one relationship this
+      contract relies on and it cannot be evaluated without an integer ``u``
+      on both events. Previously a missing/``None`` ``u`` fell through as a
+      normal continuation (book stayed VALID), two ``None`` ids were dropped as
+      a "duplicate", and a non-integer ``u`` raised ``TypeError`` out of
+      ``LocalBook.apply``. Unprovable now fails closed.
+    """
+
     def check(self, current, previous):
         if previous is None:
             return SequenceResult()
-        if (current.update_id is not None and previous.update_id is not None
-                and current.update_id < previous.update_id):
+        current_id = getattr(current, "update_id", None)
+        previous_id = getattr(previous, "update_id", None)
+        if (not isinstance(current_id, int) or isinstance(current_id, bool)
+                or not isinstance(previous_id, int) or isinstance(previous_id, bool)):
+            return SequenceResult(True, False, "update_id_missing")
+        if current_id < previous_id:
             return SequenceResult(False, True, "update_id_decrease_or_reset")
-        if current.update_id == previous.update_id:
+        if current_id == previous_id:
             return SequenceResult(False, False, "duplicate_update", is_stale=True)
         return SequenceResult()
 

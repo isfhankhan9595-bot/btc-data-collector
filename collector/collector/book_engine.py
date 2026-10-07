@@ -48,6 +48,8 @@ class LocalBook:
         self.last_reason=""; self.duplicate_count=0; self.last_transition=None; self.recovery_generation=0
         self.committed_recovery_events=[]; self.quality_events=[]
         self.stale_count=0; self.non_authoritative_count=0
+        # Bybit deltas discarded because the book was not VALID (see `apply`).
+        self.untrusted_discard_count=0
         # A snapshot that arrived ahead of every buffered diff. See
         # `binance_snapshot` for why it is retained rather than discarded.
         self._pending_snapshot=None
@@ -227,6 +229,18 @@ class LocalBook:
             if event.is_snapshot:
                 if self.snapshot(event): self.state.recovered(); return self._apply(event)
                 self.state.gap(); return None
+            if self.venue == "BYBIT" and (self.state.state != BookQuality.VALID or self.previous is None):
+                # Untrusted Bybit book: only a fresh wire snapshot (handled
+                # above) may restore authority. An ordinary delta cannot be
+                # anchored to anything provable, so it must neither mutate the
+                # book nor be returned (the runner persists whatever is
+                # returned). Discarded, not buffered: unlike Binance there is
+                # no bridge that would ever consume a Bybit buffer, and
+                # filling it would only reach the overflow path. No state
+                # transition and no `last_reason` change: the original cause
+                # was already recorded when the book became untrusted.
+                self.untrusted_discard_count += 1
+                return None
             expected=getattr(self.previous,"update_id",None)
             result=self.comparator.check(event,self.previous)
             if result.is_resync_signal:
