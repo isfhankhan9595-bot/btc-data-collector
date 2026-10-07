@@ -127,18 +127,32 @@ def test_book_state_computes_mid_spread_and_imbalance():
 
 
 def test_book_imbalance_zero_denominator_is_none_not_zero_division_error():
+    # Corrected contract (P1 market-state audit): a zero-size best level is a
+    # raw-diff *delete marker*, never part of a reconstructed book (LocalBook
+    # pops qty==0). The old version of this test asserted such an event was
+    # exposed as a priced book (mid=100.5) whose imbalance was merely None.
+    # Now the whole event is untrusted: no ZeroDivisionError, no 0/0, and no
+    # prices fabricated from a level with no size behind it.
     engine = MarketStateEngine("BINANCE")
     engine.update(book(BASE, bids=[(100.0, 0.0)], asks=[(101.0, 0.0)]))
     state = engine.snapshot(BASE)
     assert state.book.book_imbalance is None
-    assert state.book.mid == 100.5   # price side still computable
+    assert state.book.mid is None and state.book.best_bid is None
+    assert state.book.book_available is False and state.book.book_untrusted is True
 
 
-def test_empty_book_levels_are_available_but_not_priced():
+def test_empty_book_levels_are_unavailable_not_available_but_unpriced():
+    # Corrected contract (P1 market-state audit): ``book_available=True`` with
+    # no prices let a consumer that checks only ``book_available`` proceed on
+    # a book that does not exist (e.g. a one-sided raw delta). An event with
+    # an empty side is an untrusted book: unavailable, stale, explicitly
+    # untrusted -- and still never a fabricated price.
     engine = MarketStateEngine("BINANCE")
     engine.update(book(BASE, bids=[], asks=[]))
     state = engine.snapshot(BASE)
-    assert state.book.book_available is True
+    assert state.book.book_available is False
+    assert state.book.book_stale is True
+    assert state.book.book_untrusted is True
     assert state.book.best_bid is None
 
 

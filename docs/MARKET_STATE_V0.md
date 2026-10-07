@@ -48,9 +48,8 @@ and `::test_future_exchange_timestamp_cannot_pull_an_event_into_an_earlier_snaps
 
 ## Why `snapshot()` is a pure function, not an incremental update
 
-`snapshot(observation_ts)` recomputes state from scratch from the full
-stored event list each call, rather than mutating one running "current
-state". This is a deliberate simplification, made because it turns several
+`snapshot(observation_ts)` recomputes state from the stored event lists each
+call, rather than mutating one running "current state". This is a deliberate simplification, made because it turns several
 required guarantees into structural properties rather than merely tested-for
 ones:
 
@@ -58,17 +57,39 @@ ones:
   mutable state for it to overwrite; a previously-returned `MarketState` is
   a frozen dataclass, unaffected by any later `update()` call.
 - Replaying the same events in a different insertion order produces an
-  identical result — `snapshot()` sorts by `local_receive_ts` internally
-  before computing anything; call order of `update()` never matters.
+  identical result. Each event list is kept in a deterministic **total
+  order**: `local_receive_ts`, then the venue sequence hint (book
+  `update_id`, trade `venue_sequence`/numeric `trade_id`), then — only for
+  events still tied on both — `repr(event)`. The order is a function of the
+  set of events, never of `update()` call order. (Before the P1 audit, events
+  sharing a receive millisecond were resolved by insertion order, so the
+  "latest" book/trade/mark/OI and the digest depended on call order.)
+  The sequence hint breaks ties only; availability is `local_receive_ts`
+  alone and `exchange_event_ts` is never read (AST-tested).
 - No wall-clock reads, no network access, no randomness are structurally
   possible inside a pure function of its stored inputs (enforced by an AST-based
   test, `test_market_state_module_has_no_wall_clock_or_network_imports`, not
   just a docstring claim).
 
-The tradeoff: this recomputes from the full history on every call rather
-than maintaining O(1) incremental state. Acceptable for V0's purpose
-(describing state, not a hot low-latency path); revisit if profiling ever
-shows it matters.
+The tradeoff, **measured** (P1 audit; mixed trades/25-level books/marks/OI,
+this sandbox, not production hardware): the causal cut is now a binary search,
+but trade-flow and liquidation sums still walk every eligible event, so a
+snapshot is O(eligible trades + liquidations) and every event is retained for
+the engine's lifetime.
+
+| Retained events | snapshot() | repeated snapshot() | retained memory |
+|---|---|---|---|
+| 10,000 | ~18 ms | ~18 ms | ~35 MB |
+| 100,000 | ~205 ms | ~195 ms | ~350 MB |
+| 500,000 | ~860 ms | ~910 ms | ~1.8 GB |
+
+Acceptable for the current workload (no production caller exists; sporadic
+snapshots over ≤~100k events). **Latent P1 — requires redesign before the
+first production consumer**: a per-observation dataset pass (1 snapshot/s over
+~1.4M events/day projects to ~tens of hours) is quadratic, and a long-lived
+live engine grows without bound (~3.5 KB/event with 25-level books). Not
+redesigned here: it needs exact prefix sums and a retention policy that keep
+historical snapshots call-order independent.
 
 ## Field provenance and staleness
 
@@ -78,9 +99,17 @@ silently going stale-looking-fresh:
 | Dimension | Freshness field | Default threshold |
 |---|---|---|
 | Book | `book_stale` | 5,000 ms |
-| Mark/index price | `mark_stale` | 10,000 ms |
+| Mark price | `mark_stale` | 10,000 ms |
+| Index price | `index_stale` | 10,000 ms (mark threshold) |
 | Open interest | `oi_stale` | 120,000 ms |
 | Funding | `funding_stale` | 3,600,000 ms |
+
+**Freshness is per field, and measured from when the value was observed**,
+not from when a message carrying it arrived. An event's `None` value or its
+`carried_forward` entry (Bybit ticker deltas re-emit old mark/index/funding;
+OKX sends mark, index and funding as separate events) is not an observation:
+`mark_ts`, `index_ts`, `funding_ts` and `oi_ts` are the receive times of the
+latest event that genuinely observed that field.
 
 `price_vs_mark` is `None` whenever the mark price is stale — a derived
 comparison is never computed from data already flagged untrustworthy.
@@ -124,11 +153,36 @@ using the raw venue-reported side only — never relabelled `long_liquidated`/
 
 ## Order-book authority
 
-`update()` refuses any `CanonicalOrderBookEvent` whose `book_source` is in
-`book_engine.NON_AUTHORITATIVE_BOOK_SOURCES` (currently `PARTIAL_DEPTH`).
-`run_collector.py` and `run_bybit_collector.py` already filter this before
-persisting, but this is defense in depth against a future caller that
-doesn't remember to.
+A book is exposed (`book_available=True`) only if the latest causally
+available book event passes every check in
+`MarketStateEngine._book_untrusted_reason`: `book_source ==
+"DIFF_DEPTH_RECONSTRUCTED"` (allowlist, matching `run_collector.py`/
+`replay.py`), `quality_state == "VALID"`, both sides non-empty, finite
+positive prices and quantities (`qty == 0` is a raw-diff delete marker, never
+in a reconstructed book), strictly ordered levels, and `best_bid < best_ask`.
+
+A latest event that fails is an explicit **barrier**: `book_available=False`,
+`book_stale=True`, `book_untrusted=True`, no prices — an older good book never
+stands in for it. `book_untrusted` distinguishes "producer said not
+trustworthy" from "never observed". `PARTIAL_DEPTH` events are dropped at
+`update()` (neither contribute nor invalidate), as `LocalBook.apply` does.
+
+**Known residual gap (not closed here).** A well-formed raw one-level diff
+(two-sided, ordered, uncrossed, positive) is field-for-field identical to a
+one-level reconstructed book: adapters stamp raw diffs `quality_state="VALID"`
+and `book_source="DIFF_DEPTH_RECONSTRUCTED"` by default. Closing it needs a
+provenance field stamped by `LocalBook` (`book_engine.py`; the Bybit/OKX
+fail-closed fixes #89/#90 have merged without adding one) that the engine then
+requires. Pinned by a strict-xfail
+test. Also: the engine only learns of a producer-declared GAP/RECOVERING if
+the caller feeds the (non-VALID) event; it has no separate invalidation
+channel. Since #89/#90 the Bybit and
+OKX producers DISCARD updates while their book is untrusted (`LocalBook.apply`
+returns `None`; the Bybit runner persists nothing for it and replay records only
+what `apply` returns) rather than emitting a non-VALID
+book, so no barrier event reaches this engine from those paths: a pre-gap
+book ages out only through `book_stale_ms` (5 s default), not through an
+explicit untrusted signal.
 
 ## Digest and replay parity
 
