@@ -15,10 +15,15 @@ the *published segment* the recovery anchor:
   SQLite index in one atomic transaction together with a "this segment is
   reconciled" marker. Only after that commit are the segment's identities
   released from RAM.
-* **Startup reconciliation**: any published segment without a marker (crash
-  between publication and index commit) is indexed before ingestion resumes.
-  The index is therefore a *derived, rebuildable* view of published
-  segments -- losing it costs re-reading segments, never correctness.
+* **Startup reconciliation**: a segment becomes dedup authority only with a
+  valid publication marker (``<seg>.meta.json`` v2: sha256 + size of its exact
+  bytes, written after the rename's directory fsync -- see
+  ``docs/F1_DURABLE_PUBLICATION.md``). A visible ``.seg`` without one is first
+  confirmed by the startup refsync protocol (or startup fails closed); only
+  then is it indexed, before ingestion resumes. The index is a *derived,
+  rebuildable* view of confirmed segments and every row carries the marker's
+  evidence -- losing or distrusting it costs re-reading segments, never
+  correctness.
 
 An identity from a segment that was never published (a crashed ``.tmp``,
 deleted by ``ParquetWriter._recover_orphans`` with a DATA_DROP) is never in
@@ -29,12 +34,25 @@ an error to "new" or to "duplicate" (Invariants 9/J/K).
 """
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import pyarrow.parquet as pq
+
+from .publication import (
+    DEEP_VERIFY_ENV, MarkerResult, MarkerStatus, PublicationError, PublicationState, UnmarkedSegment,
+    classify_segment, confirm_unmarked, fs_guard, fsync_dir, marker_path, orphan_marker, preserve_invalid,
+    read_marker, read_segment_table, sha256_bytes,
+)
+from .utils import logger
+
+#: ``PRAGMA user_version`` of an index whose rows carry evidence (F1). Anything
+#: lower has no provenance and is rebuilt once from confirmed segments.
+INDEX_SCHEMA_VERSION = 2
 
 UNIDENTIFIED = "<unidentified>"
 SegmentToken = Tuple[str, int]
@@ -55,7 +73,11 @@ def dedup_identity_key(exchange: str, market_type: str, instrument_key: str,
 
 
 class SegmentDedupIndex:
-    """Exact, non-evicting, segment-transactional membership index."""
+    """Exact, non-evicting, segment-transactional membership index.
+
+    F1: every ``reconciled_segments`` row carries the evidence (sha256, size,
+    confirmed_by) of the publication marker it was derived from. A row can never
+    be silently reused for different bytes (``EVIDENCE_CONFLICT``)."""
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -67,8 +89,22 @@ class SegmentDedupIndex:
             self._conn.execute("CREATE TABLE IF NOT EXISTS seen (identity_key TEXT PRIMARY KEY) WITHOUT ROWID")
             self._conn.execute("CREATE TABLE IF NOT EXISTS reconciled_segments "
                                "(segment_key TEXT PRIMARY KEY, identity_count INTEGER NOT NULL) WITHOUT ROWID")
+            existing = {r[1] for r in self._conn.execute("PRAGMA table_info(reconciled_segments)")}
+            fresh = self._conn.execute("SELECT 1 FROM reconciled_segments LIMIT 1").fetchone() is None \
+                and self._conn.execute("SELECT 1 FROM seen LIMIT 1").fetchone() is None
+            for column, ddl in (("evidence_sha256", "TEXT"), ("evidence_size", "INTEGER"), ("confirmed_by", "TEXT")):
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE reconciled_segments ADD COLUMN {column} {ddl}")
+            if fresh and self.user_version() < INDEX_SCHEMA_VERSION:
+                self._conn.execute(f"PRAGMA user_version={INDEX_SCHEMA_VERSION}")   # nothing to rebuild
         except sqlite3.Error as exc:
             raise DedupStateError(f"cannot open dedup index {path!r}: {exc}") from exc
+
+    def user_version(self) -> int:
+        try:
+            return self._conn.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.Error as exc:
+            raise DedupStateError(f"user_version read failed: {exc}") from exc
 
     def contains(self, identity_key: str) -> bool:
         try:
@@ -84,24 +120,56 @@ class SegmentDedupIndex:
         except sqlite3.Error as exc:
             raise DedupStateError(f"reconciliation lookup failed: {exc}") from exc
 
-    def commit_segment(self, segment_key: str, identity_keys: Iterable[str]) -> bool:
-        """Atomically record a published segment's identities AND its
-        reconciled marker (one transaction). Idempotent: an already-marked
-        segment is a no-op returning False. Any failure rolls back fully."""
+    def evidence_of(self, segment_key: str) -> Optional[Tuple[Optional[str], Optional[int], Optional[str]]]:
+        try:
+            return self._conn.execute(
+                "SELECT evidence_sha256, evidence_size, confirmed_by FROM reconciled_segments WHERE segment_key=?",
+                (segment_key,)).fetchone()
+        except sqlite3.Error as exc:
+            raise DedupStateError(f"evidence lookup failed: {exc}") from exc
+
+    def all_reconciled(self) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
+        try:
+            return {k: (h, n) for k, h, n in self._conn.execute(
+                "SELECT segment_key, evidence_sha256, evidence_size FROM reconciled_segments")}
+        except sqlite3.Error as exc:
+            raise DedupStateError(f"reconciled listing failed: {exc}") from exc
+
+    def commit_segment(self, segment_key: str, identity_keys: Iterable[str], evidence_sha256: str,
+                       evidence_size: int, confirmed_by: str) -> bool:
+        """Atomically record a published segment's identities AND its reconciled
+        row (one transaction), bound to the marker evidence.
+
+        * no row                      -> insert, return True
+        * row with EQUAL evidence     -> idempotent no-op, return False
+        * row with DIFFERENT evidence -> ``DedupStateError("EVIDENCE_CONFLICT ...")``
+          (never a silent no-op: this is what closes sequence/name reuse).
+        Any failure rolls back fully."""
         keys = list(identity_keys)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                if self._conn.execute("SELECT 1 FROM reconciled_segments WHERE segment_key=?",
-                                      (segment_key,)).fetchone() is not None:
-                    self._conn.execute("COMMIT")
-                    return False
+                row = self._conn.execute(
+                    "SELECT evidence_sha256, evidence_size FROM reconciled_segments WHERE segment_key=?",
+                    (segment_key,)).fetchone()
+                if row is not None:
+                    if row[0] == evidence_sha256 and row[1] == evidence_size:
+                        self._conn.execute("COMMIT")
+                        return False
+                    self._conn.execute("ROLLBACK")
+                    raise DedupStateError(
+                        f"EVIDENCE_CONFLICT for {segment_key!r}: index has sha256={row[0]!r} size={row[1]!r}, "
+                        f"marker says sha256={evidence_sha256!r} size={evidence_size!r}")
                 self._conn.executemany("INSERT OR IGNORE INTO seen (identity_key) VALUES (?)",
                                        ((k,) for k in keys))
-                self._conn.execute("INSERT INTO reconciled_segments (segment_key, identity_count) VALUES (?,?)",
-                                   (segment_key, len(keys)))
+                self._conn.execute(
+                    "INSERT INTO reconciled_segments (segment_key, identity_count, evidence_sha256, "
+                    "evidence_size, confirmed_by) VALUES (?,?,?,?,?)",
+                    (segment_key, len(keys), evidence_sha256, evidence_size, confirmed_by))
                 self._conn.execute("COMMIT")
                 return True
+            except DedupStateError:
+                raise
             except BaseException:
                 try:
                     self._conn.execute("ROLLBACK")
@@ -110,6 +178,26 @@ class SegmentDedupIndex:
                 raise
         except sqlite3.Error as exc:
             raise DedupStateError(f"segment commit failed for {segment_key!r}: {exc}") from exc
+
+    def rebuild_reset(self) -> None:
+        """ONE transaction: drop every identity and reconciled row and set
+        ``user_version`` to the evidence schema. Crash-safe: either all of it
+        happened or none of it did; the caller then re-indexes from segments."""
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("DELETE FROM seen")
+                self._conn.execute("DELETE FROM reconciled_segments")
+                self._conn.execute(f"PRAGMA user_version={INDEX_SCHEMA_VERSION}")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        except sqlite3.Error as exc:
+            raise DedupStateError(f"index rebuild reset failed: {exc}") from exc
 
     def identity_count(self) -> int:
         try:
@@ -122,6 +210,16 @@ class SegmentDedupIndex:
 
     def close(self) -> None:
         self._conn.close()
+
+
+@dataclass
+class ReconcileReport:
+    confirmed_by_refsync: int = 0
+    indexed: int = 0
+    rebuilt: bool = False
+    rebuild_reasons: List[str] = field(default_factory=list)
+    dangling: int = 0
+    invalid_markers: int = 0
 
 
 class SegmentDedupCoordinator:
@@ -138,6 +236,7 @@ class SegmentDedupCoordinator:
         self._admitted: Set[str] = set()                 # admitted, not yet attributed to a segment
         self._pending_by_token: Dict[SegmentToken, Set[str]] = {}
         self._pending_index: Dict[str, SegmentToken] = {}
+        self.last_report: ReconcileReport = ReconcileReport()
 
     # -- live path -----------------------------------------------------
     def check_and_admit(self, key: str) -> bool:
@@ -164,24 +263,126 @@ class SegmentDedupCoordinator:
         self._admitted.clear()
 
     def on_segment_published(self, token: SegmentToken, path: Path) -> None:
-        """Writer publication hook: index the published file, then (and only
-        then) release its identities from RAM."""
-        keys = self._identities_of(path)
-        self.index.commit_segment(self._segment_key(path), keys)
+        """Writer publication hook: re-verify the marker against the exact
+        segment bytes, index THOSE bytes, then (and only then) release the
+        identities from RAM. Any violation raises ``DedupStateError`` and
+        commits nothing."""
+        path = Path(path)
+        marker = read_marker(path)
+        keys, sha, size, by = self._verified_identities(path, marker)
+        self.index.commit_segment(self._segment_key(path), keys, sha, size, by)
         for k in self._pending_by_token.pop(token, ()):
             self._pending_index.pop(k, None)
 
     # -- recovery ------------------------------------------------------
     def startup_reconcile(self, stream_dir: Path) -> int:
-        """Index every published, un-marked segment. Fail closed if any
-        published segment cannot be read. Returns segments newly reconciled."""
-        done = 0
-        for path in sorted(Path(stream_dir).glob("*.seg")):
-            if self.index.is_segment_reconciled(self._segment_key(path)):
+        """Deterministic, idempotent startup reconciliation (runs before
+        ingestion). A visible ``.seg`` is never authority by itself:
+
+          0 filesystem policy   1 scan segments + markers   2 classify
+          3 confirm UNMARKED (refsync + marker v2)          4 dangling markers
+          5 audit the index against marker evidence; rebuild on any divergence
+          6 index confirmed-but-unreconciled segments
+
+        Returns the number of segments newly indexed; the full account is in
+        ``self.last_report``. Raises ``DedupStateError`` on any uncertainty."""
+        stream_dir = Path(stream_dir)
+        report = ReconcileReport()
+        self.last_report = report
+        verdict = fs_guard(stream_dir)
+        segs = sorted(stream_dir.glob("*.seg"))
+        markers: Dict[Path, MarkerResult] = {p: read_marker(p) for p in segs}
+
+        confirmed: List[Path] = []
+        unmarked: List[UnmarkedSegment] = []
+        renamed = False
+        for path in segs:
+            marker = markers[path]
+            if marker.status is MarkerStatus.INVALID:
+                report.invalid_markers += 1
+                logger.error("publication_marker_invalid", file=str(marker_path(path)), reason=marker.reason)
+                try:
+                    preserve_invalid(marker_path(path))
+                except OSError as exc:
+                    raise DedupStateError(f"cannot preserve invalid marker of {path.name}: {exc!r}") from exc
+                renamed = True
+            state = classify_segment(path, marker)
+            if state is PublicationState.CORRUPT:
+                raise DedupStateError(
+                    f"segment {path.name} disagrees with its publication marker (size {path.stat().st_size} "
+                    f"!= marker {marker.publication['size_bytes']}); evidence left untouched")
+            if state is PublicationState.PUBLICATION_CONFIRMED:
+                confirmed.append(path)
+            else:
+                unmarked.append(UnmarkedSegment(path, marker))
+
+        present = {p.name for p in segs}
+        diverged: List[str] = []
+        for marker_file in sorted(stream_dir.glob("*.seg.meta.json")):
+            if marker_file.name[: -len(".meta.json")] not in present:
+                report.dangling += 1
+                logger.error("publication_marker_dangling", file=str(marker_file))
+                try:
+                    orphan_marker(marker_file)
+                except OSError as exc:
+                    raise DedupStateError(f"cannot preserve dangling marker {marker_file.name}: {exc!r}") from exc
+                renamed = True
+                if self.index.is_segment_reconciled(self._segment_key(Path(marker_file.name[: -len(".meta.json")]),
+                                                                     stream_dir)):
+                    diverged.append(f"dangling marker with indexed segment {marker_file.name}")
+        if renamed:
+            self._fsync_dir(stream_dir)
+
+        try:
+            promoted = confirm_unmarked(unmarked, stream_dir, verdict=verdict)
+        except PublicationError as exc:
+            raise DedupStateError(str(exc)) from exc
+        report.confirmed_by_refsync = len(promoted)
+        confirmed = sorted(confirmed + [c.path for c in promoted])
+
+        diverged += self._audit_index(stream_dir, confirmed)
+        if diverged:
+            report.rebuilt, report.rebuild_reasons = True, diverged
+            logger.error("DEDUP_INDEX_REBUILT", stream_dir=str(stream_dir), reasons=diverged[:20],
+                         count=len(diverged))
+            self.index.rebuild_reset()
+
+        deep = os.environ.get(DEEP_VERIFY_ENV) == "1"
+        for path in confirmed:
+            key = self._segment_key(path)
+            if self.index.is_segment_reconciled(key):
+                if deep:
+                    self._verified_identities(path, read_marker(path))      # re-hash; raises on mismatch
                 continue
-            self.index.commit_segment(self._segment_key(path), self._identities_of(path))
-            done += 1
-        return done
+            keys, sha, size, by = self._verified_identities(path, read_marker(path))
+            self.index.commit_segment(key, keys, sha, size, by)
+            report.indexed += 1
+        return report.indexed
+
+    def _audit_index(self, stream_dir: Path, confirmed: List[Path]) -> List[str]:
+        """Reasons the index is not a subset of confirmed-segment evidence."""
+        reasons: List[str] = []
+        if self.index.user_version() < INDEX_SCHEMA_VERSION:
+            reasons.append(f"index schema user_version={self.index.user_version()} < {INDEX_SCHEMA_VERSION} "
+                           f"(no evidence provenance)")
+        evidence = {self._segment_key(p): read_marker(p).publication for p in confirmed}
+        rows = self.index.all_reconciled()
+        for key, (sha, size) in sorted(rows.items()):
+            pub = evidence.get(key)
+            if pub is None:
+                reasons.append(f"indexed segment {key} has no confirmed segment on disk")
+            elif sha != pub["sha256"] or size != pub["size_bytes"]:
+                reasons.append(f"indexed evidence for {key} differs from marker")
+        if not rows and self.index.identity_count() > 0:
+            reasons.append("identities present without any reconciled segment (no provenance)")
+        return reasons
+
+    @staticmethod
+    def _fsync_dir(stream_dir: Path) -> None:
+        try:
+            fsync_dir(stream_dir)
+        except OSError as exc:
+            raise DedupStateError(f"directory fsync of {stream_dir} failed: {exc!r}") from exc
 
     # -- introspection -------------------------------------------------
     @property
@@ -197,12 +398,40 @@ class SegmentDedupCoordinator:
 
     # -- helpers -------------------------------------------------------
     @staticmethod
-    def _segment_key(path: Path) -> str:
-        return f"{Path(path).parent.name}/{Path(path).name}"
+    def _segment_key(path: Path, stream_dir: Optional[Path] = None) -> str:
+        parent = Path(path).parent.name if stream_dir is None else Path(stream_dir).name
+        return f"{parent}/{Path(path).name}"
 
-    def _identities_of(self, path: Path) -> list:
+    def _verified_identities(self, path: Path, marker: MarkerResult) -> Tuple[list, str, int, str]:
+        """Read the segment ONCE and prove it is the one the marker describes
+        (valid marker, size, sha256, footer rows); return identities extracted
+        from those same bytes plus the evidence to bind them to."""
+        if not marker.valid:
+            raise DedupStateError(
+                f"no valid publication marker for {Path(path).name} ({marker.status.value}: {marker.reason}); "
+                f"refusing to create dedup authority")
+        pub = marker.publication
         try:
-            rows = pq.read_table(str(path)).to_pylist()
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            raise DedupStateError(f"cannot read published segment {str(path)!r}: {exc!r}") from exc
+        if len(data) != pub["size_bytes"]:
+            raise DedupStateError(f"{Path(path).name}: size {len(data)} != marker size_bytes {pub['size_bytes']}")
+        digest = sha256_bytes(data)
+        if digest != pub["sha256"]:
+            raise DedupStateError(f"{Path(path).name}: sha256 {digest} != marker sha256 {pub['sha256']}")
+        try:
+            table = read_segment_table(data, Path(path).name)
+        except PublicationError as exc:
+            raise DedupStateError(str(exc)) from exc
+        rows = table.num_rows
+        if rows != marker.data["record_count"]:
+            raise DedupStateError(f"{Path(path).name}: {rows} rows != marker record_count {marker.data['record_count']}")
+        return self._identities_of_table(table, path), digest, len(data), pub["confirmed_by"]
+
+    def _identities_of_table(self, table: Any, path: Path) -> list:
+        try:
+            rows = table.to_pylist()
         except Exception as exc:  # noqa: BLE001 - unreadable published segment => cannot establish state
             raise DedupStateError(f"cannot read published segment {str(path)!r}: {exc!r}") from exc
         keys = []
