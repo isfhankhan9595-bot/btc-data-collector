@@ -114,8 +114,16 @@ class CollectorApp:
         self._recover_quality_wal(self.quality_writer.stream_dir / "wal")
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_book_writer = ParquetWriter("binance_orderbook_raw", BINANCE_ORDERBOOK_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
-        self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
-        self.raw_trades_writer = ParquetWriter("binance_trades_raw", BINANCE_TRADES_RAW_SCHEMA)
+        # P0: the canonical and raw trade writers now report their own storage
+        # failures (publication failure, unflushed-row DATA_DROP, and the
+        # restart-time DATA_DROP for a crashed/failed segment) through the
+        # durable quality path. Without a sink those were log lines only.
+        # The sink cannot recurse: _persist_quality_event writes to
+        # quality_writer, which has no sink of its own, and ParquetWriter
+        # guards the sink call so a sink failure can never make a failed
+        # writer look healthy (the latch, not the sink, enforces fail-closed).
+        self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA, quality_event_sink=self._persist_quality_event)
+        self.raw_trades_writer = ParquetWriter("binance_trades_raw", BINANCE_TRADES_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
         self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA)
         self.liq_writer = ParquetWriter("liquidation", LIQUIDATION_SCHEMA)
