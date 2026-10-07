@@ -40,9 +40,12 @@ returns (`test_release_happens_only_after_the_index_commit`).
 ## Segment publication semantics
 
 `ParquetWriter.on_segment_published(token, path)` is called after the
-segment is fully durable (fsync + rename done) —
+segment is fully durable (fsync + rename + directory fsync) **and its publication
+marker `<seg>.meta.json` v2 is durable** (see `F1_DURABLE_PUBLICATION.md`) —
 `test_hook_runs_only_after_the_segment_is_durably_published` proves the
-`.tmp` file no longer exists and the final path does at hook time. If the
+`.tmp` file no longer exists and the final path does at hook time, and
+`test_marker_written_after_dir_fsync_and_before_dedup_hook` proves the syscall order.
+The hook is withheld if the marker failed. If the
 hook raises, the writer marks itself failed and every subsequent `write()`
 raises immediately (`test_hook_failure_fails_closed_on_the_next_write`) —
 never silently continues with an uncertain dedup state. `write(record,
@@ -53,10 +56,12 @@ rollover mid-call (`test_hour_rollover_attributes_identity_to_the_segment_that_r
 ## Startup reconciliation
 
 `SegmentDedupCoordinator.startup_reconcile(stream_dir)`, run before
-ingestion resumes: for every `*.seg` file without a `reconciled_segments`
-marker, read it back and commit its identities. Idempotent
-(`test_repeated_reconciliation_is_idempotent`) and fully derivable — a lost
-index directory is rebuilt from the published segments alone
+ingestion resumes: every `*.seg` must carry a valid publication marker (sha256 + size
+bound) before its identities are committed; an unmarked segment is first confirmed
+by the startup refsync protocol, and the index rows carry the marker evidence
+(F1, `F1_DURABLE_PUBLICATION.md`) — a visible `.seg` alone is never authority.
+Idempotent (`test_repeated_reconciliation_is_idempotent`) and fully derivable — a lost
+index directory is rebuilt from the confirmed segments alone
 (`test_missing_index_is_rebuilt_from_published_segments`). An unreadable
 published segment fails closed at startup, not silently
 (`test_unreadable_published_segment_fails_closed_at_startup`).
