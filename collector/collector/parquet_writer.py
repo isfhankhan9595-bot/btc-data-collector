@@ -121,6 +121,29 @@ def _epoch_ms(value: Any) -> Optional[int]:
     return None
 
 
+def _read_counter_rows(count_path: Optional[Path]) -> Optional[int]:
+    """Rows recorded in a ``<segment>.count.json`` sidecar, or ``None``.
+
+    ``None`` means UNKNOWN -- missing, unreadable, malformed, or a nonsensical
+    (negative / boolean) value -- and is never to be read as zero.
+
+    This is the ONE reader of the sidecar. ``_recover_orphans`` (restart) and
+    ``_fail_closed`` (in-process failure) both use it, so the in-process writer
+    accounts for exactly the rows the restart will account for, and for no
+    others (see the accounting rule in ``_fail_closed``).
+    """
+    if count_path is None:
+        return None
+    try:
+        with count_path.open(encoding="utf-8") as handle:
+            rows = json.load(handle).get("rows")
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+        return None
+    return rows
+
+
 class ParquetWriter:
     """Write immutable, atomically-published Parquet segments for one stream.
 
@@ -132,12 +155,54 @@ class ParquetWriter:
         OPEN --publish ok, on_segment_published hook raises--> OPEN but write() refuses
                                                     (``_publication_failure``; segment IS durable)
 
-    FAILED means durability of the open segment was not established. The
-    writer then refuses write/flush/publish_*/finalize with RuntimeError, keeps
-    the stream lock until close(), leaves the unpublished ``.tmp`` for orphan
-    recovery (-> DATA_DROP on restart), runs no hook, and reports the failure
-    through ``quality_event_sink`` (STORAGE_PUBLICATION_FAILED, plus DATA_DROP
-    for rows that only ever lived in RAM). A failing sink never un-latches it.
+    FAILED means the writer can no longer vouch for its stream directory. It
+    refuses write/flush/publish_*/finalize with RuntimeError, keeps the stream
+    lock until close(), runs no further hook, and reports the failure through
+    ``quality_event_sink`` (STORAGE_PUBLICATION_FAILED, plus DATA_DROP for rows
+    that restart cannot account for). A failing sink never un-latches it.
+
+    Exact transitions. "Rows lost" is what the writer may claim; it never
+    claims more durability than it established, and never invents a count it
+    cannot prove (UNKNOWN is reported as UNKNOWN, ``rows_lost=None``)::
+
+      A  failure BEFORE rename   stages writer_close | tmp_fsync | overwrite_guard | rename
+           durability  NOT durable. rows_lost = every row of the segment
+                       (written-to-.tmp + buffered). Accounted exactly once:
+                       rows covered by the on-disk counter -> restart's
+                       DATA_DROP; every other row -> DATA_DROP emitted NOW.
+           .seg        absent          .tmp  present (complete parquet, left for restart)
+           hooks       none run        future writes  all refused (FAILED)
+           restart     discards .tmp; DATA_DROP = counter rows, or UNKNOWN if no counter
+      F  flush failed             stage flush (write_table raised, or the counter
+                                  sidecar could not be persisted after it)
+           as A, except .tmp is an unclosed parquet with no footer (unreadable).
+           A partially written .tmp is NEVER renamed into place.
+           Buffered rows never reached disk -> DATA_DROP emitted NOW.
+      B  failure AFTER rename, BEFORE directory fsync        stage dir_fsync
+           durability  UNCONFIRMED: the renamed, fsynced file may or may not
+                       survive a crash. rows_lost = UNKNOWN: no DATA_DROP is
+                       claimed (the file exists); the failure event says so.
+           .seg        present (left as the filesystem has it, never deleted)
+           .tmp        absent          hooks  none run (durability unproven)
+           future writes  all refused  restart  finds no orphan: reports nothing
+      C  publication SUCCEEDED, opening the NEXT segment failed   stage open_next_segment
+           durability  DURABLE (fsync + rename + dir fsync done, hooks already ran).
+           rows_lost = 0; rows_in_segment = 0; has_unpublished_rows() is False;
+           NO DATA_DROP. The event reason says "failed to open next segment".
+           .seg present and untouched; .tmp absent (an empty failed open is removed)
+           future writes  all refused (no healthy open segment exists)
+           restart     nothing to recover, nothing reported
+      D  publication SUCCEEDED, dedup hook (on_segment_published) failed
+           durable; rows_lost = 0; segment kept; next segment IS opened; the
+           ``_publication_failure`` latch makes every later write() refuse.
+           DEDUP_STATE_FAILED is emitted. restart: normal.
+      E  metadata sidecar failed after publication
+           durable; rows_lost = 0; STORAGE_METADATA_FAILED emitted; writer stays
+           healthy; hooks already ran/continue.
+      G  explicit close()
+           publishes the open segment (if it has rows), releases the stream lock,
+           and refuses all later writes. On a FAILED writer close() still raises
+           and still releases the lock.
     """
 
     def __init__(
@@ -189,7 +254,13 @@ class ParquetWriter:
         #: restart (orphan recovery) may resolve it. See _fail_closed().
         self._storage_failure: Optional[BaseException] = None
         self._storage_failure_stage: Optional[str] = None
+        #: Rows of the FAILED segment whose publication was never confirmed.
+        #: 0 when the failure left no unconfirmed rows (stage open_next_segment:
+        #: the previous segment is durable and the next one never opened).
         self._storage_failure_rows: int = 0
+        #: "unpublished" (stage before rename) | "unconfirmed" (renamed, dir
+        #: fsync failed) | "published" (durable; only opening the next failed).
+        self._storage_failure_durability: Optional[str] = None
         self._lock_handle: Optional[IO[bytes]] = _acquire_writer_lock(self.stream_dir)
         try:
             self.segment_rows, self.segment_seconds = segment_rows, segment_seconds
@@ -200,7 +271,15 @@ class ParquetWriter:
             self._tmp_filepath: Optional[Path] = None
             self._counter_filepath: Optional[Path] = None
             self._segment_opened_monotonic = time.monotonic()
+            #: Rows handed to pyarrow's write_table for the open segment (in
+            #: the .tmp). NOT a durability claim and NOT what the sidecar says.
             self.record_count = 0
+            #: Rows in the last counter sidecar this writer saw land
+            #: (``os.replace`` returned). ``None`` = none persisted for the open
+            #: segment. Lags ``record_count`` whenever a persist failed; may
+            #: also disagree with the file if something else touched it, which
+            #: is why _fail_closed re-reads the file rather than trusting this.
+            self._counter_rows_persisted: Optional[int] = None
             self._first_record_ts: Optional[int] = None
             self._last_record_ts: Optional[int] = None
             self._sequence_cache: dict[str, int] = {}
@@ -351,32 +430,87 @@ class ParquetWriter:
                 logger.error("storage_quality_event_sink_failed", stream=self.stream_name,
                              event_type="DATA_DROP", error=f"{type(exc).__name__}: {exc}")
 
+    #: Stages at which the segment is still a ``.tmp``: nothing was published.
+    _PRE_RENAME_STAGES = frozenset({"flush", "writer_close", "tmp_fsync", "overwrite_guard", "rename"})
+
+    def _counter_state(self, on_disk: Optional[int]) -> str:
+        """Describe how the sidecar on disk relates to what this writer persisted
+        and wrote. Diagnostic only -- the accounting uses ``on_disk`` itself."""
+        tracked = self._counter_rows_persisted
+        if on_disk is None:
+            state = "none_persisted" if tracked is None else f"MISSING_OR_UNREADABLE(expected_rows={tracked})"
+        elif tracked is None:
+            state = f"UNEXPECTED(disk_rows={on_disk},none_tracked)"
+        elif on_disk == tracked:
+            state = f"current(rows={on_disk})"
+        else:
+            state = f"DIVERGED(disk_rows={on_disk},tracked_rows={tracked})"
+        if on_disk is not None and on_disk > self.record_count:
+            state += f"+EXCEEDS_ROWS_WRITTEN({self.record_count})"
+        return state
+
     def _fail_closed(self, stage: str, exc: BaseException) -> None:
         """Latch the writer into the FAILED state after a publication step
         raised. Never raises. Idempotent: the FIRST failure wins.
 
-        State machine (see also the class docstring)::
+        See the class docstring for the full A/B/C/F transition table. In short:
 
             OPEN --publish ok--> OPEN (next segment) | CLOSED
             OPEN --publish step raises--> FAILED   (terminal; restart recovers)
 
-        The unpublished ``.tmp`` (and its ``.count.json``) is deliberately left
-        on disk: orphan recovery on restart turns it into a DATA_DROP. A segment
-        already renamed into place whose directory fsync failed is left as the
-        filesystem has it -- neither deleted (it may be durable) nor claimed
-        durable (no hook runs). Nothing is fabricated or restored.
+        THE ACCOUNTING RULE (one rule, no double counting). Rows of a segment
+        that will not be published are reported lost EXACTLY ONCE, by whichever
+        party can prove the count:
 
-        Rows still in RAM were never written anywhere, so no restart can
-        account for them: they are reported as DATA_DROP *now*. Rows already
-        flushed to the ``.tmp`` are left for the restart's DATA_DROP (reporting
-        them here too would count them twice).
+          * rows covered by the ``.count.json`` sidecar that is on disk NOW ->
+            reported by the restart's ``_recover_orphans`` (same reader, so the
+            two cannot disagree). This writer does NOT report them.
+          * every other row -- written to the ``.tmp`` after the last sidecar
+            that landed (or with no sidecar at all), plus rows only in RAM --
+            -> reported NOW, because no restart can recover that figure.
+
+        Consequences, none of which fabricate a number: a failed counter
+        persist (no sidecar, or a stale one) cannot under-report, because the
+        uncovered remainder is emitted immediately; a missing/unreadable sidecar
+        makes the RESTART event ``rows_lost=None`` (UNKNOWN), never 0, while this
+        writer has already reported every row it wrote. Nothing is subtracted
+        from the sidecar's figure and nothing is added to it.
+
+        Stage ``dir_fsync`` is different: the file was renamed into place and
+        may be durable, so no DATA_DROP is claimed -- durability is reported
+        UNKNOWN. Stage ``open_next_segment`` is different again: the segment
+        just published is durable and its hooks ran, so NOTHING is lost,
+        ``rows_in_segment`` is 0, and no DATA_DROP is emitted.
+
+        The unpublished ``.tmp`` (and its sidecar) of stages before rename is
+        deliberately left on disk for restart. A renamed segment is left as the
+        filesystem has it -- neither deleted nor claimed durable.
         """
         if self._storage_failure is not None:
             return
         self._storage_failure = exc
         self._storage_failure_stage = stage
         unflushed = len(self.buffer)
-        self._storage_failure_rows = self.record_count + unflushed
+        uncovered = 0
+        counter_note = ""
+        if stage == "open_next_segment":
+            # The previous segment is published and durable (fsync + rename + dir
+            # fsync + hooks all completed before the open was attempted). The
+            # next segment never came to exist, and _close_segment flushed the
+            # buffer first, so no row is pending: self.record_count here still
+            # holds the PUBLISHED segment's count and must not be reused.
+            durability = "published"
+            self._storage_failure_rows = unflushed
+        elif stage == "dir_fsync":
+            durability = "unconfirmed"
+            self._storage_failure_rows = self.record_count + unflushed
+        else:
+            durability = "unpublished"
+            self._storage_failure_rows = self.record_count + unflushed
+            on_disk = _read_counter_rows(self._counter_filepath)
+            uncovered = max(self.record_count - (on_disk or 0), 0)
+            counter_note = f" counter_sidecar={self._counter_state(on_disk)} rows_in_tmp_not_in_counter={uncovered}"
+        self._storage_failure_durability = durability
         # Release the pyarrow handle (best effort) and drop the reference so no
         # later call can append to an uncertain writer.
         handle, self.writer = self.writer, None
@@ -386,23 +520,46 @@ class ParquetWriter:
             except Exception as close_exc:  # noqa: BLE001 - the file is already suspect
                 logger.warning("failed_segment_handle_close_failed", stream=self.stream_name,
                                error=f"{type(close_exc).__name__}: {close_exc}")
-        reason = (f"segment publication failed at {stage}: {type(exc).__name__}: {exc}; "
-                  f"rows_in_segment={self._storage_failure_rows} rows_unflushed={unflushed}; "
-                  f"writer refuses all further writes until restart")
+        detail = f"{type(exc).__name__}: {exc}"
+        tail = "writer refuses all further writes until restart"
+        if durability == "published":
+            reason = (f"failed to open next segment (stage=open_next_segment): {detail}; the previous segment "
+                      f"was already published and is durable (its hooks ran): its rows are NOT lost; "
+                      f"rows_in_segment={self._storage_failure_rows} rows_unflushed={unflushed}; "
+                      f"no healthy open segment exists, so {tail}")
+        elif durability == "unconfirmed":
+            reason = (f"segment publication failed at {stage}: {detail}; segment was renamed into place but the "
+                      f"directory fsync was not confirmed: durability UNCONFIRMED and rows_lost UNKNOWN "
+                      f"(file left in place, no hook ran); rows_in_segment={self._storage_failure_rows} "
+                      f"rows_unflushed={unflushed}; {tail}")
+        else:
+            reason = (f"segment publication failed at {stage}: {detail}; "
+                      f"rows_in_segment={self._storage_failure_rows} rows_unflushed={unflushed};{counter_note}; "
+                      f"{tail}")
         logger.error("segment_publication_failed", stream=self.stream_name, stage=stage,
-                     rows=self._storage_failure_rows, error=f"{type(exc).__name__}: {exc}")
+                     durability=durability, rows=self._storage_failure_rows, error=detail)
         self._emit_quality_guarded("STORAGE_PUBLICATION_FAILED", reason)
+        if uncovered:
+            self._emit_drop(uncovered, "tmp_rows_not_covered_by_counter_discarded_on_publication_failure",
+                            guarded=True)
         if unflushed:
             self._emit_drop(unflushed, "unflushed_rows_discarded_on_publication_failure", guarded=True)
         self.buffer.clear()
 
     def _raise_if_storage_failed(self) -> None:
-        if self._storage_failure is not None:
+        if self._storage_failure is None:
+            return
+        if self._storage_failure_durability == "published":
             raise RuntimeError(
-                f"ParquetWriter for {self.stream_name!r} is FAILED: segment publication did not "
-                f"complete (stage={self._storage_failure_stage}, {self._storage_failure!r}); "
-                f"on-disk state is uncertain and the writer refuses all further operations "
-                f"until restart") from self._storage_failure
+                f"ParquetWriter for {self.stream_name!r} is FAILED: failed to open next segment "
+                f"({self._storage_failure!r}). The previous segment was published and is durable "
+                f"(no rows are pending or lost), but no healthy open segment exists, so the writer "
+                f"refuses all further operations until restart") from self._storage_failure
+        raise RuntimeError(
+            f"ParquetWriter for {self.stream_name!r} is FAILED: segment publication did not "
+            f"complete (stage={self._storage_failure_stage}, {self._storage_failure!r}); "
+            f"on-disk state is uncertain and the writer refuses all further operations "
+            f"until restart") from self._storage_failure
 
     def _recover_orphans(self) -> None:
         for meta_tmp in self.stream_dir.glob("*.meta.json.tmp"):
@@ -412,12 +569,11 @@ class ParquetWriter:
                 logger.error("metadata_orphan_discard_failed", file=str(meta_tmp), error=str(exc))
         for tmp in self.stream_dir.glob("*.seg.tmp"):
             count_path = Path(str(tmp).removesuffix(".tmp") + ".count.json")
-            rows: Optional[int] = None
-            try:
-                with count_path.open(encoding="utf-8") as handle:
-                    rows = int(json.load(handle).get("rows"))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                rows = None
+            # The sidecar is the ONLY count restart can prove: it covers the
+            # rows up to the last counter that landed, and nothing beyond it
+            # (_fail_closed reports the remainder in-process, so the two never
+            # overlap). No usable sidecar -> UNKNOWN (None), never 0.
+            rows = _read_counter_rows(count_path)
             try:
                 tmp.unlink()
                 count_path.unlink(missing_ok=True)
@@ -432,8 +588,22 @@ class ParquetWriter:
         if final.exists():
             raise FileExistsError(f"refusing to overwrite published segment: {final}")
         self._tmp_filepath, self._counter_filepath = tmp, counter
-        self.writer = pq.ParquetWriter(str(tmp), self.schema, compression="snappy")
+        try:
+            self.writer = pq.ParquetWriter(str(tmp), self.schema, compression="snappy")
+        except BaseException:
+            # A failed open never held a row. Whatever it left behind (an empty
+            # or header-only .tmp) must not survive to be reported by the next
+            # restart as a crashed segment: that would fabricate a loss for a
+            # segment that never existed.
+            for leftover in (tmp, counter):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    logger.error("failed_open_artifact_discard_failed", file=str(leftover),
+                                 error=f"{type(unlink_exc).__name__}: {unlink_exc}")
+            raise
         self.record_count = 0
+        self._counter_rows_persisted = None
         self._first_record_ts = self._last_record_ts = None
         self._segment_opened_monotonic = time.monotonic()
         self._first_row_monotonic = None
@@ -448,12 +618,16 @@ class ParquetWriter:
 
     def _persist_counter(self) -> None:
         assert self._counter_filepath is not None
+        rows = self.record_count
         temporary = Path(str(self._counter_filepath) + ".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({"rows": self.record_count}, handle)
+            json.dump({"rows": rows}, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, self._counter_filepath)
+        # Only after the replace returned: this is the last sidecar known to
+        # have landed. A raise anywhere above leaves it at the previous value.
+        self._counter_rows_persisted = rows
 
     def current_segment_token(self) -> Tuple[str, int]:
         return (self.current_hour, self._seq)
@@ -634,8 +808,10 @@ class ParquetWriter:
 
     def has_unpublished_rows(self) -> bool:
         """True while rows exist whose publication has not been confirmed.
-        A FAILED writer reports the rows of the segment that failed (they were
-        never confirmed durable) -- never a misleading False."""
+        A FAILED writer reports the rows of the segment that failed to publish
+        (never confirmed durable) -- never a misleading False. When the failure
+        was only opening the NEXT segment, the previous segment is durable and
+        nothing is unconfirmed, so this is False."""
         if self._storage_failure is not None:
             return self._storage_failure_rows > 0
         return self.writer is not None and (self.record_count > 0 or bool(self.buffer))
