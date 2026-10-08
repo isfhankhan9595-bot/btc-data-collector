@@ -628,25 +628,25 @@ def test_user_version_1_index_rebuilt_once_and_idempotent_on_crash(tmp_path):
     _write_v1_index(tmp_path / "dedup.sqlite3", {seg_key: [key_for("A"), key_for("POISON")]})
     # (a) the rebuild transaction is atomic: a failure inside it changes NOTHING, version included
     idx = SegmentDedupIndex(str(tmp_path / "dedup.sqlite3"))
-    assert idx.user_version() < 2 and idx.identity_count() == 2
+    assert idx.user_version() < sd.INDEX_SCHEMA_VERSION and idx.identity_count() == 2
     real = idx._conn
 
     class Boom:
         def execute(self, sql, *a):
-            if sql.startswith("DELETE FROM reconciled_segments"):
+            if sql.startswith("DROP TABLE IF EXISTS reconciled_segments"):
                 raise sqlite3.OperationalError("simulated crash inside rebuild")
             return real.execute(sql, *a)
     idx._conn = Boom()
     with pytest.raises(DedupStateError):
         idx.rebuild_reset()
     idx._conn = real
-    assert idx.user_version() < 2 and idx.identity_count() == 2, "rolled back as a whole"
+    assert idx.user_version() < sd.INDEX_SCHEMA_VERSION and idx.identity_count() == 2, "rolled back as a whole"
     idx.close()
     # (b) the real restart rebuilds exactly once, keyed by the schema version
     r.restart()
     rep = r.co.last_report
     assert rep.rebuilt and any("user_version" in x for x in rep.rebuild_reasons)
-    assert r.index.user_version() == 2 and not r.index.contains(key_for("POISON")), "poisoned authority removed"
+    assert r.index.user_version() == sd.INDEX_SCHEMA_VERSION and not r.index.contains(key_for("POISON")), "poisoned authority removed"
     assert r.index.contains(key_for("A")) and r.offer("POISON")
     # (c) idempotent
     r.restart()

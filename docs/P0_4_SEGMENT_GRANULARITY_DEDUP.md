@@ -21,8 +21,9 @@ writer — is ever attributed to the persistent dedup index.
   `test_ram_is_bounded_by_open_segment_not_by_process_lifetime` (2,000
   admissions, peak RAM identity accounting ≤ 2×`segment_rows+1`, never
   process-lifetime).
-- **Disk**: `SegmentDedupIndex`, a SQLite table (`seen`) plus a
-  `reconciled_segments` marker table. Never evicted — disk grows with the
+- **Disk**: `SegmentDedupIndex`, a SQLite table (`seen`, rows owned per segment) plus a
+  `reconciled_segments` table (marker evidence + identity count/digest; audited against per-segment
+  identity evidence files, see `F1_DURABLE_PUBLICATION.md` "Dedup index v3"). Never evicted — disk grows with the
   lifetime trade count, exactly as documented as an accepted tradeoff in
   `P0_4_BOUNDED_TRADE_DEDUP.md` §12 (`disk_size_bytes()` makes this
   observable).

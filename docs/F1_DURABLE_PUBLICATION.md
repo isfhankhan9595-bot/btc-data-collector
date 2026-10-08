@@ -72,12 +72,11 @@ markers are preserved (`.invalid.N`), never deleted. 4. Unmarked set `U`: `fsync
 `fsync(dir)` once → read, sha256, size, full parquet parse and footer rows for **all** (no writes
 yet) → write marker v2 for each (`confirmed_by=startup_refsync`) → `fsync(dir)` once. Any failure
 raises `DedupStateError`; nothing is indexed and no marker precedes the first successful directory
-fsync. 5. Dangling markers are renamed `.orphan.<utc>`. 6. Audit the index: rebuild (one
-transaction: delete `seen` and `reconciled_segments`, set `user_version=2`) if `user_version < 2`,
-an indexed segment has no confirmed segment on disk, indexed evidence differs from the marker, or
-identities exist with no reconciled row. 7. Index every confirmed, unreconciled segment from the
-exact bytes whose sha256/size match the marker. `DEDUP_DEEP_VERIFY=1` additionally re-hashes every
-reconciled segment (O(dataset); off by default).
+fsync. 5. Dangling markers are renamed `.orphan.<utc>`. 6. Audit the index (C1, below) and rebuild
+on any divergence. 7. Index every confirmed, unreconciled segment from the exact bytes whose
+sha256/size match the marker; an identity already owned by another segment raises
+`CROSS_SEGMENT_DUPLICATE`. `DEDUP_DEEP_VERIFY=1` additionally re-derives every segment's identity
+set from its bytes (O(dataset); off by default).
 
 A crash at any step re-runs safely. A previously failed journal commit cannot be laundered into a
 successful directory fsync on ext4/xfs, so a successful startup directory fsync after `X.seg` is
@@ -85,14 +84,33 @@ visible proves its rename durable. It does **not** prove data durability (a re-r
 cache): that rests on program order — `fsync(tmp)` strictly preceded the rename in every writer
 version since `dd9c6be8`.
 
-## Dedup index v2
+## Dedup index v3 and the identity audit (C1)
 
-`reconciled_segments` gains `evidence_sha256`, `evidence_size`, `confirmed_by`;
-`commit_segment(key, ids, sha, size, by)` is a no-op for equal evidence and raises
-`DedupStateError("EVIDENCE_CONFLICT …")` for different evidence — never a silent no-op. The hook
-re-verifies marker, size, sha256 and row count against the exact bytes it indexes and raises
-`DedupStateError` otherwise. Old indexes (`user_version < 2`) are rebuilt once from confirmed
-segments, so poisoned historical authority is not kept.
+Chain of evidence: segment bytes (authority) → marker (sha256, size) → **identity evidence file**
+`<index stem>.identity_evidence/<segment>.ids.json` (distinct identity count + order-independent
+digest = sha256 over the byte-sorted, length-framed distinct keys; bound to the marker's
+sha256/size and to the identity-key encoding; a pure function of the segment bytes) → SQLite.
+
+Schema (`user_version=3`): `reconciled_segments(segment_id, segment_key, identity_count,
+identity_digest, identity_encoding, evidence_sha256, evidence_size, confirmed_by)` and
+`seen(identity_key, segment_id)` clustered on `(identity_key, segment_id)` — every identity row is
+owned by the segment it was read from. `commit_segment` is one transaction; equal evidence and
+identity set → no-op; different evidence → `EVIDENCE_CONFLICT`; same evidence, different set →
+`IDENTITY_CONFLICT`; an identity owned by another segment → `CROSS_SEGMENT_DUPLICATE`.
+
+Startup audit (every start, no segment bytes read): per confirmed segment, marker = row evidence,
+row encoding = current, row (count, digest) = evidence file; then ONE pass over `seen` recomputes each
+segment's (count, digest) and must equal the evidence file; unknown owners, segments with no rows
+though the evidence says otherwise, and identities owned by several segments are divergence.
+Missing/stale/unreadable evidence files are re-derived from the segment bytes first (old file
+preserved `.invalid.N`). Divergence ⇒ the index is rebuilt in one transaction from the bytes.
+Identity-key encoding drift is caught by a version constant **and** a canary computed through the live
+`dedup_identity_key`. Old indexes (`user_version != 3` or a different table shape, including the
+F1 `user_version=2` index) are never trusted: they are dropped and rebuilt once, atomically.
+
+Trust level: the evidence file is trusted like the marker — both are re-checked against the bytes only
+by `DEDUP_DEEP_VERIFY=1`. A forgery of evidence **and** SQLite together is invisible to the default
+audit and caught by deep verify. Evidence files are not fsynced (derived; loss costs one segment read).
 
 ## Legacy migration
 
