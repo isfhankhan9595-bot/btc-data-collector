@@ -137,7 +137,7 @@ def test_state_E_crash_during_index_transaction_is_atomic_and_rerunnable(tmp_pat
     real = p.index._conn
     p.index._conn = Boom(real)
     with pytest.raises(DedupStateError):
-        p.co.index.commit_segment("x/y.seg", [key_for("A"), key_for("B")])
+        p.co.index.commit_segment("x/y.seg", [key_for("A"), key_for("B")], "0" * 64, 1, "writer")
     p.index._conn = real
     assert p.index.identity_count() == 0 and not p.index.is_segment_reconciled("x/y.seg")
     p.restart(); p.defer_commit = False

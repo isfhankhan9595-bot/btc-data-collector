@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 
 from .numeric import column_value
 from .utils import logger
+from .publication import CONFIRMED_BY_WRITER, sha256_file, write_marker_atomic
 from .storage_layout import (
     SegmentKind, check_stream_namespace, iter_segments, parse_segment_name, segment_path,
 )
@@ -196,9 +197,12 @@ class ParquetWriter:
            durable; rows_lost = 0; segment kept; next segment IS opened; the
            ``_publication_failure`` latch makes every later write() refuse.
            DEDUP_STATE_FAILED is emitted. restart: normal.
-      E  metadata sidecar failed after publication
-           durable; rows_lost = 0; STORAGE_METADATA_FAILED emitted; writer stays
-           healthy; hooks already ran/continue.
+      E  publication marker (``<seg>.meta.json`` v2) failed after publication
+           durable; rows_lost = 0; STORAGE_METADATA_FAILED emitted (plus
+           DEDUP_STATE_FAILED when a publication hook is wired); the dedup hook
+           is WITHHELD and the ``_publication_failure`` latch refuses later
+           writes. NO DATA_DROP. restart: reconciliation confirms the unmarked
+           segment (startup refsync) and indexes it. See docs/F1_DURABLE_PUBLICATION.md.
       G  explicit close()
            publishes the open segment (if it has rows), releases the stream lock,
            and refuses all later writes. On a FAILED writer close() still raises
@@ -431,7 +435,7 @@ class ParquetWriter:
                              event_type="DATA_DROP", error=f"{type(exc).__name__}: {exc}")
 
     #: Stages at which the segment is still a ``.tmp``: nothing was published.
-    _PRE_RENAME_STAGES = frozenset({"flush", "writer_close", "tmp_fsync", "overwrite_guard", "rename"})
+    _PRE_RENAME_STAGES = frozenset({"flush", "writer_close", "tmp_fsync", "digest", "overwrite_guard", "rename"})
 
     def _counter_state(self, on_disk: Optional[int]) -> str:
         """Describe how the sidecar on disk relates to what this writer persisted
@@ -730,6 +734,9 @@ class ParquetWriter:
             stage = "tmp_fsync"
             with tmp.open("rb") as handle:
                 os.fsync(handle.fileno())
+            # F1: bind the marker to the EXACT bytes about to be renamed.
+            stage = "digest"
+            digest, digest_size = sha256_file(tmp)
             stage = "overwrite_guard"
             if final.exists():
                 raise FileExistsError(f"refusing to overwrite published segment: {final}")
@@ -759,35 +766,31 @@ class ParquetWriter:
                 self.on_segment_durable(final, self.record_count)
             except Exception as exc:  # noqa: BLE001 - segment is durable; the owner latches its own state
                 logger.error("segment_durable_hook_failed", file=str(final), error=f"{type(exc).__name__}: {exc}")
-        # The segment is already durably published above. A metadata failure
-        # must therefore never propagate: it would kill the ingest task over a
-        # sidecar hint while the data itself is safely on disk. Surface it as a
-        # durable quality event instead of silently swallowing it.
-        meta = Path(str(final) + ".meta.json")
-        meta_tmp = Path(str(meta) + ".tmp")
+        # F1: publication marker v2 (``<seg>.meta.json``), written strictly AFTER the
+        # rename's directory fsync above. Its visibility implies that rename is
+        # durable. The segment itself is already durable here, so a marker failure
+        # is never a data loss (no DATA_DROP), but it is a GATE: without a durable
+        # marker no dedup authority may be created, and the writer fails closed.
+        marker_ok = True
         try:
-            with meta_tmp.open("w", encoding="utf-8") as handle:
-                json.dump({"record_count": self.record_count, "first_record_ts": self._first_record_ts,
-                           "last_record_ts": self._last_record_ts}, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(meta_tmp, meta)
-            parent_fd = os.open(str(final.parent), os.O_RDONLY)
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        except (OSError, TypeError, ValueError) as exc:
-            try:
-                meta_tmp.unlink(missing_ok=True)
-            except OSError:
-                pass  # recovery discards stray *.meta.json.tmp on restart
+            write_marker_atomic(final, record_count=self.record_count, first_ts=self._first_record_ts,
+                                last_ts=self._last_record_ts, sha256=digest, size_bytes=digest_size,
+                                confirmed_by=CONFIRMED_BY_WRITER, legacy=False)
+        except Exception as exc:  # noqa: BLE001 - segment is durable; latch, never raise out of publication
+            marker_ok = False
+            self._publication_failure = exc
             self._emit_quality_guarded(
                 "STORAGE_METADATA_FAILED",
-                f"segment published but metadata sidecar failed: {type(exc).__name__}: {exc}",
+                f"segment published (durable, rows NOT lost) but publication marker failed: "
+                f"{type(exc).__name__}: {exc}; dedup hook withheld, writer refuses further writes until restart",
             )
+            if self.on_segment_published is not None:
+                self._emit_quality_guarded(
+                    "DEDUP_STATE_FAILED",
+                    "segment published but its marker is not durable: dedup commit withheld; "
+                    "restart reconciliation will confirm and index it")
         logger.info("closed_parquet_segment", stream=self.stream_name, file=str(final), rows=self.record_count)
-        if self.on_segment_published is not None:
+        if self.on_segment_published is not None and marker_ok:
             try:
                 self.on_segment_published((self.current_hour, self._seq), final)
             except Exception as exc:  # noqa: BLE001 - segment is durable; fail CLOSED on the next write

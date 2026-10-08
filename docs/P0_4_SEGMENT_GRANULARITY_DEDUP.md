@@ -21,8 +21,9 @@ writer — is ever attributed to the persistent dedup index.
   `test_ram_is_bounded_by_open_segment_not_by_process_lifetime` (2,000
   admissions, peak RAM identity accounting ≤ 2×`segment_rows+1`, never
   process-lifetime).
-- **Disk**: `SegmentDedupIndex`, a SQLite table (`seen`) plus a
-  `reconciled_segments` marker table. Never evicted — disk grows with the
+- **Disk**: `SegmentDedupIndex`, a SQLite table (`seen`, rows owned per segment) plus a
+  `reconciled_segments` table (marker evidence + identity count/digest; audited against per-segment
+  identity evidence files, see `F1_DURABLE_PUBLICATION.md` "Dedup index v3"). Never evicted — disk grows with the
   lifetime trade count, exactly as documented as an accepted tradeoff in
   `P0_4_BOUNDED_TRADE_DEDUP.md` §12 (`disk_size_bytes()` makes this
   observable).
@@ -32,7 +33,9 @@ writer — is ever attributed to the persistent dedup index.
 Only inside `SegmentDedupIndex.commit_segment`, one SQLite transaction that
 inserts every identity a published segment contains **and** its
 `reconciled_segments` marker atomically — `BEGIN IMMEDIATE` /
-`INSERT OR IGNORE` × N / `INSERT` marker / `COMMIT`, with `ROLLBACK` on any
+plain `INSERT` × N (one row per distinct identity of the segment; an identity already owned by
+another segment, or any other conflict, aborts the whole transaction — nothing is ignored) /
+`INSERT` marker / `COMMIT`, with `ROLLBACK` on any
 failure (`test_state_E_crash_during_index_transaction_is_atomic_and_rerunnable`).
 RAM identities for that segment are released **only after** this commit
 returns (`test_release_happens_only_after_the_index_commit`).
@@ -40,9 +43,12 @@ returns (`test_release_happens_only_after_the_index_commit`).
 ## Segment publication semantics
 
 `ParquetWriter.on_segment_published(token, path)` is called after the
-segment is fully durable (fsync + rename done) —
+segment is fully durable (fsync + rename + directory fsync) **and its publication
+marker `<seg>.meta.json` v2 is durable** (see `F1_DURABLE_PUBLICATION.md`) —
 `test_hook_runs_only_after_the_segment_is_durably_published` proves the
-`.tmp` file no longer exists and the final path does at hook time. If the
+`.tmp` file no longer exists and the final path does at hook time, and
+`test_marker_written_after_dir_fsync_and_before_dedup_hook` proves the syscall order.
+The hook is withheld if the marker failed. If the
 hook raises, the writer marks itself failed and every subsequent `write()`
 raises immediately (`test_hook_failure_fails_closed_on_the_next_write`) —
 never silently continues with an uncertain dedup state. `write(record,
@@ -53,10 +59,12 @@ rollover mid-call (`test_hour_rollover_attributes_identity_to_the_segment_that_r
 ## Startup reconciliation
 
 `SegmentDedupCoordinator.startup_reconcile(stream_dir)`, run before
-ingestion resumes: for every `*.seg` file without a `reconciled_segments`
-marker, read it back and commit its identities. Idempotent
-(`test_repeated_reconciliation_is_idempotent`) and fully derivable — a lost
-index directory is rebuilt from the published segments alone
+ingestion resumes: every `*.seg` must carry a valid publication marker (sha256 + size
+bound) before its identities are committed; an unmarked segment is first confirmed
+by the startup refsync protocol, and the index rows carry the marker evidence
+(F1, `F1_DURABLE_PUBLICATION.md`) — a visible `.seg` alone is never authority.
+Idempotent (`test_repeated_reconciliation_is_idempotent`) and fully derivable — a lost
+index directory is rebuilt from the confirmed segments alone
 (`test_missing_index_is_rebuilt_from_published_segments`). An unreadable
 published segment fails closed at startup, not silently
 (`test_unreadable_published_segment_fails_closed_at_startup`).

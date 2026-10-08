@@ -139,14 +139,15 @@ def test_metadata_failure_does_not_lose_published_segment(tmp_path, monkeypatch)
         quality_event_sink=events.append,
     )
 
-    real_open = type(tmp_path).open
+    import os as _os
+    real_os_open = _os.open
 
-    def fail_on_meta_tmp(self, *args, **kwargs):
-        if self.name.endswith(".meta.json.tmp"):
+    def fail_on_meta_tmp(path, *args, **kwargs):
+        if str(path).endswith(".meta.json.tmp"):
             raise OSError("simulated sidecar failure")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(type(tmp_path), "open", fail_on_meta_tmp)
+    monkeypatch.setattr(_os, "open", fail_on_meta_tmp)
 
     writer.write({"timestamp": 1770000000000, "value": 7})
     writer.close()

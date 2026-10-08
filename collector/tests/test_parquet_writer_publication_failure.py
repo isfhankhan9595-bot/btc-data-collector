@@ -252,7 +252,9 @@ def test_4b_sink_failure_while_reporting_a_hook_failure_cannot_reopen_the_writer
 
 
 # --------------------------------------------------------------------- TEST 5
-def test_5_metadata_sidecar_failure_never_discards_a_durable_segment(tmp_path, monkeypatch):
+def test_5_marker_failure_never_discards_a_durable_segment_and_withholds_dedup(tmp_path, monkeypatch):
+    """F1: the marker is a GATE. A durable segment is never discarded or reported
+    lost, but without a marker no dedup hook runs and the writer fails closed."""
     events, published, durable = [], [], []
     w = _make(tmp_path, events=events, published=published, durable=durable)
     for i in range(3):
@@ -263,17 +265,20 @@ def test_5_metadata_sidecar_failure_never_discards_a_durable_segment(tmp_path, m
 
     segs = _segs(w, "*.seg")
     assert len(segs) == 1 and pq.read_table(segs[0]).num_rows == 3
-    assert len(published) == 1 and len(durable) == 1
-    meta = [e for e in events if e["event_type"] == "STORAGE_METADATA_FAILED"]
-    assert len(meta) == 1
+    assert len(published) == 0, "dedup hook must be withheld when the marker is not durable"
+    assert len(durable) == 1, "on_segment_durable keeps its own contract (segment IS durable)"
+    assert len([e for e in events if e["event_type"] == "STORAGE_METADATA_FAILED"]) == 1
+    assert len([e for e in events if e["event_type"] == "DEDUP_STATE_FAILED"]) == 1
     assert not [e for e in events if e["event_type"] in ("STORAGE_PUBLICATION_FAILED", "DATA_DROP")]
-    assert w._publication_failure is None and w._storage_failure is None
-    w.write(_row(10))                                 # writer stays healthy
+    assert w._publication_failure is not None and w._storage_failure is None
+    assert not Path(str(segs[0]) + ".meta.json").exists()
+    with pytest.raises(RuntimeError):
+        w.write(_row(10))                             # fails closed
     w.close()
-    assert len(_segs(w, "*.seg")) == 2
+    assert len(_segs(w, "*.seg")) == 1
 
 
-def test_5b_quality_sink_failure_during_metadata_report_does_not_skip_hooks_or_next_segment(tmp_path, monkeypatch):
+def test_5b_quality_sink_failure_during_marker_report_does_not_skip_next_segment_or_unlatch(tmp_path, monkeypatch):
     published = []
 
     def broken_sink(event):
@@ -283,10 +288,12 @@ def test_5b_quality_sink_failure_during_metadata_report_does_not_skip_hooks_or_n
     w.write(_row(0))
     _fail_replace_to(monkeypatch, ".meta.json")
     w.publish_open_segment()                          # a sink fault must not abort publication
-    assert len(published) == 1, "the dedup hook must still run for a durable segment"
-    w.write(_row(1))                                  # next segment was opened: writer healthy
+    assert published == [], "no marker => no dedup hook, whatever the sink does"
+    assert w._publication_failure is not None, "the latch, not the sink, enforces fail-closed"
+    with pytest.raises(RuntimeError):
+        w.write(_row(1))
     w.close()
-    assert len(_segs(w, "*.seg")) == 2
+    assert len(_segs(w, "*.seg")) == 1
 
 
 def test_5c_stale_counter_unlink_failure_after_publication_is_not_a_storage_failure(tmp_path, monkeypatch):
