@@ -23,7 +23,9 @@ the *published segment* the recovery anchor:
   then is it indexed, before ingestion resumes.
 
 C1 (index content audit). The index is a *derived, rebuildable* view, and every
-fact in it is auditable against evidence that does not live in SQLite:
+fact in it is auditable against evidence that is stored outside SQLite (a separate file per
+segment, derived from the same bytes by the same identity code: storage independence, NOT
+independent derivation):
 
     segment bytes (authority)  ->  marker (sha256, size)
         ->  identity evidence file ``<index stem>.identity_evidence/<segment>.ids.json``
@@ -145,6 +147,16 @@ def identity_set_digest(keys: Iterable[str]) -> Tuple[int, str]:
     return len(unique), h.hexdigest()
 
 
+def future_schema_message(version: int) -> Optional[str]:
+    """``None`` unless ``version`` is NEWER than this code's ``INDEX_SCHEMA_VERSION``. A newer layout is never
+    rebuilt, downgraded or reinterpreted (an older one is rebuilt once, from the segment bytes)."""
+    if version > INDEX_SCHEMA_VERSION:
+        return (f"UNSUPPORTED_FUTURE_SCHEMA: index user_version={version} is newer than this code supports "
+                f"({INDEX_SCHEMA_VERSION}); refusing to read, rebuild or downgrade it -- run a collector "
+                f"version that understands it, or move the index aside deliberately")
+    return None
+
+
 class IndexedSegment(NamedTuple):
     segment_id: int
     sha256: Optional[str]
@@ -203,6 +215,9 @@ class SegmentDedupIndex:
         leaves the previous schema and rows exactly as they were."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            future = self._future_schema_problem_in_txn()
+            if future is not None:                       # never drop/downgrade a layout this code does not know
+                raise DedupStateError(future)
             if drop:
                 self._conn.execute("DROP TABLE IF EXISTS seen")
                 self._conn.execute("DROP TABLE IF EXISTS reconciled_segments")
@@ -223,10 +238,22 @@ class SegmentDedupIndex:
         except sqlite3.Error as exc:
             raise DedupStateError(f"user_version read failed: {exc}") from exc
 
+    def _future_schema_problem_in_txn(self) -> Optional[str]:
+        return future_schema_message(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def future_schema_problem(self) -> Optional[str]:
+        """Why this file must NOT be touched: its ``user_version`` is newer than this code understands.
+        Unlike an older layout (rebuilt once, from the segment bytes) a newer one is never dropped,
+        downgraded or reinterpreted -- the caller stops."""
+        return future_schema_message(self.user_version())
+
     def schema_problem(self) -> Optional[str]:
         """None when the file has exactly the current layout; otherwise why it must be rebuilt
         (older/newer ``user_version``, or tables/indexes that do not have the expected shape)."""
         version = self.user_version()
+        future = future_schema_message(version)
+        if future is not None:
+            return future
         if version != INDEX_SCHEMA_VERSION:
             return (f"index schema user_version={version} != {INDEX_SCHEMA_VERSION} "
                     f"(no per-segment identity ownership/evidence)")
@@ -292,13 +319,17 @@ class SegmentDedupIndex:
         owners: Dict[bytes, List[int]] = {}
         prev, prev_sid = None, None
         try:
-            for sid, kb in self._conn.execute(
-                    "SELECT segment_id, CAST(identity_key AS BLOB) FROM seen ORDER BY identity_key, segment_id"):
+            for sid, kb, kind in self._conn.execute(
+                    "SELECT segment_id, CAST(identity_key AS BLOB), typeof(identity_key) FROM seen "
+                    "ORDER BY identity_key, segment_id"):
                 entry = state.get(sid)
                 if entry is None:
                     entry = state[sid] = [0, _new_digest()]
-                if not isinstance(kb, bytes):
-                    kb = b"\xff<non-text>" + repr(kb).encode()
+                if kind != "text":
+                    # CAST(... AS BLOB) would give a BLOB key the very bytes of the TEXT key it imitates, yet
+                    # ``contains()`` (a TEXT comparison) can never match it. Fold the storage type into the
+                    # digest so the segment diverges from its evidence instead of silently normalising.
+                    kb = b"\xff<non-text:" + str(kind).encode("ascii", "replace") + b">" + kb
                 entry[0] += 1
                 entry[1].update(_LEN(len(kb)) + kb)
                 if kb == prev:
@@ -393,6 +424,14 @@ class SegmentDedupIndex:
         except sqlite3.Error as exc:
             raise DedupStateError(f"count failed: {exc}") from exc
 
+    def non_text_identity_rows(self) -> int:
+        """Persisted ``identity_key`` values whose SQLite storage class is not TEXT (corruption: ``contains()``
+        compares TEXT and would never match them). Read-only; used by audits/tools."""
+        try:
+            return self._conn.execute("SELECT COUNT(*) FROM seen WHERE typeof(identity_key) != 'text'").fetchone()[0]
+        except sqlite3.Error as exc:
+            raise DedupStateError(f"type scan failed: {exc}") from exc
+
     def disk_size_bytes(self) -> int:
         return sum(os.path.getsize(self.path + s) for s in ("", "-wal", "-shm") if os.path.exists(self.path + s))
 
@@ -424,8 +463,10 @@ class SegmentDedupCoordinator:
     ``evidence_dir`` holds one derived identity-evidence file per segment
     (default: ``<index stem>.identity_evidence`` beside the index). Each is a pure function of the
     segment bytes, bound to the marker's sha256/size; it is the index's
-    independent audit reference and is regenerated from the bytes whenever it
-    is missing, stale, unreadable or (under deep verify) wrong.
+    separately stored audit reference (stored apart from SQLite, but derived by the same
+    ``row_identity`` code from the same bytes -- it catches SQLite loss/corruption/tampering,
+    not a bug in identity derivation that both would share) and is regenerated from the bytes
+    whenever it is missing, stale, unreadable or (under deep verify) wrong.
     """
 
     def __init__(self, index: SegmentDedupIndex, row_identity: Callable[[Dict[str, Any]], Optional[str]],
@@ -442,7 +483,7 @@ class SegmentDedupCoordinator:
     def default_evidence_dir(index: SegmentDedupIndex) -> Path:
         """``<dir>/<stem>.identity_evidence`` next to ``<dir>/<stem>.sqlite3`` -- deliberately NOT prefixed by
         the index file name, so deleting ``<index>*`` (a lost or distrusted index) does not delete the
-        independent evidence with it."""
+        separately stored evidence with it."""
         idx = Path(index.path)
         return idx.with_name(idx.stem + ".identity_evidence")
 
@@ -566,6 +607,9 @@ class SegmentDedupCoordinator:
         report = ReconcileReport()
         self.last_report = report
         verdict = fs_guard(stream_dir)
+        future = self.index.future_schema_problem()
+        if future is not None:        # before ANY marker is renamed or written: an unknown layout is never rebuilt
+            raise DedupStateError(future)
         segs = sorted(stream_dir.glob("*.seg"))
         markers: Dict[Path, MarkerResult] = {p: read_marker(p) for p in segs}
 

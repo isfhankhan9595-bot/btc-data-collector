@@ -297,14 +297,101 @@ def test_6_identity_attributed_to_the_wrong_segment_is_detected(tmp_path):
     assert sql_one(r, "SELECT segment_id FROM seen WHERE identity_key=?", (key_for("A"),))[0] == s1
 
 
-@pytest.mark.parametrize("delta", [-1, +1])
-def test_current_shape_with_a_different_schema_version_is_rebuilt(tmp_path, delta):
-    """The version also versions SEMANTICS: an identical table shape under another version is not trusted."""
+def test_current_shape_with_a_different_schema_version_is_rebuilt(tmp_path):
+    """The version also versions SEMANTICS: an identical table shape under an OLDER version is not trusted.
+    (A NEWER version is the opposite case: see ``test_10b_*`` -- it is never rebuilt.)"""
     r = five(tmp_path)
-    tamper(r, (f"PRAGMA user_version={sd.INDEX_SCHEMA_VERSION + delta}",))
+    tamper(r, (f"PRAGMA user_version={sd.INDEX_SCHEMA_VERSION - 1}",))
     r.start()
     assert_reports_rebuild(r, "user_version")
     assert r.index.user_version() == sd.INDEX_SCHEMA_VERSION
+
+
+def _dir_bytes(root):
+    return {str(q.relative_to(root)): q.read_bytes() for q in sorted(Path(root).rglob("*")) if q.is_file()}
+
+
+@pytest.mark.parametrize("future", [sd.INDEX_SCHEMA_VERSION + 1, sd.INDEX_SCHEMA_VERSION + 40])
+def test_10b_future_schema_fails_closed_before_touching_anything(tmp_path, future):
+    """A ``user_version`` newer than this code understands is NOT an old schema: startup must raise and leave the
+    index rows, the markers (even an invalid one it would normally rename), the dangling marker it would
+    normally orphan, and the evidence files exactly as they were."""
+    r = five(tmp_path)
+    segs = r.segs()
+    marker_path(segs[0]).write_bytes(b"{not json")                           # startup would rename this to .invalid.N
+    shutil.copy(marker_path(segs[1]), segs[1].parent / "2026-01-01-00-999999.seg.meta.json")   # ... and orphan this
+    tamper(r, (f"PRAGMA user_version={future}",))
+    rows_before = (sql_one(r, "SELECT COUNT(*) FROM seen")[0], sql_one(r, "SELECT COUNT(*) FROM reconciled_segments")[0])
+    stream_before = _dir_bytes(r.stream_dir)
+    evidence_before = _dir_bytes(Path(r.co.evidence_dir))
+    index = SegmentDedupIndex(r.db)
+    try:
+        assert index.future_schema_problem() and index.schema_problem().startswith("UNSUPPORTED_FUTURE_SCHEMA")
+        with pytest.raises(DedupStateError, match="UNSUPPORTED_FUTURE_SCHEMA"):
+            SegmentDedupCoordinator(index, row_identity).startup_reconcile(r.stream_dir)
+    finally:
+        index.close()
+    assert _dir_bytes(r.stream_dir) == stream_before, "no marker may be renamed, written or orphaned"
+    assert _dir_bytes(Path(r.co.evidence_dir)) == evidence_before
+    assert sql_one(r, "PRAGMA user_version")[0] == future, "never downgraded"
+    assert (sql_one(r, "SELECT COUNT(*) FROM seen")[0], sql_one(r, "SELECT COUNT(*) FROM reconciled_segments")[0]) == rows_before
+
+
+def test_10c_rebuild_reset_and_a_fresh_open_refuse_a_future_schema(tmp_path):
+    path = str(tmp_path / "i.sqlite3")
+    idx = SegmentDedupIndex(path)
+    assert idx.commit_segment("s/a.seg", ["k1", "k2"], "a" * 64, 1, "writer")
+    idx.close()
+    conn = sqlite3.connect(path)
+    conn.execute(f"PRAGMA user_version={sd.INDEX_SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    idx = SegmentDedupIndex(path)                                # tables exist: opening does not migrate or reset
+    try:
+        with pytest.raises(DedupStateError, match="UNSUPPORTED_FUTURE_SCHEMA"):
+            idx.rebuild_reset()
+        assert idx.contains("k1") and idx.contains("k2") and idx.user_version() == sd.INDEX_SCHEMA_VERSION + 1
+    finally:
+        idx.close()
+    empty = str(tmp_path / "empty.sqlite3")                      # a future-versioned file with NO tables yet
+    conn = sqlite3.connect(empty)
+    conn.execute(f"PRAGMA user_version={sd.INDEX_SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    with pytest.raises(DedupStateError, match="UNSUPPORTED_FUTURE_SCHEMA"):
+        SegmentDedupIndex(empty)
+    conn = sqlite3.connect(empty)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == sd.INDEX_SCHEMA_VERSION + 1
+        assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("letter", ["A", "B"])
+def test_9b_non_text_identity_key_is_divergence_not_normalised(tmp_path, letter):
+    """A BLOB with the very bytes of a TEXT identity looks identical after ``CAST(... AS BLOB)`` but ``contains()``
+    (a TEXT comparison) never matches it -- a silent hole in dedup. The audit must call it divergence.
+    ``B`` is the segment's LAST key: a BLOB sorts after every TEXT, so only there does the digest ORDER match and the
+    storage type is the sole thing that can reveal the corruption (``A`` is also caught, by ordering alone)."""
+    r = five(tmp_path)
+    victim = key_for(letter)
+    tamper(r, ("UPDATE seen SET identity_key = CAST(identity_key AS BLOB) WHERE identity_key = ?", (victim,)))
+    assert sql_one(r, "SELECT typeof(identity_key) FROM seen WHERE CAST(identity_key AS BLOB) = CAST(? AS BLOB)",
+                   (victim,))[0] == "blob"
+    idx = SegmentDedupIndex(r.db)
+    try:
+        assert not idx.contains(victim), "the hole: the bytes are there, the TEXT lookup misses them"
+        assert idx.non_text_identity_rows() == 1
+        sid = idx.reconciled_rows()[r.seg_key(r.segs()[0])].segment_id
+        want = identity_set_digest([key_for("A"), key_for("B")])
+        assert idx.membership_digests()[0][sid] != want, "the BLOB must not be normalised into the TEXT digest"
+    finally:
+        idx.close()
+    r.start()
+    assert_reports_rebuild(r, "differs")                           # detected on startup, repaired from the bytes
+    assert r.index.non_text_identity_rows() == 0 and r.index.contains(victim)
+    assert not r.offer("A"), "after repair the redelivered identity is suppressed again"
 
 
 def test_orphan_membership_rows_and_dropped_index_are_detected(tmp_path):
@@ -334,7 +421,7 @@ def _forge_sqlite_consistently(r, drop_trade):
 def test_self_consistent_corrupt_sqlite_is_caught_by_the_independent_evidence(tmp_path):
     r = five(tmp_path)
     _forge_sqlite_consistently(r, "A")
-    r.start()                                   # NO deep verify: the evidence file is the independent reference
+    r.start()                                   # NO deep verify: the separately stored evidence file is the reference
     assert_reports_rebuild(r, "differs from segment evidence")
     assert r.index.contains(key_for("A"))
 
@@ -737,6 +824,36 @@ def test_identity_set_digest_is_order_and_duplicate_independent_and_content_sens
     assert identity_set_digest(["a", "b", "x"])[1] != identity_set_digest(keys)[1], "same count, one identity swapped"
     assert identity_set_digest(["a", "b"])[1] != identity_set_digest(["ab"])[1], "framing is unambiguous"
     assert identity_set_digest([])[0] == 0
+
+
+def _independent_identity_set_digest(keys):
+    """The documented algorithm, re-implemented from its description only: sha256(domain || for each DISTINCT key in
+    UTF-8 byte order: u64-big-endian length || bytes)."""
+    import hashlib
+    import struct
+    unique = sorted({k.encode("utf-8") for k in keys})
+    h = hashlib.sha256(b"btc-collector/dedup-identity-set/1\x00")
+    for kb in unique:
+        h.update(struct.pack(">Q", len(kb)) + kb)
+    return len(unique), h.hexdigest()
+
+
+_KAT = [   # (identities as supplied -- unordered, with a repeat --, expected distinct count, expected SHA-256)
+    (["b", "a", "c", "a"], 3, "2625fbffed3ffdf9dec25fd3835402502422b5c9bca22f228636fa8bc08e93f9"),
+    ([], 0, "41c9ede44a32c8dc27b691e03615ec59cf3fc1628622483af1a24d4fff42b95c"),
+    ([dedup_identity_key("BINANCE", "linear_perpetual", INSTR, "trades", t)
+      for t in ("100", "101", "100", "\u00e9", "\u4e2d\u6587", "\U0001f600")],
+     5, "c8d0d2ed76ed37bbaf12d6f7fb87fe98fa9d7f529668e22ad97b9e9381b4a00e"),
+]
+
+
+@pytest.mark.parametrize("keys,count,digest", _KAT, ids=["abc", "empty", "real-keys-non-ascii"])
+def test_identity_set_digest_known_answer_vectors(keys, count, digest):
+    """FIXED vectors: a change of the domain tag, the length framing, the byte order or the hash is a change of every
+    stored identity digest (an index/evidence migration), so it must fail here, not in production."""
+    assert identity_set_digest(keys) == (count, digest)
+    assert _independent_identity_set_digest(keys) == (count, digest), "the vector itself is correct"
+    assert identity_set_digest(list(reversed(keys))) == (count, digest)
 
 
 def test_streamed_membership_digest_equals_sorted_digest_for_non_ascii_keys(tmp_path):

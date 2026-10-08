@@ -105,10 +105,24 @@ though the evidence says otherwise, and identities owned by several segments are
 Missing/stale/unreadable evidence files are re-derived from the segment bytes first (old file
 preserved `.invalid.N`). Divergence ⇒ the index is rebuilt in one transaction from the bytes.
 Identity-key encoding drift is caught by a version constant **and** a canary computed through the live
-`dedup_identity_key`. Old indexes (`user_version != 3` or a different table shape, including the
-F1 `user_version=2` index) are never trusted: they are dropped and rebuilt once, atomically.
+`dedup_identity_key`. Old indexes (`user_version < 3` or a different table shape, including the
+F1 `user_version=2` index) are never trusted: they are dropped and rebuilt once, atomically. A NEWER
+`user_version` (> 3) is the opposite case and is **never** rebuilt or downgraded: startup raises
+`DedupStateError(UNSUPPORTED_FUTURE_SCHEMA)` before any marker is renamed or written, and
+`rebuild_reset` refuses it too. A persisted `identity_key` whose SQLite storage class is not TEXT
+(`contains()` compares TEXT and would never match it) is divergence, not normalised: the storage type is
+folded into the membership digest.
 
-Trust level: the evidence file is trusted like the marker — both are re-checked against the bytes only
+Duplicate semantics (unchanged by the rehearsal tooling): an identity repeated **inside one segment**
+is recorded once (the segment bytes keep every row; nothing is deleted or collapsed). The same identity
+in **two or more segments** is `CROSS_SEGMENT_DUPLICATE`: indexing and startup fail closed, no winner is
+chosen and no history is deduplicated; the rehearsal tool reports such identities (and
+`cross_only_extra_rows`) so the operator decides before the real run.
+
+Trust level: the evidence file is stored separately from SQLite (so losing or distrusting the index does
+not lose it), but it is derived from the same bytes by the same identity code — storage independence, not
+independent derivation: it catches SQLite loss/corruption/tampering, not a bug in identity derivation that
+both would share. It is trusted like the marker — both are re-checked against the bytes only
 by `DEDUP_DEEP_VERIFY=1`. A forgery of evidence **and** SQLite together is invisible to the default
 audit and caught by deep verify. Evidence files are not fsynced (derived; loss costs one segment read).
 
@@ -118,8 +132,44 @@ Existing segments without a valid v2 marker are **not** grandfathered: they are 
 same refsync protocol and marked `confirmed_by=startup_refsync`, `legacy=true` (a post-F1 crash
 window and a pre-F1 segment are indistinguishable on disk, so `legacy=true` means only "no valid v2
 marker existed"). A consistent v1 hint's timestamps are carried; an inconsistent one is dropped.
-Measured (synthetic, ext4, 5000 rows/segment): about 33 ms/segment, ≈ 5.5 min per 10 000 segments,
-with the collector offline.
+The F1-era figure for this step (about 33 ms/segment, ≈ 5.5 min per 10 000 segments) predates C1 and no longer
+describes startup: a cold index now also derives every identity and writes one evidence file per segment, and the
+normal start-up audit is one pass over `seen`, i.e. it scales with the number of **identities**, not segments.
+Current measurement (`collector/scripts/c1_dedup_bench.py --segments 300 --rows 2000`, 600 000 identities, Linux
+container, Python 3.12, pyarrow 24; a dev container, not target hardware): cold index (read + derive + index every
+segment) 4.9 s (≈ 16 ms/segment); **normal startup 0.72 s**; deep verify 3.0 s; index file 66 MB (≈ 110 B per
+identity). Re-measure on the real machine and volume before relying on any extrapolation.
+
+## Migration rehearsal tool (read-only)
+
+`collector/scripts/c1_migration_rehearsal.py` audits a **copy** of production data before the real start-up. It reads
+segment bytes, markers, evidence and the SQLite index (the latter only through a private copy in a scratch
+directory) and writes nothing next to them: no markers, no evidence, no index rebuild, no rename/delete/quarantine,
+no duplicate winner is chosen and no history is deduplicated. `--preset` selects one of the five production trade
+streams (the tests derive every preset from the real runners' wiring); `--json` prints a report whose `report_digest`
+covers only deterministic content (no absolute paths, timings or free space; identical datasets at different
+filesystem paths give the same digest).
+
+What it reports, beyond counts and rebuild estimates: `cross_only_extra_rows` (occurrences beyond the first that exist
+only because an identity crosses a segment boundary = sum over identities of segments − 1; intra-segment repetitions
+are reported separately), the hours present as BOTH legacy hourly `.parquet` and `.seg` (reported only: legacy
+parquet is outside start-up's `*.seg` reconciliation, is **not** merged into the dedup index, and whole-dataset
+claims must account for the overlap), an unsupported future index schema, and a non-TEXT stored `identity_key`.
+
+Safety rails: the scratch directory (default: system temp, honouring `TMPDIR`) and the `--json-out`/`--detail-out`
+files are resolved through symlinks and refused if they lie inside the stream, evidence or index directories (or
+`--data-root`); the tool stops rather than contaminate its own input. A before/after `lstat` snapshot (inode, mode,
+size, mtime, ctime, symlink target; directories included; index sidecars watched) flags added, removed, modified or
+replaced input — it is **not** tamper-proofing: contents are not re-hashed and a privileged actor or clock change can
+defeat metadata checks.
+
+Scratch volume: the scratch SQLite holds one row per identity occurrence, plus a copy of the index. A preflight
+estimates the need (footer row counts × SQLite bytes per row **measured on a sample of the dataset's own
+identities**; no fixed constant) and refuses when even the expected figure does not fit (`--allow-low-scratch`
+downgrades this to a warning, `--no-scratch-preflight` skips it). Measured on the benchmark above (identity keys
+≈ 89 bytes): ≈ 113 B per identity (estimate 134.8–135.7 MB, actual 134.2 MB for 600 000 identities) plus the index
+copy (≈ 110 B per identity), so a **billion-identity dataset can need on the order of 100 GB of scratch plus the
+index copy**; the figure scales with key length. Use `--scratch-dir` on a volume that has the space.
 
 ## Filesystem requirements and operator override
 

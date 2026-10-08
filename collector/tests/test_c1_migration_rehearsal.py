@@ -21,6 +21,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from collections import namedtuple
 from collections import defaultdict
 from pathlib import Path
 
@@ -95,7 +97,8 @@ def rehearse(base: Path, tmp_path: Path, *, trade_id_field: str = "trade_id", wi
         trade_id_field=trade_id_field,
         index_path=(base / "dedup_state" / f"{STREAM}.sqlite3") if with_index else None, evidence_dir=None,
         sample_limit=kw.get("sample_limit", 10), top_segments=kw.get("top_segments", 25),
-        example_limit=kw.get("example_limit", 5), detail_out=detail_out, scratch_dir=scratch).run()
+        example_limit=kw.get("example_limit", 5), detail_out=detail_out, scratch_dir=scratch,
+        scratch_preflight=kw.get("scratch_preflight", "error"), data_root=kw.get("data_root")).run()
     assert list(scratch.iterdir()) == [], "scratch directory must be removed"
     return result
 
@@ -698,3 +701,502 @@ def test_script_runs_from_a_clean_environment_without_pythonpath(tmp_path):
     out = json.loads(proc.stdout)
     assert out["report"]["duplicates"]["cross_segment"]["identities"] == 1
     assert out["report"]["read_only_check"]["unchanged"] is True
+
+
+# ====================================================================================== final hardening pass
+# ---------------------------------------------------------------------------- presets == production wiring
+_RUNNERS = {   # preset -> (runner module, adapter event stream that runner wires)
+    "binance-usdm": ("collector.run_collector", "trades"),
+    "bybit": ("collector.run_bybit_collector", "trades"),
+    "okx-trades": ("collector.run_okx_collector", "trades"),
+    "okx-trades-all": ("collector.run_okx_collector", "trades-all"),
+    "binance-spot": ("collector.run_binance_spot_collector", "spot_trades"),
+}
+
+
+@pytest.fixture(scope="module")
+def production_specs(tmp_path_factory):
+    """The StreamSpecs the REAL runners hand to ``attach_segment_dedup`` (constructed for real, wrapped to record)."""
+    import importlib
+    mp = pytest.MonkeyPatch()
+    captured, apps = {}, []
+    base = tmp_path_factory.mktemp("prod_wiring")
+    try:
+        for modname in sorted({m for m, _ in _RUNNERS.values()}):
+            mod = importlib.import_module(modname)
+            real = mod.attach_segment_dedup
+
+            def wrapper(adapter, specs, _real=real, _mod=modname):
+                specs = list(specs)
+                for s in specs:
+                    captured[(_mod, s.event_stream)] = s
+                return _real(adapter, specs)
+
+            mp.setattr(mod, "attach_segment_dedup", wrapper)
+        mp.chdir(base)
+        (base / "data").mkdir()
+        for modname, cls, kwargs in (("collector.run_collector", "CollectorApp", {}),
+                                     ("collector.run_bybit_collector", "BybitCollectorApp", {"data_dir": str(base / "b")}),
+                                     ("collector.run_okx_collector", "OKXCollectorApp", {"data_dir": str(base / "o")}),
+                                     ("collector.run_binance_spot_collector", "BinanceSpotCollectorApp", {"data_dir": str(base / "s")})):
+            apps.append(getattr(importlib.import_module(modname), cls)(**kwargs))
+        yield captured
+    finally:
+        for app in apps:
+            try:
+                app.segment_dedup.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for s in captured.values():
+            try:
+                s.writer._release_lock()
+            except Exception:  # noqa: BLE001
+                pass
+        mp.undo()
+
+
+def test_every_production_trade_stream_has_exactly_one_preset(production_specs):
+    assert set(production_specs) == set(_RUNNERS.values()), "a production trade stream without a preset (or vice versa)"
+    assert set(c1.PRESETS) == set(_RUNNERS)
+
+
+@pytest.mark.parametrize("preset", sorted(_RUNNERS))
+def test_preset_matches_the_production_runner_wiring(production_specs, preset, tmp_path, capsys):
+    spec = production_specs[_RUNNERS[preset]]
+    wiring = c1.PRESETS[preset]
+    assert wiring == dict(stream=spec.writer.stream_name, exchange=spec.exchange, market_type=spec.market_type,
+                          event_stream=spec.event_stream, trade_id_field=spec.trade_id_field)
+    names = spec.writer.schema.names
+    assert spec.trade_id_field in names and "instrument_key" in names, "identity columns exist in the real schema"
+
+    # end to end through the CLI: the preset must reproduce the PRODUCTION identity (evidence written by the real
+    # coordinator with the production spec must verify), under the production stream directory name.
+    base, sdir = tmp_path / "data", tmp_path / "data" / "raw" / spec.writer.stream_name
+    sdir.mkdir(parents=True)
+
+    def seg(seq, ids):
+        path = sdir / f"{HOUR}-{seq:06d}.seg"
+        pq.write_table(pa.table({"timestamp": list(range(len(ids))), "instrument_key": [INSTR] * len(ids),
+                                 spec.trade_id_field: pa.array(ids, type=pa.string())}), path)
+        write_marker(path, len(ids))
+
+    seg(0, ["1", "2"])
+    seg(1, ["3", "4"])
+    (base / "dedup_state").mkdir()
+    index = sd.SegmentDedupIndex(str(base / "dedup_state" / f"{spec.writer.stream_name}.sqlite3"))
+    sd.SegmentDedupCoordinator(index, spec.row_identity).startup_reconcile(sdir)
+    index.close()
+    seg(2, ["4", "5"])                                                   # a later, not-yet-indexed cross duplicate
+    assert c1.main(["--preset", preset, "--data-root", str(base), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)["report"]
+    assert out["identity_spec"] == {k: wiring[k] for k in ("exchange", "market_type", "event_stream", "trade_id_field")}
+    ev = out["identity_evidence"]["per_segment"]
+    assert (ev["ok"]["count"], ev["missing"]["count"], ev["mismatch"]["count"], ev["stale"]["count"]) == (2, 1, 0, 0)
+    cmp_ = out["dedup_index"]["comparison"]
+    assert cmp_["segments_on_disk_not_indexed"]["count"] == 1
+    assert all((v if isinstance(v, int) else v["count"]) == 0 for k, v in cmp_.items() if k != "segments_on_disk_not_indexed")
+    assert out["duplicates"]["cross_segment"]["identities"] == 1
+    sample = out["duplicates"]["cross_segment"]["samples"][0]
+    assert c1.decode_identity_key(sample["identity"]) == [spec.exchange, spec.market_type, INSTR, spec.event_stream, "4"]
+    assert sample["identity"] == spec.row_identity({"instrument_key": INSTR, spec.trade_id_field: "4"})
+
+
+# ---------------------------------------------------------------------------- determinism across filesystem paths
+def _damaged(base: Path, index_kind: str) -> None:
+    """One dataset exercising EVERY exception-reporting path of the report."""
+    write_seg(base, 0, ids("a", 3))
+    write_seg(base, 1, ids("b", 3))
+    write_seg(base, 2, ids("c", 3), marker="valid")
+    build_index(base)
+    garbage = write_seg(base, 3, ids("d", 2))                      # bytes that are not parquet (marker is valid JSON)
+    garbage.write_bytes(b"this is not parquet")
+    trunc = write_seg(base, 4, ids("e", 2))
+    trunc.write_bytes(trunc.read_bytes()[:30])
+    bad_type = write_seg(base, 5, ids("f", 2))                     # integer trade ids: identity derivation fails
+    pq.write_table(pa.table({"instrument_key": [INSTR] * 2, "trade_id": pa.array([1, 2], type=pa.int64())}), bad_type)
+    write_marker(bad_type, 2)
+    mk = pub.marker_path(write_seg(base, 6, ids("g", 2)))          # an unreadable marker: OSError text embeds the path
+    mk.unlink()
+    mk.mkdir()
+    pub.marker_path(write_seg(base, 7, ids("h", 2))).write_bytes(b"{not json")
+    pq.write_table(pa.table({"x": [1]}), stream_dir(base) / "2026-01-01-00.parquet")        # legacy overlap
+    state = base / "dedup_state"
+    if index_kind == "corrupt":
+        (state / f"{STREAM}.sqlite3").write_bytes(b"\x00garbage" * 64)
+    elif index_kind == "future":
+        con = sqlite3.connect(str(state / f"{STREAM}.sqlite3"))
+        con.execute(f"PRAGMA user_version={sd.INDEX_SCHEMA_VERSION + 3}")
+        con.commit()
+        con.close()
+    elif index_kind == "old":
+        con = sqlite3.connect(str(state / f"{STREAM}.sqlite3"))
+        con.execute("PRAGMA user_version=1")
+        con.commit()
+        con.close()
+
+
+@pytest.mark.parametrize("index_kind", ["ok", "corrupt", "future", "old"])
+def test_identical_damaged_datasets_at_different_paths_have_the_same_report_digest(tmp_path, index_kind):
+    one, two = tmp_path / "a" / "data", tmp_path / "bbbb" / "deeper" / "elsewhere" / "data"
+    for base in (one, two):
+        base.mkdir(parents=True)
+        _damaged(base, index_kind)
+    (tmp_path / "s1").mkdir()
+    (tmp_path / "s2").mkdir()
+    r1 = rehearse(one, tmp_path / "s1")
+    r2 = rehearse(two, tmp_path / "s2")
+    assert r1["report"]["segments"]["malformed_or_unreadable"]["count"] >= 2, "the damage is really exercised"
+    assert r1["report"]["segments"]["identity_derivation_failed"]["count"] == 1 if "identity_derivation_failed" in r1["report"]["segments"] else True
+    assert r1["report_digest"] == r2["report_digest"]
+    text = json.dumps(r1["report"]) + json.dumps(r2["report"])
+    for leak in (str(tmp_path), "/tmp", "c1_rehearsal_", "_scratch", "Errno"):
+        assert leak not in text, f"run-specific text {leak!r} leaked into the deterministic report"
+
+
+def test_report_does_not_depend_on_directory_listing_order(tmp_path, monkeypatch):
+    base = tmp_path / "data"
+    for i in range(6):
+        write_seg(base, i, ids(f"y{i}", 2))
+    build_index(base)
+    for i in range(6, 12):
+        write_seg(base, i, ids(f"z{i}", 2), marker="none")
+    for i in range(4):
+        shutil.copy(evidence_file(base, 0), evidence_file(base, 0).with_name(f"orphan-{i}{sd.EVIDENCE_SUFFIX}"))
+    (tmp_path / "s").mkdir()
+    normal = rehearse(base, tmp_path / "s", example_limit=2)
+    orphans = normal["report"]["identity_evidence"]["orphan_evidence_files"]
+    assert orphans["count"] == 4 and orphans["examples"] == [f"orphan-{i}{sd.EVIDENCE_SUFFIX}" for i in range(2)]
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pat: iter(list(reversed(sorted(real_glob(self, pat))))))
+    flipped = rehearse(base, tmp_path / "s", example_limit=2)
+    assert normal["report_digest"] == flipped["report_digest"]
+
+
+# ---------------------------------------------------------------------------- scratch / output containment
+def _two_seg(tmp_path):
+    base = tmp_path / "data"
+    write_seg(base, 0, ids("a", 3))
+    write_seg(base, 1, ids("b", 3))
+    build_index(base)
+    return base
+
+
+@pytest.mark.parametrize("where,cached", [("stream", False), ("state", False), ("root", False), ("stream", True)])
+def test_tmpdir_inside_the_input_tree_is_refused(tmp_path, monkeypatch, where, cached):
+    base = _two_seg(tmp_path)
+    inside = {"stream": stream_dir(base) / "tmpdir", "state": base / "dedup_state" / "tmpdir", "root": base / "tmpdir"}[where]
+    inside.mkdir()
+    monkeypatch.setenv("TMPDIR", str(inside))
+    monkeypatch.setattr(tempfile, "tempdir", str(inside) if cached else None)
+    before, mtime = tree_state(base), os.stat(inside).st_mtime_ns
+    with pytest.raises(SystemExit, match="inside an input directory"):
+        c1.main(["--stream-dir", str(stream_dir(base)), "--data-root", str(base), "--exchange", "BINANCE",
+                 "--market-type", "linear_perpetual", "--event-stream", "trades", "--trade-id-field", "trade_id"])
+    assert tree_state(base) == before and list(inside.iterdir()) == [], "the tool must not contaminate its own input"
+    assert os.stat(inside).st_mtime_ns == mtime, "not even probed"
+
+
+def test_symlinks_into_the_input_tree_cannot_hide_scratch_or_outputs(tmp_path):
+    base = _two_seg(tmp_path)
+    link = tmp_path / "innocent_link"
+    link.symlink_to(stream_dir(base), target_is_directory=True)
+    before, stream_mtime = tree_state(base), os.stat(stream_dir(base)).st_mtime_ns
+    common = ["--stream-dir", str(stream_dir(base)), "--data-root", str(base), "--exchange", "BINANCE",
+              "--market-type", "linear_perpetual", "--event-stream", "trades", "--trade-id-field", "trade_id"]
+    for extra in (["--scratch-dir", str(link)], ["--json-out", str(link / "r.json")], ["--detail-out", str(link / "d.jsonl")]):
+        with pytest.raises(SystemExit, match="inside an input directory"):
+            c1.main(common + extra)
+    assert tree_state(base) == before
+    assert os.stat(stream_dir(base)).st_mtime_ns == stream_mtime, "not even a transient scratch dir may appear in the input"
+
+
+def test_input_reached_through_a_symlink_is_still_protected_and_watched(tmp_path, monkeypatch):
+    base = _two_seg(tmp_path)
+    link = tmp_path / "linked_stream"
+    link.symlink_to(stream_dir(base), target_is_directory=True)
+    with pytest.raises(SystemExit, match="inside an input directory"):
+        c1.Rehearsal(link, exchange="BINANCE", market_type="linear_perpetual", event_stream="trades",
+                     trade_id_field="trade_id", index_path=None, evidence_dir=None, sample_limit=1, top_segments=1,
+                     example_limit=1, detail_out=stream_dir(base) / "d.jsonl", scratch_dir=tmp_path / "s").run()
+    orig = c1.Rehearsal._aggregate
+
+    def hooked(self, conn):
+        with open(seg_path(base, 0), "ab") as fh:
+            fh.write(b"x")
+        return orig(self, conn)
+
+    monkeypatch.setattr(c1.Rehearsal, "_aggregate", hooked)
+    (tmp_path / "s").mkdir()
+    out = c1.Rehearsal(link, exchange="BINANCE", market_type="linear_perpetual", event_stream="trades",
+                       trade_id_field="trade_id", index_path=None, evidence_dir=None, sample_limit=1, top_segments=1,
+                       example_limit=1, detail_out=None, scratch_dir=tmp_path / "s").run()
+    assert out["report"]["read_only_check"]["unchanged"] is False
+
+
+# ---------------------------------------------------------------------------- input snapshot
+def _mut_append(base):
+    with open(seg_path(base, 0), "ab") as fh:
+        fh.write(b"x")
+
+
+def _mut_add_file(base):
+    (stream_dir(base) / "new.txt").write_bytes(b"n")
+
+
+def _mut_remove_file(base):
+    pub.marker_path(seg_path(base, 1)).unlink()
+
+
+def _mut_new_empty_dir(base):
+    (stream_dir(base) / "emptydir").mkdir()
+
+
+def _mut_inplace_same_size_mtime_restored(base):
+    path = seg_path(base, 0)
+    st = os.stat(path)
+    data = bytearray(path.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    with open(path, "r+b") as fh:
+        fh.write(bytes(data))
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _mut_replace_new_inode_same_size_mtime_restored(base):
+    path = seg_path(base, 0)
+    st = os.stat(path)
+    tmp = path.with_name("swap.tmp")
+    tmp.write_bytes(path.read_bytes())
+    os.replace(tmp, path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _mut_index_sidecar(base):
+    (base / "dedup_state" / f"{STREAM}.sqlite3-journal").write_bytes(b"j")
+
+
+def _mut_evidence_edit(base):
+    f = evidence_file(base, 0)
+    st = os.stat(f)
+    f.write_bytes(f.read_bytes().replace(b"1", b"2", 1))
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+@pytest.mark.parametrize("mutate,kind,prefix", [
+    (_mut_append, "modified", "stream:"), (_mut_add_file, "added", "stream:"), (_mut_remove_file, "removed", "stream:"),
+    (_mut_new_empty_dir, "added", "stream:"), (_mut_inplace_same_size_mtime_restored, "modified", "stream:"),
+    (_mut_replace_new_inode_same_size_mtime_restored, "modified", "stream:"),
+    (_mut_index_sidecar, "added", "index:"), (_mut_evidence_edit, "modified", "evidence:"),
+], ids=lambda v: v.__name__.replace("_mut_", "") if callable(v) else str(v))
+def test_input_changes_during_the_run_are_detected(tmp_path, monkeypatch, mutate, kind, prefix):
+    base = _two_seg(tmp_path)
+    orig = c1.Rehearsal._aggregate
+
+    def hooked(self, conn):
+        mutate(base)
+        return orig(self, conn)
+
+    monkeypatch.setattr(c1.Rehearsal, "_aggregate", hooked)
+    rc = rehearse(base, tmp_path)["report"]["read_only_check"]
+    assert rc["unchanged"] is False and rc[kind] >= 1
+    assert any(e.startswith(f"{kind}:{prefix}") for e in rc["changed_examples"]), rc["changed_examples"]
+    assert str(tmp_path) not in json.dumps(rc), "snapshot keys are label-relative"
+    assert "tamper" in rc["method"].lower() and "NOT tamper-proofing" in rc["method"]
+
+
+def test_untouched_input_reports_unchanged_with_counts(tmp_path):
+    rc = rehearse(_two_seg(tmp_path), tmp_path)["report"]["read_only_check"]
+    assert rc["unchanged"] is True and (rc["added"], rc["removed"], rc["modified"]) == (0, 0, 0)
+    assert rc["files_snapshotted"] >= 5 and rc["directories_snapshotted"] >= 2
+
+
+# ---------------------------------------------------------------------------- scratch disk preflight
+_Usage = namedtuple("usage", "total used free")
+
+
+def _random_ids_dataset(base, segments=6, rows=3000):
+    import random
+    rng = random.Random(7)
+    for s in range(segments):
+        write_seg(base, s, [str(rng.getrandbits(48)) for _ in range(rows)])
+
+
+def test_scratch_preflight_estimate_is_measured_and_not_below_actual_use(tmp_path):
+    base = tmp_path / "data"
+    _random_ids_dataset(base)
+    pf = rehearse(base, tmp_path, with_index=False)["run"]["scratch_preflight"]
+    assert pf["status"] == "ok" and pf["occurrence_rows_upper_bound"] == 6 * 3000
+    assert pf["bytes_per_row_dense"] > 0 and pf["bytes_per_row_scattered_scaled"] >= pf["bytes_per_row_dense"]
+    assert pf["actual_scratch_bytes"] <= pf["conservative_bytes"], "the conservative estimate must cover real use"
+    assert pf["expected_bytes"] <= pf["conservative_bytes"]
+    assert "labeled estimate" in pf["basis"] and "large scratch volume" in pf["basis"]
+
+
+def test_scratch_preflight_refuses_when_clearly_too_small_and_creates_nothing(tmp_path, monkeypatch):
+    base = tmp_path / "data"
+    _random_ids_dataset(base)
+    monkeypatch.setattr(c1.shutil, "disk_usage", lambda p: _Usage(10**9, 10**9 - 1000, 1000))
+    before = tree_state(base)
+    scratch = tmp_path / "_scratch"
+    scratch.mkdir()
+    with pytest.raises(SystemExit, match="scratch preflight"):
+        rehearse(base, tmp_path, with_index=False)
+    assert list(scratch.iterdir()) == [] and tree_state(base) == before
+
+
+def test_scratch_preflight_warn_and_conservative_zone_proceed_with_a_message(tmp_path, monkeypatch):
+    base = tmp_path / "data"
+    _random_ids_dataset(base)
+    pf = rehearse(base, tmp_path, with_index=False)["run"]["scratch_preflight"]
+    mid = (pf["expected_bytes"] + pf["conservative_bytes"]) // 2
+    assert pf["expected_bytes"] < mid < pf["conservative_bytes"]
+    monkeypatch.setattr(c1.shutil, "disk_usage", lambda p: _Usage(10**9, 0, mid))
+    out = rehearse(base, tmp_path, with_index=False)
+    assert out["run"]["scratch_preflight"]["status"] == "warning" and "larger volume" in out["run"]["scratch_preflight"]["message"]
+    monkeypatch.setattr(c1.shutil, "disk_usage", lambda p: _Usage(10**9, 0, 1000))
+    warned = rehearse(base, tmp_path, with_index=False, scratch_preflight="warn")
+    assert warned["run"]["scratch_preflight"]["status"] == "warning"
+    assert rehearse(base, tmp_path, with_index=False, scratch_preflight="off")["run"]["scratch_preflight"]["status"] == "off"
+    assert warned["report_digest"] == out["report_digest"], "disk state never enters the deterministic report"
+
+
+def test_scratch_preflight_cli_flags(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "data"
+    _random_ids_dataset(base, segments=2)
+    monkeypatch.setattr(c1.shutil, "disk_usage", lambda p: _Usage(10**9, 0, 1000))
+    common = ["--stream-dir", str(stream_dir(base)), "--exchange", "BINANCE", "--market-type", "linear_perpetual",
+              "--event-stream", "trades", "--trade-id-field", "trade_id", "--no-index", "--scratch-dir", str(tmp_path / "sc")]
+    with pytest.raises(SystemExit, match="scratch preflight"):
+        c1.main(common)
+    assert c1.main(common + ["--allow-low-scratch"]) == 0 and "SCRATCH:" in capsys.readouterr().out
+    assert c1.main(common + ["--no-scratch-preflight"]) == 0
+
+
+# ---------------------------------------------------------------------------- cross_only_extra_rows
+@pytest.mark.parametrize("segments,cross_only,cross_extra,intra_extra", [
+    ([["A", "A", "B"]], 0, 0, 1),                                  # A,A,B : only an intra-segment repetition
+    ([["A", "X"], ["A", "Y"]], 1, 1, 0),                           # A in two segments
+    ([["A", "A"], ["A"]], 1, 2, 1),                                # A,A in one segment + A in another
+    ([["A"], ["A"], ["A"]], 2, 2, 0),                              # A across 3 segments
+    ([["A"], ["A"], ["A"], ["A"]], 3, 3, 0),                       # A across 4 segments
+    ([["A", "A", "A"], ["A", "A"], ["A"]], 2, 5, 3),               # mixed: 6 occurrences, 3 segments, 3 intra reps
+], ids=["A-A-B", "two-segments", "AA-plus-A", "three-segments", "four-segments", "mixed"])
+def test_cross_only_extra_rows_metric(tmp_path, segments, cross_only, cross_extra, intra_extra):
+    base = tmp_path / "data"
+    for i, group in enumerate(segments):
+        write_seg(base, i, group)
+    out = rehearse(base, tmp_path, with_index=False, detail_out=tmp_path / "d.jsonl")["report"]
+    dup = out["duplicates"]
+    assert dup["cross_segment"]["cross_only_extra_rows"] == cross_only
+    assert dup["cross_segment"]["extra_rows_beyond_one_per_identity"] == (cross_extra if cross_only else 0)
+    assert dup["intra_segment"]["extra_rows"] == intra_extra
+    assert dup["total_extra_rows_beyond_first_per_identity"] == out["rows"]["with_identity"] - out["identities"]["distinct_total"]
+    assert dup["total_extra_rows_beyond_first_per_identity"] == intra_extra + cross_only
+    recs = [json.loads(line) for line in (tmp_path / "d.jsonl").read_text().splitlines()]
+    cross = [r for r in recs if r["class"] == "cross_segment"]
+    assert sum(r["cross_only_extra_rows"] for r in cross) == cross_only
+
+
+# ---------------------------------------------------------------------------- legacy hourly parquet vs .seg
+def _legacy(base, name, rows=4):
+    pq.write_table(pa.table({"instrument_key": [INSTR] * rows, "trade_id": [f"L{i}" for i in range(rows)]}),
+                   stream_dir(base) / name)
+
+
+def test_legacy_parquet_overlap_by_hour_is_reported_and_never_merged(tmp_path, monkeypatch):
+    base = tmp_path / "data"
+    write_seg(base, 0, ["a", "b"])
+    write_seg(base, 1, ["c", "d", "e"])
+    write_seg(base, 0, ["f"], hour="2026-01-01-03")
+    plain = rehearse(base, tmp_path, with_index=False)["report"]
+    _legacy(base, "2026-01-01-00.parquet", rows=4)                  # same hour as two .seg  -> overlap
+    _legacy(base, "2026-01-01-05.parquet", rows=2)                  # legacy only
+    _legacy(base, "2026-01-01-00-000009.parquet", rows=1)           # not a legacy hourly name
+    (stream_dir(base) / "2026-01-01-07.parquet").write_bytes(b"junk")   # legacy hour 07, unreadable footer
+    read = []
+    real = pub.read_segment_table
+    monkeypatch.setattr(pub, "read_segment_table", lambda data, label: read.append(label) or real(data, label))
+    out = rehearse(base, tmp_path, with_index=False, detail_out=tmp_path / "d.jsonl")["report"]
+    assert not [n for n in read if n.endswith(".parquet")], "legacy parquet bytes are never decoded as identities"
+    lg = out["legacy_parquet"]
+    assert lg["included_in_dedup_index"] is False and lg["legacy_hourly_files"] == 3
+    assert lg["hours_with_both"] == 1 and lg["overlap"]["examples"] == ["2026-01-01-00"]
+    assert (lg["legacy_only_hours"], lg["segment_only_hours"]) == (2, 1)
+    assert lg["unparsed_parquet_names"]["count"] == 1 and lg["legacy_hourly_footer_unreadable"] == 1
+    assert lg["legacy_hourly_rows_total"] is None
+    assert lg["overlap"] == dict(lg["overlap"], hours=1, legacy_rows=4, segment_files=2, segment_rows=5,
+                                 segment_files_unreadable=0, legacy_footer_unreadable=0)
+    assert out["identities"] == plain["identities"] and out["duplicates"] == plain["duplicates"], "nothing merged"
+    assert out["segments"]["other_files"]["legacy_hourly_parquet_files_not_audited"] == 4
+    rec = [json.loads(line) for line in (tmp_path / "d.jsonl").read_text().splitlines() if '"legacy_overlap_hour"' in line]
+    assert [(r["hour"], r["legacy_rows"], r["segment_rows"], len(r["segment_files"])) for r in rec] == [("2026-01-01-00", 4, 5, 2)]
+
+
+# ---------------------------------------------------------------------------- index type safety / future schema (tool level)
+def test_non_text_identity_key_is_reported_as_divergence_by_the_tool(tmp_path):
+    base = _two_seg(tmp_path)
+    db = base / "dedup_state" / f"{STREAM}.sqlite3"
+    con = sqlite3.connect(str(db))
+    con.execute("UPDATE seen SET identity_key = CAST(identity_key AS BLOB) WHERE identity_key = "
+                "(SELECT identity_key FROM seen ORDER BY identity_key LIMIT 1)")
+    con.commit()
+    con.close()
+    before = tree_state(base)
+    idx = rehearse(base, tmp_path)["report"]["dedup_index"]
+    assert tree_state(base) == before
+    assert idx["comparison"]["identity_rows_with_non_text_storage_type"] == 1
+    assert idx["comparison"]["indexed_membership_differs_from_bytes"]["count"] == 1
+
+
+def test_future_index_schema_is_reported_as_unsupported_not_as_a_rebuild(tmp_path):
+    base = _two_seg(tmp_path)
+    db = base / "dedup_state" / f"{STREAM}.sqlite3"
+    con = sqlite3.connect(str(db))
+    con.execute(f"PRAGMA user_version={sd.INDEX_SCHEMA_VERSION + 4}")
+    con.commit()
+    con.close()
+    before = tree_state(base)
+    report = rehearse(base, tmp_path)["report"]
+    assert tree_state(base) == before
+    idx = report["dedup_index"]
+    assert idx["unsupported_future_schema"] is True and idx["needs_rebuild_for_schema"] is False
+    assert idx["schema_problem"].startswith("UNSUPPORTED_FUTURE_SCHEMA") and "comparison" not in idx
+    est = report["estimated_work"]
+    assert est["index_rebuild_expected"] is False and len(est["startup_refusal_reasons"]) == 1
+    assert report["fail_closed_conditions"]["index_unsupported_future_schema"] == 1
+    assert any("FUTURE" in w for w in report["warnings"])
+
+
+def test_index_with_a_damaged_table_page_is_reported_not_raised(tmp_path):
+    base = tmp_path / "data"
+    for s in range(3):
+        write_seg(base, s, [f"id-{s}-{i}" for i in range(4000)])
+    build_index(base)
+    db = base / "dedup_state" / f"{STREAM}.sqlite3"
+    con = sqlite3.connect(str(db))
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+    raw = bytearray(db.read_bytes())
+    for page in range(2, len(raw) // 4096 - 1):                      # smash interior pages, keep header + page 1
+        raw[page * 4096: page * 4096 + 64] = b"\xff" * 64
+    db.write_bytes(bytes(raw))
+    out = rehearse(base, tmp_path)["report"]["dedup_index"]
+    assert out["readable"] is False and "error" in out and str(tmp_path) not in json.dumps(out)
+
+
+def test_evidence_is_bound_to_segment_size_not_only_sha(tmp_path):
+    """Evidence whose sha256, count and digest are all RIGHT but whose recorded size is wrong is bound to other bytes."""
+    base = tmp_path / "data"
+    write_seg(base, 0, ids("s", 3))
+    write_seg(base, 1, ids("t", 3))
+    build_index(base)
+    p = evidence_file(base, 0)
+    obj = json.loads(p.read_text())
+    obj["segment_size"] += 1                                  # ONLY the size is changed
+    p.write_text(json.dumps(obj))
+    ev = rehearse(base, tmp_path)["report"]["identity_evidence"]["per_segment"]
+    assert (ev["ok"]["count"], ev["stale"]["count"], ev["mismatch"]["count"], ev["invalid"]["count"]) == (1, 1, 0, 0)
+    key = f"{STREAM}/{seg_path(base, 0).name}"
+    s = seg_path(base, 0).read_bytes()
+    derived = (3, json.loads(evidence_file(base, 1).read_text())["identity_digest"])
+    assert c1.classify_evidence(evidence_file(base, 0).parent, key, hashlib.sha256(s).hexdigest(), len(s) + 1, derived) in ("stale", "mismatch")
+    assert c1.classify_evidence(evidence_file(base, 0).parent, key, hashlib.sha256(s).hexdigest(), len(s), (3, obj["identity_digest"])) == "stale"

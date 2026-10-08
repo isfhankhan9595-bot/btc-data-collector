@@ -33,7 +33,9 @@ writer — is ever attributed to the persistent dedup index.
 Only inside `SegmentDedupIndex.commit_segment`, one SQLite transaction that
 inserts every identity a published segment contains **and** its
 `reconciled_segments` marker atomically — `BEGIN IMMEDIATE` /
-`INSERT OR IGNORE` × N / `INSERT` marker / `COMMIT`, with `ROLLBACK` on any
+plain `INSERT` × N (one row per distinct identity of the segment; an identity already owned by
+another segment, or any other conflict, aborts the whole transaction — nothing is ignored) /
+`INSERT` marker / `COMMIT`, with `ROLLBACK` on any
 failure (`test_state_E_crash_during_index_transaction_is_atomic_and_rerunnable`).
 RAM identities for that segment are released **only after** this commit
 returns (`test_release_happens_only_after_the_index_commit`).
