@@ -1,5 +1,6 @@
 import asyncio
 import signal
+import sys
 import time
 import json
 import os
@@ -45,6 +46,10 @@ from collector.collector.gap_detector import GapDetector
 from collector.collector.disk_monitor import DiskMonitor
 from collector.collector.health_monitor import HealthMonitor
 from collector.collector.parquet_writer import ParquetWriter
+from collector.collector.storage_errors import FatalStorageError, WriterFailureSnapshot
+from collector.collector.failure_topology import (
+    FailureRecord, VERDICT_DEGRADE_QUALITY, VERDICT_ISOLATE, VERDICT_TERMINATE,
+)
 from collector.collector.websocket_client import WebSocketClient
 
 STREAM_INACTIVE_STARTUP_SECONDS = 60
@@ -58,11 +63,23 @@ BINANCE_DEPTH_SNAPSHOT_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCU
 QUALITY_SEGMENT_ROWS = 500
 QUALITY_SEGMENT_SECONDS = 30.0
 
+#: F5: how often the supervisor looks for a writer failure that latched while
+#: that writer was quiet. A handful of attribute reads: not expensive polling.
+FAILURE_SUPERVISOR_INTERVAL_S = 1.0
+#: F5: process exit status of a terminal (raw-evidence) storage failure. Any
+#: non-zero value makes systemd's Restart=always treat the exit as a failure.
+EXIT_FATAL_STORAGE = 70
+#: Writers the supervisor inspects (attribute name on the app).
+SUPERVISED_WRITERS = ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
+                      "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer",
+                      "raw_rest_writer", "quality_writer")
+
 
 class CollectorApp:
     def __init__(self, enable_segment_dedup: bool = True):
         self.running = False
         self._closed = False
+        self._init_failure_state()
         self.raw_messages_logged = 0
         self.stream_counters = {
             "orderbook": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
@@ -124,9 +141,11 @@ class CollectorApp:
         # writer look healthy (the latch, not the sink, enforces fail-closed).
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_trades_writer = ParquetWriter("binance_trades_raw", BINANCE_TRADES_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
-        self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
-        self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA)
-        self.liq_writer = ParquetWriter("liquidation", LIQUIDATION_SCHEMA)
+        # F5: these three used to have no sink, so their storage failures were
+        # log lines only. Same non-recursive sink as every other derived writer.
+        self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA, quality_event_sink=self._persist_quality_event)
+        self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA, quality_event_sink=self._persist_quality_event)
+        self.liq_writer = ParquetWriter("liquidation", LIQUIDATION_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_wire_writer = ParquetWriter("raw_wire", RAW_WIRE_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.raw_rest_writer = ParquetWriter("raw_rest", RAW_REST_SCHEMA, quality_event_sink=self._persist_quality_event)
         # P0-4: the raw (least-processed) writer is the dedup recovery
@@ -145,8 +164,12 @@ class CollectorApp:
                 StreamSpec("trades", self.raw_trades_writer, "BINANCE", "linear_perpetual",
                           trade_id_field="native_trade_id"),
             ])
+        # F5: raw_wire / raw_rest are the irrecoverable-evidence boundary, so a
+        # typed storage fatal from either must reach the application instead of
+        # being absorbed (ordinary capture failures still fail open).
         self.raw_capture = RawCapture(self.raw_wire_writer, self.raw_rest_writer,
-                                      quality_event_sink=self._persist_quality_event)
+                                      quality_event_sink=self._persist_quality_event,
+                                      fail_closed_on_fatal_storage=True)
         # Adapter drops become durable quality events instead of vanishing.
         self.binance_adapter.set_unhandled_sink(self._record_adapter_unhandled)
 
@@ -156,14 +179,14 @@ class CollectorApp:
                 on_message=self.handle_message,
                 on_reconnect=self._make_reconnect_handler(BINANCE_PUBLIC_WS_URL),
                 on_quality_event=self._websocket_quality_event, stream_group="public",
-                on_raw_frame=self._capture_raw_frame
+                on_raw_frame=self._capture_raw_frame, on_fatal=self._on_fatal_storage
             ),
             WebSocketClient(
                 url=BINANCE_MARKET_WS_URL,
                 on_message=self.handle_message,
                 on_reconnect=self._make_reconnect_handler(BINANCE_MARKET_WS_URL),
                 on_quality_event=self._websocket_quality_event, stream_group="market",
-                on_raw_frame=self._capture_raw_frame
+                on_raw_frame=self._capture_raw_frame, on_fatal=self._on_fatal_storage
             ),
         ]
 
@@ -173,6 +196,176 @@ class CollectorApp:
     @property
     def connected(self):
         return all(client.connected for client in self.ws_clients)
+
+    # ------------------------------------------------------------------
+    # F5: typed fatal-storage topology (see docs/F5_FATAL_STORAGE_TOPOLOGY.md).
+    #
+    #   raw_wire / raw_rest failure  -> TERMINATE (controlled, non-zero exit)
+    #   derived writer failure       -> ISOLATE that route only
+    #   quality writer failure       -> DEGRADE the quality channel only
+    #   unknown typed fatal          -> TERMINATE (default-deny)
+    #   ordinary exception           -> not handled here: unchanged (P0-1)
+    #
+    # Classification is ``isinstance(exc, FatalStorageError)`` plus the writer's
+    # own ``stream`` (failure_topology); never RuntimeError, never message text.
+    # Nothing below resurrects a failed writer: a latch only ever closes, and
+    # only a process restart (F1/P0-4 startup reconciliation) reopens a stream.
+    # ------------------------------------------------------------------
+    def _init_failure_state(self) -> None:
+        #: component key -> FailureRecord (first failure per component wins).
+        self.failed_components: dict = {}
+        #: route -> FailureRecord for routes whose handler/writer is cut off.
+        self.isolated_routes: dict = {}
+        #: First TERMINATE-verdict failure; once set the process must exit non-zero.
+        self.terminal_failure = None
+        #: First quality-channel failure (telemetry degraded, market data intact).
+        self.quality_degraded = None
+        #: Frames short-circuited per isolated route (a counter, never one event per frame).
+        self.route_short_circuits: dict = {}
+        #: Repeat observations of an already-latched component (no re-report).
+        self.failure_repeats: dict = {}
+        self._reporting_failure = False
+        self._terminal_shutdown_task = None
+
+    def _ensure_failure_state(self) -> None:
+        if not hasattr(self, "failed_components"):
+            self._init_failure_state()
+
+    @property
+    def exit_code(self) -> int:
+        self._ensure_failure_state()
+        return EXIT_FATAL_STORAGE if self.terminal_failure is not None else 0
+
+    def _on_fatal_storage(self, exc, origin: str = "handler") -> str:
+        """Classify and latch one typed storage fatal. Idempotent and non-raising
+        for every input a ``FatalStorageError`` can be; returns the verdict.
+
+        Safe to call from the websocket worker: it never shuts anything down.
+        A TERMINATE verdict only latches state and puts the websocket clients in
+        discard mode; the supervisor task performs the controlled shutdown."""
+        self._ensure_failure_state()
+        if not isinstance(exc, FatalStorageError):
+            raise TypeError(f"_on_fatal_storage requires FatalStorageError, got {type(exc).__name__}")
+        record = FailureRecord.from_exception(exc, origin=origin, now_ms=int(time.time() * 1000))
+        return self._latch_failure(record)
+
+    def _latch_failure(self, record: "FailureRecord") -> str:
+        self._ensure_failure_state()
+        key = record.key
+        if key in self.failed_components:
+            # Already latched: count, do not re-report. This is what stops an
+            # error flood when every later frame trips the same dead writer.
+            self.failure_repeats[key] = self.failure_repeats.get(key, 0) + 1
+            return self.failed_components[key].verdict
+        self.failed_components[key] = record
+        if record.verdict == VERDICT_ISOLATE and record.route is not None:
+            self.isolated_routes.setdefault(record.route, record)
+        elif record.verdict == VERDICT_DEGRADE_QUALITY:
+            if self.quality_degraded is None:
+                self.quality_degraded = record
+            if not self._quality_checkpoint_is_blocked():
+                self._block_quality_checkpoint("quality_writer_fatal_storage")
+        else:  # VERDICT_TERMINATE, including every unmapped typed fatal
+            if self.terminal_failure is None:
+                self.terminal_failure = record
+            self._enter_terminal_mode()
+        self._report_storage_failure(record)
+        return record.verdict
+
+    def _enter_terminal_mode(self) -> None:
+        """Stop normal ingestion without shutting anything down from here.
+
+        Discard mode keeps each client's worker draining (task_done exactly
+        once per item) so no producer blocks and queue.join() completes."""
+        for client in getattr(self, "ws_clients", ()):
+            try:
+                client.enter_discard_mode("app_terminal_failure")
+            except Exception as exc:  # noqa: BLE001 - latching must never raise into a worker
+                logger.error("terminal_mode_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _report_storage_failure(self, record: "FailureRecord") -> None:
+        """Recursion-safe failure report. NEVER touches ``quality_writer`` nor
+        ``_persist_quality_event`` (either may be the failed component):
+        synchronous structured log -> the quality WAL directly -> operator alert.
+        Never raises."""
+        if self._reporting_failure:
+            return
+        self._reporting_failure = True
+        try:
+            logger.error("storage_failure_latched", **record.as_dict())
+            self._report_failure_to_wal(record)
+            try:
+                send_telegram_alert(
+                    f"STORAGE FAILURE [{record.verdict}] stream={record.stream} component={record.component} "
+                    f"stage={record.stage} durability={record.durability} origin={record.origin}")
+            except Exception as exc:  # noqa: BLE001 - alerting fails open
+                logger.error("storage_failure_alert_failed", error=f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - reporting must never abort the caller
+            logger.error("storage_failure_report_failed", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            self._reporting_failure = False
+
+    def _report_failure_to_wal(self, record: "FailureRecord") -> None:
+        """Append the failure straight to the quality WAL (durable, fsynced).
+
+        The seq is tracked in-flight so no later checkpoint can cover it: the
+        next start's WAL recovery replays it into quality Parquet. Bypasses
+        quality_writer entirely, so it works when quality_writer is the thing
+        that failed."""
+        wal = getattr(self, "_quality_wal", None)
+        if wal is None:
+            return
+        self._ensure_quality_state()
+        event = {"exchange": "BINANCE", "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
+                 "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
+                            f"stage={record.stage}:durability={record.durability}:origin={record.origin}"),
+                 "rows_lost": None, "local_ts": record.first_observed_ts}
+        try:
+            event_id = wal.append(event)
+        except Exception as exc:  # noqa: BLE001 - the log line above is still the record
+            logger.error("storage_failure_wal_append_failed", error=f"{type(exc).__name__}: {exc}")
+            return
+        self._quality_wal_inflight.add(int(event_id.rsplit("-", 1)[-1]))
+
+    def supervise_once(self) -> None:
+        """One supervisor pass: latch any writer failure nobody has seen yet.
+
+        A writer can latch FAILED (or its publication gate) while quiet -- e.g.
+        a hook failure at a segment close -- and the exception only surfaces on
+        the NEXT write, which may never come. This reads the latches; it never
+        clears them and never touches a writer's state."""
+        self._ensure_failure_state()
+        for name in SUPERVISED_WRITERS:
+            writer = getattr(self, name, None)
+            snapshot_fn = getattr(writer, "failure_snapshot", None)
+            if snapshot_fn is None:
+                continue
+            snapshot = snapshot_fn()
+            if not isinstance(snapshot, WriterFailureSnapshot):
+                continue
+            self._latch_failure(FailureRecord.from_snapshot(
+                snapshot, origin="supervisor", now_ms=int(time.time() * 1000)))
+
+    async def _failure_supervisor_loop(self) -> None:
+        """Poll for latent writer failures; on a terminal failure, start the
+        controlled shutdown from HERE (never from a websocket worker, which
+        would be shutting down its own parent task)."""
+        while self.running and not self._closed:
+            try:
+                self.supervise_once()
+            except Exception as exc:  # noqa: BLE001 - the supervisor must not die
+                logger.error("failure_supervisor_pass_failed", error=f"{type(exc).__name__}: {exc}")
+            if self.terminal_failure is not None:
+                self._terminal_shutdown_task = asyncio.create_task(self._async_shutdown(0, terminal=True))
+                return
+            await asyncio.sleep(FAILURE_SUPERVISOR_INTERVAL_S)
+
+    def _route_is_isolated(self, route) -> bool:
+        return route in self.isolated_routes
+
+    def _note_short_circuit(self, route: str) -> None:
+        self.route_short_circuits[route] = self.route_short_circuits.get(route, 0) + 1
+
 
     def _requested_streams(self, url: str):
         parsed = urlparse(url)
@@ -253,10 +446,22 @@ class CollectorApp:
         self.stream_counters["adapter_unhandled"]["received"] += 1
         self._persist_quality_event(message.to_quality_event())
 
-    def _capture_rest(self, record):
+    def _capture_rest(self, record) -> bool:
+        """Persist one raw REST record. Returns ``False`` ONLY when the raw_rest
+        evidence boundary is lost (terminal failure latched): the caller must
+        then not treat the response as authoritative -- a REST answer reflects
+        the exchange at request time and cannot be reconstructed later, which
+        is why raw_rest is a raw-evidence boundary (TERMINATE), not a route.
+        Ordinary capture failures still fail open inside RawCapture."""
         capture = getattr(self, "raw_capture", None)
-        if capture is not None:
+        if capture is None:
+            return True
+        try:
             capture.capture_rest(record)
+        except FatalStorageError as exc:
+            self._on_fatal_storage(exc, origin="raw_rest")
+            return False
+        return True
 
     def _record_validation_rejection(self, stream_name: str, reason: str):
         reasons = self.validation_fail_reasons.setdefault(stream_name, {})
@@ -282,6 +487,20 @@ class CollectorApp:
 
     async def handle_message(self, msg: dict, local_receive_ts: int | None = None,
                              connection_id: str | None = None):
+        """Route one decoded frame. F5 boundary: a typed storage fatal raised by
+        any route's writer is classified here (isolate / degrade / terminate)
+        instead of surfacing as an ordinary processing error. Ordinary
+        exceptions are untouched: they propagate to the worker exactly as before
+        (P0-1 isolation). The raw frame was captured before this point, so
+        abandoning a frame whose route just failed loses no raw evidence."""
+        try:
+            await self._handle_message_routed(msg, local_receive_ts, connection_id)
+        except FatalStorageError as exc:
+            self._on_fatal_storage(exc, origin="handler")
+
+    async def _handle_message_routed(self, msg: dict, local_receive_ts: int | None = None,
+                                     connection_id: str | None = None):
+        self._ensure_failure_state()
         if local_receive_ts is None:
             local_receive_ts = int(time.time() * 1000)
         if not isinstance(msg, dict) or "stream" not in msg or "data" not in msg:
@@ -302,6 +521,11 @@ class CollectorApp:
         data = msg["data"]
         self._log_raw_sample(stream, msg)
         route = self._route_stream(stream)
+        if route is not None and self._route_is_isolated(route):
+            # F5: the route's writer failed. Do not invoke its handler or writer
+            # again, and do not turn every later frame into a quality event.
+            self._note_short_circuit(route)
+            return
         if route is None:
             self.stream_counters["unrouted"]["received"] += 1
             logger.warning("Unrouted stream message", stream=stream)
@@ -655,19 +879,36 @@ class CollectorApp:
             # must not count an event that is not in that segment).
             if _seq is not None:
                 self._quality_segment_seqs.add(_seq)
+        if getattr(self, "quality_degraded", None) is not None:
+            # F5: the quality channel is latched degraded. Its WAL copy (written
+            # above) is the durable record and the next start replays it; calling
+            # the failed writer again would only raise once per event.
+            self._quality_events_wal_only = getattr(self, "_quality_events_wal_only", 0) + 1
+            return
         try:
             self.quality_writer.write(row, bind=_bind)
-        except Exception:
+        except Exception as exc:
             # Writer state is now uncertain (buffered row may be unwritable,
             # segment may be half-closed): fail closed, event stays in WAL.
             self._block_quality_checkpoint("quality_writer_write_failed")
+            self._note_quality_writer_failure(exc)
             raise
         if not wal_protected:
             try:
                 self.quality_writer.publish_open_segment()
-            except Exception:
+            except Exception as exc:
                 self._block_quality_checkpoint("unprotected_event_publish_failed")
+                self._note_quality_writer_failure(exc)
                 raise
+
+    def _note_quality_writer_failure(self, exc: BaseException) -> None:
+        """Latch the quality channel degraded when ITS writer raised a typed fatal.
+
+        Never calls ``quality_writer`` or ``_persist_quality_event`` (see
+        ``_report_storage_failure``), so a failed quality writer cannot recurse
+        into itself. Ordinary exceptions are ignored here: they stay ordinary."""
+        if isinstance(exc, FatalStorageError):
+            self._on_fatal_storage(exc, origin="quality_writer")
 
     def _record_book_quality(self, kind, reason, transition=None, event=None):
         transition=transition or self.binance_book.last_transition
@@ -750,12 +991,15 @@ class CollectorApp:
             process_ts=int(time.time()*1000)
             # Record the exact snapshot so deterministic replay can bridge
             # from recorded data instead of contacting the live exchange.
-            self._capture_rest(RawRestRecord(
+            if self._capture_rest(RawRestRecord(
                 request_ts=request_ts, response_receive_ts=receive_ts,
                 endpoint=BINANCE_DEPTH_SNAPSHOT_URL, purpose="orderbook_snapshot",
                 request_params={"symbol": SYMBOL, "limit": 1000},
                 http_status=status, ok=True, payload=body, symbol=SYMBOL,
-                local_process_ts=process_ts))
+                local_process_ts=process_ts)) is False:
+                # F5: the raw_rest boundary is lost (terminal latched). A snapshot
+                # that was not durably captured must not bridge the book.
+                return False
             if not isinstance(snapshot, dict) or "lastUpdateId" not in snapshot: raise ValueError("missing_last_update_id")
             if not snapshot.get("bids") or not snapshot.get("asks"): raise ValueError("empty_snapshot")
             snapshot_event=self.binance_adapter.snapshot_event(
@@ -786,6 +1030,12 @@ class CollectorApp:
                 self._drain_integrity_quality_events()
                 if controller is not None: controller.succeed()
                 return True
+        except FatalStorageError as exc:
+            # F5: must precede the broad handlers below, which would report a
+            # dead writer as "snapshot_http_error" and keep going. Classified by
+            # the failing writer's own stream (orderbook raw writer -> isolate).
+            self._on_fatal_storage(exc, origin="recovery")
+            return False
         except asyncio.TimeoutError:
             why="snapshot_timeout"
         except ValueError as exc:
@@ -1050,6 +1300,13 @@ class CollectorApp:
             self.liq_writer.write(features)
             self.stream_counters["liquidation"]["written"] += 1
             self.health_monitor.record_message("liquidation", features["timestamp"])
+        except FatalStorageError as exc:
+            # F5: before the blanket handler, which used to swallow a dead
+            # liquidation writer as a "rejected" frame and keep calling it.
+            # Classified by the failing writer's own stream: a quality-channel
+            # fatal raised from inside this handler degrades QUALITY, it does not
+            # isolate liquidation; an unmapped stream terminates.
+            self._on_fatal_storage(exc, origin="route:liquidation")
         except Exception as exc:
             self.stream_counters["liquidation"]["rejected"] += 1
             self._record_validation_rejection("liquidation", type(exc).__name__)
@@ -1119,6 +1376,8 @@ class CollectorApp:
         send_telegram_alert("Collector Application Started")
         self.running = True
         self._quality_task = asyncio.create_task(self._quality_persistence_loop())
+        # F5: latent writer-failure detection + the controlled terminal shutdown.
+        self.tasks.append(asyncio.create_task(self._failure_supervisor_loop()))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._async_shutdown(s)))
@@ -1150,10 +1409,14 @@ class CollectorApp:
     async def _poll_openinterest(self):
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=5)
+        self._ensure_failure_state()
         while self.running:
+            if self.terminal_failure is not None:
+                return  # raw-evidence boundary lost: no further polling, shutdown is in progress
             request_ts = int(time.time() * 1000)
             status = None
             body = None
+            raw_captured = False
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(OI_URL) as resp:
@@ -1165,13 +1428,25 @@ class CollectorApp:
                 # REST polling time is not exchange observation time; both are
                 # preserved separately so research can tell them apart.
                 process_ts = int(time.time() * 1000)
-                self._capture_rest(RawRestRecord(
+                if self._capture_rest(RawRestRecord(
                     request_ts=request_ts, response_receive_ts=receive_ts,
                     endpoint=OI_URL, purpose="open_interest",
                     request_params={"symbol": SYMBOL}, http_status=status,
                     ok=True, payload=body, symbol=SYMBOL,
-                    local_process_ts=process_ts))
+                    local_process_ts=process_ts)) is False:
+                    # F5: raw_rest lost => TERMINATE. The response was NOT durably
+                    # captured, so it is not authoritative and must not feed the
+                    # canonical OI writer.
+                    return
+                raw_captured = True
                 self.stream_counters["openinterest"]["received"] += 1
+                if self._route_is_isolated("openinterest"):
+                    # F5: canonical OI writer failed earlier. Raw REST capture
+                    # (above) keeps running -- replay can rebuild canonical OI
+                    # from it -- but the failed writer is never called again.
+                    self._note_short_circuit("openinterest")
+                    await asyncio.sleep(OI_POLL_INTERVAL_S)
+                    continue
                 # G2: the same normalizer replay uses. local_receive_ts is the
                 # RESPONSE's receive time, not wall-clock-at-write and not the
                 # exchange's own `time` field -- a slow response must not
@@ -1206,16 +1481,25 @@ class CollectorApp:
                     self.health_monitor.record_message("openinterest", event.local_receive_ts)
             except asyncio.CancelledError:
                 raise
+            except FatalStorageError as exc:
+                # F5: before the blanket handler, which would log a second,
+                # contradictory ok=False raw_rest record for a response that was
+                # already captured ok=True. Classified by the failing writer's
+                # own stream (openinterest -> isolate the canonical route).
+                self._on_fatal_storage(exc, origin="route:openinterest")
             except Exception as e:
                 # Previously log-only, so a REST outage left no trace in the
                 # data and looked identical to a period of no change.
                 logger.error("OI poll failed", error=str(e))
-                self._capture_rest(RawRestRecord(
-                    request_ts=request_ts, response_receive_ts=None,
-                    endpoint=OI_URL, purpose="open_interest",
-                    request_params={"symbol": SYMBOL}, http_status=status,
-                    ok=False, error=f"{type(e).__name__}:{e}", payload=body,
-                    symbol=SYMBOL))
+                if not raw_captured:
+                    # F5: a response already captured ok=True must not also be
+                    # recorded as a failed request (contradictory raw_rest state).
+                    self._capture_rest(RawRestRecord(
+                        request_ts=request_ts, response_receive_ts=None,
+                        endpoint=OI_URL, purpose="open_interest",
+                        request_params={"symbol": SYMBOL}, http_status=status,
+                        ok=False, error=f"{type(e).__name__}:{e}", payload=body,
+                        symbol=SYMBOL))
                 self._persist_quality_event({
                     "stream": "openinterest", "event_type": QualityEventType.ERROR,
                     "reason": f"oi_poll_failed:{type(e).__name__}",
@@ -1232,8 +1516,12 @@ class CollectorApp:
             raise RuntimeError(msg)
         logger.info("Startup stream verification passed", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
 
-    async def _async_shutdown(self, signum: int):
-        logger.info("Received signal, initiating async shutdown", signum=signum)
+    async def _async_shutdown(self, signum: int, terminal: bool = False):
+        if terminal:
+            logger.error("Terminal storage failure, initiating controlled shutdown",
+                         failure=None if self.terminal_failure is None else self.terminal_failure.as_dict())
+        else:
+            logger.info("Received signal, initiating async shutdown", signum=signum)
         self.running = False
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
@@ -1310,7 +1598,9 @@ class CollectorApp:
                     self._persist_quality_event({
                         "exchange": "BINANCE", "stream": getattr(writer, "stream_name", writer_name),
                         "event_type": "ERROR",
-                        "reason": f"storage_shutdown_close_failed:{writer_name}:{type(exc).__name__}",
+                        "reason": (f"storage_shutdown_close_failed:{writer_name}:{type(exc).__name__}"
+                                   # F5: the typed fatal chains the original storage error; keep that evidence.
+                                   + ("" if exc.__cause__ is None else f":cause={type(exc.__cause__).__name__}")),
                     })
                 except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
                     logger.error("storage_shutdown_close_failure_report_failed",
@@ -1320,10 +1610,21 @@ class CollectorApp:
         send_telegram_alert(msg)
         return closed_ok
 
-if __name__ == "__main__":
+def main(app_factory=None) -> int:
+    """Run the collector and return its process exit status.
+
+    0 for a normal / signalled stop; ``EXIT_FATAL_STORAGE`` (non-zero) when a
+    raw-evidence storage failure latched a terminal failure, so systemd sees a
+    failed exit. Plain ``sys.exit`` from the main thread only: no ``os._exit``,
+    and nothing in a worker calls it."""
     validate_telegram_startup()
-    app = CollectorApp()
+    app = (app_factory or CollectorApp)()
     try:
         asyncio.run(app.start())
     except KeyboardInterrupt:
         pass
+    return app.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
