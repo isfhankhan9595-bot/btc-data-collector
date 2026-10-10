@@ -284,6 +284,12 @@ Reproduced on the unfixed head (snapshot, then a delta with a decreasing update 
   neither swallowed nor relabelled.
 * `_record_adapter_unhandled` hands a typed fatal that is *not* the quality channel's to the failure policy
   (`origin="adapter_unhandled"`) before re-raising, because the adapter's catch-all would otherwise drop it.
+* `_on_client_quality_event` (called UNGUARDED by `WebSocketClient`, so it must not raise) hands a typed fatal that
+  is *not* the quality channel's to the failure policy (`origin="client_quality_event"`) and then **contains** it:
+  raw-evidence / unknown stream → terminate (discard mode, supervisor wake-up, exit 70), derived stream → isolate
+  its own route, never latched as a quality failure. Previously its catch-all logged and swallowed it, so the
+  default-deny rule was bypassed. Repeats are counted by the policy, not logged or alerted per event. An ordinary
+  exception keeps the existing log + checkpoint-block behaviour.
 * While degraded, the per-event `bybit_quality_event_wal_append_failed_in_persist` error log is replaced by the
   bounded accounting log (a full disk typically breaks the WAL and Parquet together).
 

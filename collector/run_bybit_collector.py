@@ -629,12 +629,27 @@ class BybitCollectorApp:
         failure is logged at ERROR and the checkpoint is already latched by
         _persist_quality_event, leaving any WAL copy for restart recovery.
         A quality-channel fatal is contained by ``_emit_quality_event`` (latched and
-        reported once there), so this handler logs only for a NEW kind of failure."""
+        reported once there), so this handler logs only for a NEW kind of failure.
+
+        A typed fatal of ANY OTHER stream (``_emit_quality_event`` lets it propagate: it
+        is not quality telemetry) is classified here by this runner's own
+        ``failure_policy`` BEFORE it is contained, so the default-deny rule holds: a
+        raw-evidence or unknown stream latches TERMINATE (client discard mode, supervisor
+        wake-up, non-zero exit), a derived stream isolates its own route, and it is never
+        latched as a quality-channel failure. It is contained afterwards rather than
+        re-raised: this callback is the client's unguarded boundary, and the latch is what
+        the supervisor acts on. The policy logs, alerts and reports it once and merely
+        counts repeats, so nothing here logs per event or re-enters the quality writer."""
         try:
             self._emit_quality_event({"stream": stream_group or "bybit_websocket",
                                       "event_type": event_type, "reason": reason,
                                       "connection_id": connection_id,
                                       "local_ts": int(time.time() * 1000)})
+        except FatalStorageError as exc:
+            policy = getattr(self, "failure_policy", None)
+            if policy is None:
+                raise                  # cannot be classified: never swallowed
+            policy.on_fatal(exc, origin="client_quality_event")
         except Exception:  # noqa: BLE001
             logger.error("bybit_websocket_quality_event_persist_failed",
                          event_type=event_type, reason=reason)
