@@ -53,6 +53,9 @@ Only `collector.run_collector` (Binance USD-M) has a systemd unit. `run_bybit_co
 no deployment artifact. This is scope, not a limitation of this unit: nothing in the repo
 indicates one unit should cover every runner, and no second unit was added speculatively.
 Add one per runner, following this file's pattern, if/when those need deployment.
+All of them now exit `70` on a terminal (raw-evidence) storage failure and `1` if the application
+task crashed of an ordinary exception, so any supervisor that restarts on non-zero will treat both
+as failures; see `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
 ## Shutdown contract (offline analysis only -- NOT VERIFIED LIVE)
 

@@ -23,19 +23,24 @@ no event loop, so the mapping is trivially unit-testable.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 from .storage_errors import FatalStorageError, WriterFailureSnapshot
 
 __all__ = [
     "VERDICT_TERMINATE", "VERDICT_ISOLATE", "VERDICT_DEGRADE_QUALITY",
-    "STORAGE_STREAM_VERDICTS", "FORCED_TERMINAL_ORIGINS",
+    "STORAGE_STREAM_VERDICTS", "FORCED_TERMINAL_ORIGINS", "EXIT_FATAL_STORAGE",
     "FailureRecord", "classify_stream", "classify_fatal",
 ]
 
 VERDICT_TERMINATE = "terminate"
 VERDICT_ISOLATE = "isolate_route"
 VERDICT_DEGRADE_QUALITY = "degrade_quality"
+
+#: Process exit status of a terminal (raw-evidence) storage failure, shared by
+#: every entry point that implements the termination contract. Any non-zero
+#: value makes systemd's ``Restart=always`` treat the exit as a failure.
+EXIT_FATAL_STORAGE = 70
 
 #: ``FatalStorageError.stream`` (the writer's storage stream) -> (verdict, route).
 #: ``route`` names the application route to isolate; ``None`` when no route.
@@ -61,19 +66,34 @@ STORAGE_STREAM_VERDICTS: Dict[str, Tuple[str, Optional[str]]] = {
 #: fatal there is terminal whatever stream name it carries: the boundary itself
 #: is what failed. (An unrelated stream name must not talk the app into
 #: continuing past a raw-evidence failure.)
-FORCED_TERMINAL_ORIGINS = frozenset({"raw_frame", "raw_rest"})
+#:
+#: ``run_task`` is the supervisor's last line of defence: a typed fatal that
+#: escaped the application task all the way to the supervisor was never
+#: classified by anyone, so it is terminal by default-deny.
+FORCED_TERMINAL_ORIGINS = frozenset({"raw_frame", "raw_rest", "run_task"})
 
 
-def classify_stream(stream: Optional[str]) -> Tuple[str, Optional[str]]:
-    """``(verdict, route)`` for a storage stream. Unknown / missing => TERMINATE."""
+def classify_stream(stream: Optional[str], *,
+                    table: Optional[Mapping[str, Tuple[str, Optional[str]]]] = None
+                    ) -> Tuple[str, Optional[str]]:
+    """``(verdict, route)`` for a storage stream. Unknown / missing => TERMINATE.
+
+    ``table`` lets an entry point supply the stream -> verdict mapping for ITS
+    OWN writers (venue-prefixed stream names differ per runner: ``spot_trades``,
+    ``bybit_orderbook``, ``okx_trades`` ...). It replaces the default table, it
+    is never merged with it, and a stream missing from it is still TERMINATE:
+    default-deny holds for every table."""
+    entries = STORAGE_STREAM_VERDICTS if table is None else table
     if isinstance(stream, str):
-        entry = STORAGE_STREAM_VERDICTS.get(stream)
+        entry = entries.get(stream)
         if entry is not None:
             return entry
     return (VERDICT_TERMINATE, None)
 
 
-def classify_fatal(exc: FatalStorageError, *, origin: Optional[str] = None) -> Tuple[str, Optional[str]]:
+def classify_fatal(exc: FatalStorageError, *, origin: Optional[str] = None,
+                   table: Optional[Mapping[str, Tuple[str, Optional[str]]]] = None
+                   ) -> Tuple[str, Optional[str]]:
     """Classify a typed fatal. Only ``FatalStorageError`` is accepted: this is
     the single place that turns an exception into a verdict, and it refuses to
     classify anything by ``RuntimeError``-ness, message text or class name."""
@@ -81,7 +101,7 @@ def classify_fatal(exc: FatalStorageError, *, origin: Optional[str] = None) -> T
         raise TypeError(f"classify_fatal requires a FatalStorageError, got {type(exc).__name__}")
     if origin in FORCED_TERMINAL_ORIGINS:
         return (VERDICT_TERMINATE, None)
-    return classify_stream(exc.stream)
+    return classify_stream(exc.stream, table=table)
 
 
 @dataclass(frozen=True)
@@ -108,8 +128,9 @@ class FailureRecord:
         return asdict(self)
 
     @classmethod
-    def from_exception(cls, exc: FatalStorageError, *, origin: str, now_ms: int) -> "FailureRecord":
-        verdict, route = classify_fatal(exc, origin=origin)
+    def from_exception(cls, exc: FatalStorageError, *, origin: str, now_ms: int,
+                       table: Optional[Mapping[str, Tuple[str, Optional[str]]]] = None) -> "FailureRecord":
+        verdict, route = classify_fatal(exc, origin=origin, table=table)
         cause = exc.__cause__
         error = f"{type(exc).__name__}: {exc}"
         if cause is not None:

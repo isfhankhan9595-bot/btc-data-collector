@@ -70,8 +70,9 @@ its absence would look identical to never having tried.
   built, or a writer error that is not a typed storage fatal, becomes a durable
   `DATA_DROP` quality event and the frame still flows. **F5 exception:** a
   `FatalStorageError` from the `raw_wire` / `raw_rest` writer means the
-  irrecoverable-evidence boundary is gone, so the Binance USD-M collector
-  (`RawCapture(fail_closed_on_fatal_storage=True)`) stops instead of continuing
+  irrecoverable-evidence boundary is gone, so the Binance USD-M collector, Binance
+  Spot, Bybit, OKX and OKX capture-only (each builds
+  `RawCapture(fail_closed_on_fatal_storage=True)`) stop instead of continuing
   without durable raw evidence. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
 - **Bounded.** Payloads above `DEFAULT_MAX_PAYLOAD_BYTES` (4 MB) are stored
   truncated with the original length recorded, and truncation itself raises a

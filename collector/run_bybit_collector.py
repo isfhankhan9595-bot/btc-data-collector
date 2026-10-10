@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import signal
 import time
@@ -74,11 +75,19 @@ from collector.collector.config import (
     SYMBOL,
 )
 from collector.collector.backoff import ExponentialBackoff
+from collector.collector.failure_topology import FailureRecord
 from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT, InstrumentIdError
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
 from collector.collector.quality_wal import QualityEventWAL, QualityWALCorruption
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
+from collector.collector.standalone_failure_policy import (
+    StandaloneFailurePolicy,
+    build_stream_table,
+    supervise_standalone_runner,
+    tag_route,
+)
+from collector.collector.storage_errors import FatalStorageError
 from collector.collector.utils import logger
 from collector.collector.websocket_client import Keepalive, WebSocketClient
 
@@ -124,8 +133,13 @@ class BybitCollectorApp:
         self.raw_wire_writer = ParquetWriter(
             "bybit_raw_wire", RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="BYBIT", quality_event_sink=self._persist_quality_event)
+        # F5 raw-evidence contract: a typed fatal from the raw writer is NOT
+        # absorbed by the fail-open path; it reaches the shared client's
+        # raw-frame boundary, is classified TERMINATE by ``failure_policy`` and
+        # ends in a controlled non-zero exit.
         self.raw_capture = RawCapture(
-            self.raw_wire_writer, None, quality_event_sink=self._persist_quality_event)
+            self.raw_wire_writer, None, quality_event_sink=self._persist_quality_event,
+            fail_closed_on_fatal_storage=True)
 
         self.ob_writer = ParquetWriter(
             "bybit_orderbook", BYBIT_ORDERBOOK_SCHEMA, base_dir=data_dir,
@@ -138,6 +152,22 @@ class BybitCollectorApp:
             "bybit_openinterest", BYBIT_OPENINTEREST_SCHEMA, base_dir=data_dir, exchange="BYBIT")
         self.liq_writer = ParquetWriter(
             "bybit_liquidation", BYBIT_LIQUIDATION_SCHEMA, base_dir=data_dir, exchange="BYBIT")
+
+        # F5 failure topology for THIS runner's streams (bybit_*), built from the
+        # live writers: raw -> terminate, derived -> isolate the route, quality
+        # -> degrade, anything unlisted -> terminate (default-deny).
+        self.failure_policy = StandaloneFailurePolicy(
+            venue="BYBIT",
+            streams=build_stream_table(
+                raw=(self.raw_wire_writer,),
+                derived={self.ob_writer.stream_name: "orderbook",
+                         self.trades_writer.stream_name: "trades",
+                         self.mark_writer.stream_name: "markprice",
+                         self.oi_writer.stream_name: "openinterest",
+                         self.liq_writer.stream_name: "liquidation"},
+                quality=(self.quality_writer,), dedup_route="trades"),
+            clients=lambda: (self.client,),
+            report=self._report_storage_failure)
 
         self.adapter = BybitAdapter()
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
@@ -163,7 +193,33 @@ class BybitCollectorApp:
                                 expect=None, timeout_s=10.0),
             backoff=ExponentialBackoff(base_delay=1.0, max_delay=30.0, max_attempts=None),
             stream_group="bybit",
+            on_fatal=self._on_fatal_storage,
         )
+
+    # -- F5 failure topology ------------------------------------------------
+
+    @property
+    def exit_code(self) -> int:
+        return self.failure_policy.exit_code
+
+    def _on_fatal_storage(self, exc, origin: str = "handler", *, route=None) -> str:
+        """Classify and latch one typed storage fatal (see ``failure_policy``).
+        Safe to call from the websocket worker: it only latches."""
+        return self.failure_policy.on_fatal(exc, origin, route=route)
+
+    def _report_storage_failure(self, record: FailureRecord) -> None:
+        """Durable record of a NEW derived/raw failure in this venue's quality
+        stream. Never called for a quality failure (the policy skips it).
+        ``_persist_quality_event`` re-raises here, so it is guarded: reporting
+        must never abort the failure path."""
+        try:
+            self._persist_quality_event({
+                "exchange": "BYBIT", "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
+                "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
+                           f"stage={record.stage}:durability={record.durability}:origin={record.origin}"),
+                "local_ts": record.first_observed_ts})
+        except Exception:  # noqa: BLE001 - the structured log line is still the record
+            logger.error("bybit_storage_failure_quality_report_failed", stream=record.stream)
 
     # -- raw capture ---------------------------------------------------
 
@@ -430,12 +486,61 @@ class BybitCollectorApp:
 
     # -- message handling --------------------------------------------------
 
+    #: adapter route -> the F5 routes a message of that route feeds.
+    _MESSAGE_ROUTES = {"orderbook": ("orderbook",), "trades": ("trades",),
+                       "ticker": ("markprice", "openinterest"), "liquidation": ("liquidation",)}
+
+    def _message_routes(self, data) -> tuple:
+        """F5 routes a decoded message feeds; ``()`` when unknown. Never raises."""
+        try:
+            return self._MESSAGE_ROUTES.get(self.adapter.route_message(data), ()) if isinstance(data, dict) else ()
+        except Exception:  # noqa: BLE001 - a routing probe must not become a new failure mode
+            return ()
+
+    @staticmethod
+    def _event_route(event):
+        """The F5 route an event is persisted on (``None``: not persisted)."""
+        if isinstance(event, CanonicalOrderBookEvent):
+            return "orderbook"
+        if isinstance(event, CanonicalTradeEvent):
+            return "trades"
+        if isinstance(event, CanonicalMarkPriceEvent):
+            return "markprice"
+        if isinstance(event, CanonicalOIEvent):
+            return "openinterest"
+        if isinstance(event, CanonicalLiquidationEvent):
+            return "liquidation"
+        return None
+
     async def _handle_message(self, data: dict, local_receive_ts: int, connection_id=None) -> None:
         self.messages_handled += 1
+        routes = self._message_routes(data)
+        if routes and all(self.failure_policy.route_is_isolated(r) for r in routes):
+            # F5: every route this message feeds is cut off. Skip BEFORE
+            # normalize (which runs trade dedup): a dead route costs a counter,
+            # not an error per frame. The raw frame was captured already.
+            for route in routes:
+                self.failure_policy.note_short_circuit(route)
+            return
+        # F5: a typed storage fatal is NOT caught here. It propagates to the
+        # websocket worker boundary (the P0-4 contract), where the client calls
+        # ``on_fatal`` -> ``failure_policy`` -> isolate the route / terminate. This
+        # handler only records which route it was serving, so a failure that names
+        # a generic stream (``DedupStateError`` -> ``trades``) is still attributed
+        # to the right route.
+        served_route = "trades"          # normalize() runs trade dedup
         try:
             events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
             for event in events:
+                event_route = self._event_route(event)
+                if event_route is not None and self.failure_policy.route_is_isolated(event_route):
+                    self.failure_policy.note_short_circuit(event_route)
+                    continue
+                served_route = event_route
                 self._persist_event(event)
+        except FatalStorageError as exc:
+            tag_route(exc, served_route)
+            raise
         finally:
             # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
             segment_dedup = getattr(self, "segment_dedup", None)
@@ -530,7 +635,16 @@ class BybitCollectorApp:
 
     async def shutdown(self) -> None:
         self.running = False
-        await self.client.stop()
+        # Every step is guarded: none may stop the writer closes below.
+        # ``WebSocketClient.stop()`` is a plain method returning ``None``;
+        # awaiting it unconditionally raised ``TypeError`` here and skipped
+        # every writer close.
+        try:
+            stopped = self.client.stop()
+            if inspect.isawaitable(stopped):
+                await stopped
+        except Exception as exc:  # noqa: BLE001
+            logger.error("bybit_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")
@@ -584,20 +698,19 @@ class BybitCollectorApp:
         return closed_ok
 
 
-async def _main(data_dir: str, url: str) -> None:
+async def _main(data_dir: str, url: str) -> int:
+    """Run the collector; return the process exit status (0 for a signalled
+    stop, ``EXIT_FATAL_STORAGE`` for a terminal raw-evidence failure). The
+    application task is supervised, never left as an unobserved background task."""
     app = BybitCollectorApp(data_dir=data_dir, url=url)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass  # not available on this platform
-
-    run_task = asyncio.ensure_future(app.run())
-    await stop.wait()
-    await app.shutdown()
-    run_task.cancel()
+    return await supervise_standalone_runner(app, stop)
 
 
 if __name__ == "__main__":
@@ -609,4 +722,4 @@ if __name__ == "__main__":
     logger.info("bybit_collector_starting", url=args.url, data_dir=args.data_dir,
                note="requires outbound access to stream.bybit.com:443; "
                     "not available in every environment")
-    asyncio.run(_main(args.data_dir, args.url))
+    raise SystemExit(asyncio.run(_main(args.data_dir, args.url)))

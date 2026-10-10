@@ -48,7 +48,7 @@ from collector.collector.health_monitor import HealthMonitor
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.storage_errors import FatalStorageError, WriterFailureSnapshot
 from collector.collector.failure_topology import (
-    FailureRecord, VERDICT_DEGRADE_QUALITY, VERDICT_ISOLATE, VERDICT_TERMINATE,
+    EXIT_FATAL_STORAGE, FailureRecord, VERDICT_DEGRADE_QUALITY, VERDICT_ISOLATE, VERDICT_TERMINATE,
 )
 from collector.collector.websocket_client import WebSocketClient
 
@@ -66,9 +66,9 @@ QUALITY_SEGMENT_SECONDS = 30.0
 #: F5: how often the supervisor looks for a writer failure that latched while
 #: that writer was quiet. A handful of attribute reads: not expensive polling.
 FAILURE_SUPERVISOR_INTERVAL_S = 1.0
-#: F5: process exit status of a terminal (raw-evidence) storage failure. Any
-#: non-zero value makes systemd's Restart=always treat the exit as a failure.
-EXIT_FATAL_STORAGE = 70
+# F5: ``EXIT_FATAL_STORAGE`` (process exit status of a terminal raw-evidence
+# storage failure) is defined once, in failure_topology, and shared with the
+# standalone venue runners; it stays importable from this module.
 #: Writers the supervisor inspects (attribute name on the app).
 SUPERVISED_WRITERS = ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
                       "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer",
@@ -484,6 +484,38 @@ class CollectorApp:
                     self._persist_quality_event(event.record())
                 elif isinstance(event, dict):
                     self._persist_quality_event(event)
+
+    def _drain_integrity_quality_events_safely(self) -> None:
+        """Shutdown-path variant of ``_drain_integrity_quality_events``: it never
+        raises and one failing event does not forfeit the events after it.
+
+        Quality reporting must never be a precondition of terminal shutdown: when
+        the quality writer is the thing that just failed, the first persist raises,
+        and the strict drain would abort ``_async_shutdown`` / ``shutdown`` before
+        a single writer was closed. Each event is already WAL-protected before it
+        reaches the writer (``_persist_quality_event``), so a failed persist only
+        latches the checkpoint closed and leaves the event for the next start's
+        WAL recovery."""
+        for source in (getattr(self, "binance_book", None), getattr(self, "validator", None)):
+            drain = getattr(source, "drain_quality_events", None)
+            if drain is None:
+                continue
+            try:
+                events = list(drain())
+            except Exception as exc:  # noqa: BLE001
+                logger.error("integrity_quality_drain_failed", error=f"{type(exc).__name__}: {exc}")
+                self._block_quality_checkpoint("shutdown_integrity_drain_failed")
+                continue
+            for event in events:
+                try:
+                    if isinstance(event, QualityEvent):
+                        self._persist_quality_event(event.record())
+                    elif isinstance(event, dict):
+                        self._persist_quality_event(event)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("integrity_quality_event_shutdown_persist_failed",
+                                 error=f"{type(exc).__name__}: {exc}")
+                    self._block_quality_checkpoint("shutdown_integrity_persist_failed")
 
     async def handle_message(self, msg: dict, local_receive_ts: int | None = None,
                              connection_id: str | None = None):
@@ -1396,15 +1428,30 @@ class CollectorApp:
         except asyncio.CancelledError:
             pass
         finally:
-            if self._recovery_task is not None and not self._recovery_task.done():
-                self._recovery_task.cancel()
-                await asyncio.gather(self._recovery_task, return_exceptions=True)
-            self._drain_integrity_quality_events()
-            await self._quality_queue.join()
-            self.running = False
-            if self._quality_task is not None:
-                await self._quality_task
-            self.shutdown()
+            # F5: every step is guarded and ``shutdown()`` is reached on EVERY
+            # path. Quality reporting is telemetry: a failing quality writer here
+            # used to raise out of this block, skip ``shutdown()`` (all writers
+            # left unclosed) and turn the intended exit 70 into a traceback.
+            try:
+                try:
+                    if self._recovery_task is not None and not self._recovery_task.done():
+                        self._recovery_task.cancel()
+                        await asyncio.gather(self._recovery_task, return_exceptions=True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
+                self._drain_integrity_quality_events_safely()
+                try:
+                    await self._quality_queue.join()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("shutdown_quality_queue_join_failed", error=f"{type(exc).__name__}: {exc}")
+                self.running = False
+                try:
+                    if self._quality_task is not None:
+                        await self._quality_task
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("shutdown_quality_task_failed", error=f"{type(exc).__name__}: {exc}")
+            finally:
+                self.shutdown()
 
     async def _poll_openinterest(self):
         import aiohttp
@@ -1523,30 +1570,71 @@ class CollectorApp:
         else:
             logger.info("Received signal, initiating async shutdown", signum=signum)
         self.running = False
-        if self._recovery_task is not None and not self._recovery_task.done():
-            self._recovery_task.cancel()
-            await asyncio.gather(self._recovery_task, return_exceptions=True)
-        self._drain_integrity_quality_events()
-        if self._quality_task is not None:
-            await self._quality_task
-        self.shutdown()
-        for task in self.tasks:
-            task.cancel()
+        # F5: exception-safe. Quality reporting is telemetry and must never be a
+        # precondition of the terminal path: when the quality writer is the thing
+        # that failed, its first persist raises, and this method used to abort
+        # here -- ``shutdown()`` never ran, the writers stayed unclosed, the
+        # tasks (health monitor included) kept running and the process never
+        # exited 70. ``shutdown()`` and the task cancellation below are in a
+        # ``finally`` so they happen whatever the steps above do. This coroutine
+        # runs in the supervisor's (or the signal handler's) task, never in a
+        # websocket worker, so cancelling ``self.tasks`` cannot cancel itself.
+        try:
+            try:
+                if self._recovery_task is not None and not self._recovery_task.done():
+                    self._recovery_task.cancel()
+                    await asyncio.gather(self._recovery_task, return_exceptions=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
+            self._drain_integrity_quality_events_safely()
+            try:
+                if self._quality_task is not None:
+                    await self._quality_task
+            except Exception as exc:  # noqa: BLE001
+                logger.error("shutdown_quality_task_failed", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            try:
+                self.shutdown()
+            except Exception as exc:  # noqa: BLE001 - shutdown() is itself exception-safe; belt and braces
+                logger.error("shutdown_failed", error=f"{type(exc).__name__}: {exc}")
+            finally:
+                for task in self.tasks:
+                    task.cancel()
+
+    def _shutdown_step(self, step: str, function, *args) -> bool:
+        """Run one shutdown step; a failure is logged and never stops the next one."""
+        try:
+            function(*args)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("shutdown_step_failed", step=step, error=f"{type(exc).__name__}: {exc}")
+            return False
 
     def shutdown(self):
-        if self._closed:
+        """Stop intake and finalize every writer. Exception-safe and retryable.
+
+        ``_closed`` means "shutdown has begun" (the supervisor loop reads it); it
+        no longer means "cleanup is done". Cleanup completion is
+        ``_shutdown_done``, set only after a full pass, and each writer's close is
+        attempted at most once (``_writer_close_results``). So a first call that
+        fails partway -- or is interrupted -- never leaves writers unclosed
+        behind a latched ``_closed``: a later call attempts exactly the steps not
+        yet attempted, and an already-attempted writer is never closed twice."""
+        if getattr(self, "_shutdown_done", False):
             return
         self._closed = True
+        if not hasattr(self, "_writer_close_results"):
+            self._writer_close_results = {}
         logger.info("Shutting down Collector Application...", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
         self.running = False
         for ws_client in self.ws_clients:
-            ws_client.stop()
-        self.health_monitor.stop()
-        self._drain_integrity_quality_events()
+            self._shutdown_step("ws_client_stop", ws_client.stop)
+        self._shutdown_step("health_monitor_stop", self.health_monitor.stop)
+        self._drain_integrity_quality_events_safely()
         for task in self.tasks:
-            task.cancel()
+            self._shutdown_step("task_cancel", task.cancel)
         if self._recovery_task is not None and not self._recovery_task.done():
-            self._recovery_task.cancel()
+            self._shutdown_step("recovery_task_cancel", self._recovery_task.cancel)
         # Hostile-audit finding (this session): none of these close() calls
         # were guarded. _close_segment's flush/pyarrow-close/fsync/rename have
         # no failure handling of their own (only the metadata sidecar step
@@ -1561,20 +1649,30 @@ class CollectorApp:
         # quality events, WAL-protected and buffered) -> close quality_writer,
         # which PUBLISHES the final partial segment and thereby checkpoints
         # its WAL seqs -> only then close the WAL (the publish hook needs it).
-        self._drain_quality_queue_sync()
+        self._shutdown_step("quality_queue_drain", self._drain_quality_queue_sync)
         for writer_name in ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
                             "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer", "raw_rest_writer"):
-            self._close_writer_reporting_failure(writer_name)
-        if not self._close_writer_reporting_failure("quality_writer"):
+            self._close_writer_once(writer_name)
+        if not self._close_writer_once("quality_writer"):
             # Final segment not published: its events stay in the WAL,
             # uncheckpointed, and are replayed by the next startup.
             self._block_quality_checkpoint("quality_writer_close_failed")
         wal = getattr(self, "_quality_wal", None)
-        if wal is not None:
+        if wal is not None and not getattr(self, "_quality_wal_closed", False):
+            self._quality_wal_closed = True
             try:
                 wal.close()
             except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
                 logger.error("quality_wal_close_failed", error=str(exc))
+        self._shutdown_done = True
+
+    def _close_writer_once(self, writer_name: str) -> bool:
+        """Attempt ``writer_name``'s close at most once per process; a repeat call
+        returns the first attempt's outcome instead of closing it again."""
+        results = self._writer_close_results
+        if writer_name not in results:
+            results[writer_name] = self._close_writer_reporting_failure(writer_name)
+        return results[writer_name]
 
     def _close_writer_reporting_failure(self, writer_name: str) -> bool:
         """Close one writer; on failure, report it and still return.
@@ -1623,6 +1721,13 @@ def main(app_factory=None) -> int:
         asyncio.run(app.start())
     except KeyboardInterrupt:
         pass
+    except Exception as exc:  # noqa: BLE001
+        if app.terminal_failure is None:
+            raise                       # an unrelated crash keeps its traceback and status
+        # A terminal storage failure was latched: the intended exit status is
+        # EXIT_FATAL_STORAGE, not whatever the teardown tripped over afterwards.
+        logger.error("collector_exception_after_terminal_failure",
+                     error=f"{type(exc).__name__}: {exc}")
     return app.exit_code
 
 
