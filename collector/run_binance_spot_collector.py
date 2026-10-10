@@ -130,6 +130,13 @@ class BinanceSpotCollectorApp:
         # log line per event. Set before any writer exists: a writer may emit
         # through ``_persist_quality_event`` while it is being constructed.
         self.quality_events_lost = 0
+        # A typed fatal from THIS runner's own quality writer raised BEFORE
+        # ``failure_policy`` exists (a raw writer's orphan recovery emits a quality
+        # event while it is being constructed). There is no table to classify with
+        # yet, so it is only HELD here and latched exactly once, through the
+        # runner's own policy, the moment that policy is built. Never a fabricated
+        # record and never a retried write: the dead writer is not called again.
+        self._pre_policy_quality_failure = None
 
         self.quality_writer = ParquetWriter(
             venue_stream(VENUE, "quality_events"), QUALITY_EVENTS_SCHEMA,
@@ -167,6 +174,7 @@ class BinanceSpotCollectorApp:
                 quality=(self.quality_writer,), dedup_route="trades"),
             clients=lambda: (self.client,),
             report=self._report_storage_failure)
+        self._latch_pre_policy_quality_failure()
 
         self.adapter = BinanceSpotAdapter()
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
@@ -299,6 +307,15 @@ class BinanceSpotCollectorApp:
                 "quality_events_lost": self.quality_events_lost,
                 "quality_failure": None if record is None else record.as_dict()}
 
+    def _latch_pre_policy_quality_failure(self) -> None:
+        """Latch, once, a quality-writer failure held while the policy did not
+        exist. Goes through the real ``on_fatal`` (classified by this runner's own
+        table, one alert, never re-reported); it does not touch the failed writer.
+        The counter already holds the event that tripped it."""
+        pending, self._pre_policy_quality_failure = self._pre_policy_quality_failure, None
+        if pending is not None:
+            self.failure_policy.on_fatal(pending, origin="quality_writer")
+
     def _persist_quality_event(self, event: dict) -> None:
         """Single choke point for every Spot quality event.
 
@@ -311,7 +328,8 @@ class BinanceSpotCollectorApp:
         A typed fatal of any OTHER stream is re-raised (never swallowed by the
         quality handler); an ordinary exception keeps the log-and-continue path."""
         policy = getattr(self, "failure_policy", None)
-        if policy is not None and policy.quality_degraded is not None:
+        if (policy is not None and policy.quality_degraded is not None) \
+                or self._pre_policy_quality_failure is not None:
             self.quality_events_lost += 1
             return
         event_type = event.get("event_type", QualityEventType.ERROR.value)
@@ -336,7 +354,17 @@ class BinanceSpotCollectorApp:
                 "local_process_ts": int(time.time() * 1000),
             })
         except FatalStorageError as exc:
-            if policy is None or not policy.is_quality_channel_failure(exc):
+            if policy is None:
+                # Startup, before the policy exists. Only a typed fatal that names
+                # THIS runner's own quality stream is held for the policy; every
+                # other typed fatal (raw evidence, derived, another venue's
+                # stream, unknown) propagates exactly as it did before.
+                if exc.stream != self.quality_writer.stream_name:
+                    raise
+                self._pre_policy_quality_failure = exc
+                self.quality_events_lost += 1
+                return
+            if not policy.is_quality_channel_failure(exc):
                 raise
             policy.on_fatal(exc, origin="quality_writer")
             self.quality_events_lost += 1
