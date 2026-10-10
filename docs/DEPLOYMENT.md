@@ -38,6 +38,13 @@ Not in the unit. `EnvironmentFile=/etc/btc-collector.env` (root-owned, 0600) sup
 - Missing/unreadable env file, bad WorkingDirectory/ExecStart/user: start fails immediately.
 - Repeated failure: after 5 starts in 300 s the unit enters `failed` (no infinite crash loop).
 - Stop: SIGTERM, up to 60 s (must exceed the 30 s websocket queue drain).
+- **F5 terminal storage failure:** if the `raw_wire` or `raw_rest` writer fails (raw evidence is
+  irrecoverable), the collector stops ingesting, runs the normal shutdown (closing the healthy
+  writers) and exits with status **70**. Under the existing `Restart=always` that is a failure exit
+  and is restarted after `RestartSec`; F1/P0-4 startup reconciliation then recovers the stream. It
+  counts toward `StartLimitBurst` like any other failed start. A *derived* writer failure does not
+  exit: only that route is isolated and the operator is alerted. The unit file is unchanged;
+  behaviour under a real systemd/disk fault is not verified live. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
 ## Runner coverage (repository evidence, P0-12 finalization)
 
@@ -46,6 +53,9 @@ Only `collector.run_collector` (Binance USD-M) has a systemd unit. `run_bybit_co
 no deployment artifact. This is scope, not a limitation of this unit: nothing in the repo
 indicates one unit should cover every runner, and no second unit was added speculatively.
 Add one per runner, following this file's pattern, if/when those need deployment.
+All of them now exit `70` on a terminal (raw-evidence) storage failure and `1` if the application
+task crashed of an ordinary exception, so any supervisor that restarts on non-zero will treat both
+as failures; see `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
 ## Shutdown contract (offline analysis only -- NOT VERIFIED LIVE)
 

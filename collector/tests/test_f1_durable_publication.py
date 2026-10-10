@@ -32,6 +32,7 @@ import pytest
 from collector.collector import publication as pub
 from collector.collector import segment_dedup as sd
 from collector.collector.parquet_writer import ParquetWriter
+from collector.tests.test_parquet_writer_publication_failure import expect_fatal
 from collector.collector.publication import (
     DEEP_VERIFY_ENV, MarkerStatus, PublicationError, UNVERIFIED_FS_ENV, encode_marker, fs_guard,
     marker_path, quarantine_segment, read_marker, sha256_file,
@@ -285,7 +286,7 @@ def test_dir_fsync_failure_leaves_seg_unmarked_unindexed(tmp_path, monkeypatch):
     hooks = []
     r = Rig(tmp_path, hook=lambda rig, token, path: hooks.append(path))
     r.offer("A")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         r.writer.publish_open_segment()
     seg = r.segs()
     assert len(seg) == 1, "left in place, never deleted"

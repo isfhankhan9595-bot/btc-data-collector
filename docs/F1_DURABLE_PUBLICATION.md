@@ -190,6 +190,16 @@ only that exact value enables it. Use it only after verifying the storage out of
 * Reader code (`storage_layout`, `replay`, `compact_daily`, `pipeline/*`) is unchanged: sidecars and
   the `quarantine/` directory are invisible to `iter_segments`.
 
+## F5: how F1 failures propagate
+
+F1 publication semantics and ordering are unchanged. What changed is the exception type: a failed
+publication step (flush, close, fsync, rename, directory fsync, opening the next segment), a failed
+marker, or a failed dedup hook now surfaces as `FatalStorageError` (original exception on
+`__cause__`, plus `stage` / `durability`) instead of a bare `OSError` / `RuntimeError`, and the
+application maps the owning writer's stream to a verdict (terminate for `raw_wire`/`raw_rest`,
+isolate the route otherwise). A latched marker/hook failure is also visible through
+`ParquetWriter.failure_snapshot()` before any further write. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
+
 ## Known UNKNOWN / out of scope
 
 * Real power-loss behaviour of the production filesystem is **not tested**; tests simulate loss by

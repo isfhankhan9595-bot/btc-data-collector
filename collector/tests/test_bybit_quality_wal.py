@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from collector.collector.parquet_writer import ParquetWriter
+from collector.tests.test_parquet_writer_publication_failure import expect_fatal
 from collector.collector.quality_events import QualityEventType
 from collector.collector.quality_wal import CHECKPOINT_FILENAME, QualityEventWAL
 from collector.run_bybit_collector import BybitCollectorApp
@@ -309,8 +310,9 @@ def test_C_quality_write_failure_is_not_swallowed_and_the_event_stays_in_the_wal
 def test_C_segment_publication_failure_raises_blocks_checkpoint_and_keeps_wal_record(tmp_path, monkeypatch):
     app = _app(tmp_path)
     _fail_segment_publish(monkeypatch)
-    with pytest.raises(OSError, match="disk full"):
+    with expect_fatal(OSError, stage="rename") as info:
         app._persist_quality_event(_ev("t_c_publishfail"))
+    assert "disk full" in str(info.value.__cause__), "the original storage error is chained, not lost"
 
     assert [r["reason"] for r in _pending(tmp_path)] == ["t_c_publishfail"]
     assert _disk_ckpt(tmp_path) == -1
@@ -340,7 +342,7 @@ def test_C_wal_and_writer_both_failing_is_loud_and_leaves_the_wal_copy(tmp_path,
     app = _app(tmp_path)
     _fail_wal_fsync(monkeypatch, app)
     _fail_quality_write(monkeypatch, app)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError):        # ordinary: _fail_quality_write monkeypatches write() itself
         app._persist_quality_event(_ev("t_c_double"))
 
     assert app._quality_checkpoint_blocked is True
@@ -372,7 +374,7 @@ def test_D_unpublished_event_is_replayed_once_with_original_provenance(tmp_path,
     ts = 1_700_000_000_123
     with monkeypatch.context() as m:
         _fail_segment_publish(m)
-        with pytest.raises(OSError):
+        with expect_fatal(OSError):
             app._persist_quality_event(_ev("t_d_replay", event_type=QualityEventType.SEQUENCE_GAP,
                                            local_ts=ts, local_receive_ts=ts - 5, update_id=42))
     (orig,) = _pending(tmp_path)

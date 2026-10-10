@@ -14,6 +14,8 @@ import pyarrow.parquet as pq
 from .numeric import column_value
 from .utils import logger
 from .publication import CONFIRMED_BY_WRITER, sha256_file, write_marker_atomic
+from .failure_topology import VERDICT_DEGRADE_QUALITY, classify_stream
+from .storage_errors import FatalStorageError, WriterFailureSnapshot
 from .storage_layout import (
     SegmentKind, check_stream_namespace, iter_segments, parse_segment_name, segment_path,
 )
@@ -157,10 +159,16 @@ class ParquetWriter:
                                                     (``_publication_failure``; segment IS durable)
 
     FAILED means the writer can no longer vouch for its stream directory. It
-    refuses write/flush/publish_*/finalize with RuntimeError, keeps the stream
+    refuses write/flush/publish_*/finalize with ``FatalStorageError`` (F5: a
+    typed, ``RuntimeError``-derived exception that is NOT an ``OSError``; the
+    first failure chains the original exception on ``__cause__``, and every
+    later refusal carries the same ``stage``/``durability``), keeps the stream
     lock until close(), runs no further hook, and reports the failure through
     ``quality_event_sink`` (STORAGE_PUBLICATION_FAILED, plus DATA_DROP for rows
     that restart cannot account for). A failing sink never un-latches it.
+    ``failure_snapshot()`` exposes the latch read-only so a supervisor can see a
+    failure on a quiet writer. A closed writer's refusal stays a plain
+    ``RuntimeError``: closing is not a storage failure.
 
     Exact transitions. "Rows lost" is what the writer may claim; it never
     claims more durability than it established, and never invents a count it
@@ -250,6 +258,10 @@ class ParquetWriter:
         self._age_from_first_row = age_from_first_row
         self._first_row_monotonic: Optional[float] = None
         self._publication_failure: Optional[BaseException] = None
+        #: Which gate set ``_publication_failure``: ``"marker"`` (F1 publication
+        #: marker not durable) or ``"publication_hook"`` (dedup commit failed).
+        #: Diagnostic only; it feeds the typed ``FatalStorageError.stage``.
+        self._publication_failure_stage: Optional[str] = None
         #: Fail-closed latch for a segment publication that did not complete
         #: (flush / pyarrow close / fsync / rename / directory fsync / opening
         #: the next segment). Distinct from ``_publication_failure``, which
@@ -321,7 +333,26 @@ class ParquetWriter:
         }
         logger.warning("storage_quality_event", **event)
         if self.quality_event_sink:
+            self._deliver_to_sink(event)
+
+    def _deliver_to_sink(self, event: Dict[str, Any]) -> None:
+        """Hand one event to ``quality_event_sink``.
+
+        F5: a typed fatal raised by the SINK that belongs to the quality channel
+        (its writer already latched itself and the application degraded the
+        channel) is not a failure of THIS writer. Letting it propagate out of
+        write() would make a telemetry failure look like this stream's failure --
+        for ``raw_wire`` / ``raw_rest`` that is the difference between degrading
+        telemetry and terminating the collector. Contained here, logged, and
+        nothing else: a typed fatal of any OTHER stream, and every ordinary
+        exception, still propagates exactly as before."""
+        try:
             self.quality_event_sink(event)
+        except FatalStorageError as exc:
+            if classify_stream(exc.stream)[0] != VERDICT_DEGRADE_QUALITY:
+                raise
+            logger.error("storage_quality_channel_failed_in_sink", stream=self.stream_name,
+                         sink_stream=exc.stream, sink_stage=exc.stage, event_type=event.get("event_type"))
 
     def _next_sequence(self, hour: str) -> int:
         """Return the next unused segment sequence for ``hour``.
@@ -426,10 +457,10 @@ class ParquetWriter:
         logger.warning("segment_data_drop", **event)
         if self.quality_event_sink:
             if not guarded:
-                self.quality_event_sink(event)
+                self._deliver_to_sink(event)
                 return
             try:
-                self.quality_event_sink(event)
+                self._deliver_to_sink(event)
             except Exception as exc:  # noqa: BLE001 - see _emit_quality_guarded
                 logger.error("storage_quality_event_sink_failed", stream=self.stream_name,
                              event_type="DATA_DROP", error=f"{type(exc).__name__}: {exc}")
@@ -550,20 +581,67 @@ class ParquetWriter:
             self._emit_drop(unflushed, "unflushed_rows_discarded_on_publication_failure", guarded=True)
         self.buffer.clear()
 
+    def _storage_fatal(self) -> FatalStorageError:
+        """The typed fatal for the STORAGE latch (``_storage_failure``).
+
+        Built on demand from the latched fields, chained to the original cause,
+        so the first failure and every later refusal carry the same stage and
+        durability evidence."""
+        cause = self._storage_failure
+        if self._storage_failure_durability == "published":
+            message = (
+                f"ParquetWriter for {self.stream_name!r} is FAILED: failed to open next segment "
+                f"({cause!r}). The previous segment was published and is durable "
+                f"(no rows are pending or lost), but no healthy open segment exists, so the writer "
+                f"refuses all further operations until restart")
+        else:
+            message = (
+                f"ParquetWriter for {self.stream_name!r} is FAILED: segment publication did not "
+                f"complete (stage={self._storage_failure_stage}, {cause!r}); "
+                f"on-disk state is uncertain and the writer refuses all further operations "
+                f"until restart")
+        error = FatalStorageError(
+            message, stream=self.stream_name, component="parquet_writer",
+            stage=self._storage_failure_stage, durability=self._storage_failure_durability)
+        error.__cause__ = cause
+        return error
+
+    def _publication_fatal(self, detail: str) -> FatalStorageError:
+        """The typed fatal for the PUBLICATION latch (``_publication_failure``):
+        the segment IS durable but its marker / dedup hook failed, so the
+        writer refuses further writes until restart."""
+        cause = self._publication_failure
+        error = FatalStorageError(
+            f"ParquetWriter for {self.stream_name!r} refuses {detail}: the segment-publication "
+            f"gate failed at {self._publication_failure_stage or 'publication'} ({cause!r}); "
+            f"dedup/storage state is uncertain",
+            stream=self.stream_name, component="parquet_writer",
+            stage=self._publication_failure_stage or "publication_hook", durability="published")
+        error.__cause__ = cause
+        return error
+
+    def failure_snapshot(self) -> Optional[WriterFailureSnapshot]:
+        """Read-only view of the writer's latched failure, or ``None`` if healthy.
+
+        Exists so a supervisor can notice a latched failure on a QUIET writer
+        (no future ``write()`` will ever raise it). It reports; it never
+        repairs: there is no way to clear either latch from here."""
+        if self._storage_failure is not None:
+            return WriterFailureSnapshot(
+                stream=self.stream_name, component="parquet_writer",
+                stage=self._storage_failure_stage, durability=self._storage_failure_durability,
+                kind="storage", error=f"{type(self._storage_failure).__name__}: {self._storage_failure}")
+        if self._publication_failure is not None:
+            return WriterFailureSnapshot(
+                stream=self.stream_name, component="parquet_writer",
+                stage=self._publication_failure_stage or "publication_hook", durability="published",
+                kind="publication", error=f"{type(self._publication_failure).__name__}: {self._publication_failure}")
+        return None
+
     def _raise_if_storage_failed(self) -> None:
         if self._storage_failure is None:
             return
-        if self._storage_failure_durability == "published":
-            raise RuntimeError(
-                f"ParquetWriter for {self.stream_name!r} is FAILED: failed to open next segment "
-                f"({self._storage_failure!r}). The previous segment was published and is durable "
-                f"(no rows are pending or lost), but no healthy open segment exists, so the writer "
-                f"refuses all further operations until restart") from self._storage_failure
-        raise RuntimeError(
-            f"ParquetWriter for {self.stream_name!r} is FAILED: segment publication did not "
-            f"complete (stage={self._storage_failure_stage}, {self._storage_failure!r}); "
-            f"on-disk state is uncertain and the writer refuses all further operations "
-            f"until restart") from self._storage_failure
+        raise self._storage_fatal()
 
     def _recover_orphans(self) -> None:
         for meta_tmp in self.stream_dir.glob("*.meta.json.tmp"):
@@ -644,10 +722,7 @@ class ParquetWriter:
         its segment exactly (a rotation after the append cannot race it)."""
         self._raise_if_storage_failed()
         if self._publication_failure is not None:
-            raise RuntimeError(
-                f"ParquetWriter for {self.stream_name!r} refuses writes: the segment-publication "
-                f"hook failed ({self._publication_failure!r}); dedup/storage state is uncertain"
-            ) from self._publication_failure
+            raise self._publication_fatal("writes")
         hour = self._get_current_hour_str()
         if hour != self.current_hour:
             if self._closed:
@@ -668,17 +743,15 @@ class ParquetWriter:
             # would be silently admitted into a writer that is already in a
             # fail-closed state, one write late.
             if self._publication_failure is not None:
-                raise RuntimeError(
-                    f"ParquetWriter for {self.stream_name!r} refuses this write: the segment-"
-                    f"publication hook failed during this write's own hour rollover "
-                    f"({self._publication_failure!r}); dedup/storage state is uncertain"
-                ) from self._publication_failure
+                raise self._publication_fatal("this write (its own hour rollover tripped the gate)")
             self.current_hour, self._seq = hour, self._next_sequence(hour)
             try:
                 self._open_segment()
             except BaseException as exc:
                 self._fail_closed("open_next_segment", exc)
-                raise
+                if not isinstance(exc, Exception):
+                    raise  # KeyboardInterrupt / CancelledError are never rewritten as storage failure
+                raise self._storage_fatal() from exc
         if self.writer is None:
             # No open segment (closed writer): buffering here could never be
             # published. Refuse instead of silently accepting the row.
@@ -716,7 +789,9 @@ class ParquetWriter:
             # A half-applied append leaves the segment in an unknown state:
             # appending again could duplicate or lose rows. Fail closed.
             self._fail_closed("flush", exc)
-            raise
+            if not isinstance(exc, Exception):
+                raise  # KeyboardInterrupt / CancelledError are never rewritten as storage failure
+            raise self._storage_fatal() from exc
 
     def _close_segment(self, *, open_next: bool) -> None:
         self._raise_if_storage_failed()
@@ -750,7 +825,9 @@ class ParquetWriter:
                 os.close(parent_fd)
         except BaseException as exc:
             self._fail_closed(stage, exc)
-            raise
+            if not isinstance(exc, Exception):
+                raise  # KeyboardInterrupt / CancelledError are never rewritten as storage failure
+            raise self._storage_fatal() from exc
         # The segment is durable from here on. A stale row-count sidecar that
         # cannot be removed is harmless (orphan recovery only reads the counter
         # of a ``.seg.tmp``) and must not skip the hooks below.
@@ -779,6 +856,7 @@ class ParquetWriter:
         except Exception as exc:  # noqa: BLE001 - segment is durable; latch, never raise out of publication
             marker_ok = False
             self._publication_failure = exc
+            self._publication_failure_stage = "marker"
             self._emit_quality_guarded(
                 "STORAGE_METADATA_FAILED",
                 f"segment published (durable, rows NOT lost) but publication marker failed: "
@@ -795,6 +873,7 @@ class ParquetWriter:
                 self.on_segment_published((self.current_hour, self._seq), final)
             except Exception as exc:  # noqa: BLE001 - segment is durable; fail CLOSED on the next write
                 self._publication_failure = exc
+                self._publication_failure_stage = "publication_hook"
                 self._emit_quality_guarded(
                     "DEDUP_STATE_FAILED",
                     f"segment published but publication hook failed: {type(exc).__name__}: {exc}")
@@ -807,7 +886,9 @@ class ParquetWriter:
                 # The segment just published is untouched; but a writer with no
                 # open segment must never keep accepting rows.
                 self._fail_closed("open_next_segment", exc)
-                raise
+                if not isinstance(exc, Exception):
+                    raise  # KeyboardInterrupt / CancelledError are never rewritten as storage failure
+                raise self._storage_fatal() from exc
 
     def has_unpublished_rows(self) -> bool:
         """True while rows exist whose publication has not been confirmed.

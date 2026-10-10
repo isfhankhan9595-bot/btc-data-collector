@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import signal
 import time
@@ -64,9 +65,17 @@ from collector.collector.okx_capture import (
     OKX_PUBLIC_WS_URL,
     okx_subscribe_message,
 )
+from collector.collector.failure_topology import FailureRecord
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
+from collector.collector.standalone_failure_policy import (
+    StandaloneFailurePolicy,
+    build_stream_table,
+    supervise_standalone_runner,
+    tag_route,
+)
+from collector.collector.storage_errors import FatalStorageError
 from collector.collector.storage_layout import venue_stream
 from collector.collector.utils import logger
 from collector.collector.websocket_client import Keepalive, WebSocketClient
@@ -89,6 +98,13 @@ class OKXCollectorApp:
         self.inst_id = inst_id
         self.channels = tuple(channels)
 
+        # Quality events NOT persisted because the quality channel is degraded:
+        # the event that tripped the latch plus every later one, which is
+        # short-circuited without calling the failed writer. A counter, never a
+        # log line per event. Set before any writer exists: a writer may emit
+        # through ``_persist_quality_event`` while it is being constructed.
+        self.quality_events_lost = 0
+
         # Own okx_-prefixed streams (PR #19 storage-namespace phase);
         # exchange="OKX" so this runner's own storage faults are never
         # attributed to Binance/Bybit (ParquetWriter's default).
@@ -98,8 +114,13 @@ class OKXCollectorApp:
         self.raw_wire_writer = ParquetWriter(
             venue_stream("OKX", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="OKX", quality_event_sink=self._persist_quality_event)
+        # F5 raw-evidence contract: a typed fatal from the raw writer is NOT
+        # absorbed by the fail-open path; it reaches the shared client's
+        # raw-frame boundary, is classified TERMINATE by ``failure_policy`` and
+        # ends in a controlled non-zero exit.
         self.raw_capture = RawCapture(
-            self.raw_wire_writer, None, quality_event_sink=self._persist_quality_event)
+            self.raw_wire_writer, None, quality_event_sink=self._persist_quality_event,
+            fail_closed_on_fatal_storage=True)
 
         self.trades_writer = ParquetWriter(
             venue_stream("OKX", "trades"), OKX_TRADES_SCHEMA, base_dir=data_dir, exchange="OKX")
@@ -115,6 +136,26 @@ class OKXCollectorApp:
             venue_stream("OKX", "openinterest"), OKX_OPENINTEREST_SCHEMA, base_dir=data_dir, exchange="OKX")
         self.liq_writer = ParquetWriter(
             venue_stream("OKX", "liquidation"), OKX_LIQUIDATION_SCHEMA, base_dir=data_dir, exchange="OKX")
+
+        # F5 failure topology for THIS runner's streams (okx_*), built from the
+        # live writers: raw -> terminate, derived -> isolate the route, quality
+        # -> degrade, anything unlisted -> terminate (default-deny). OKX has TWO
+        # trade streams with independent writers and dedup indexes, so they are
+        # two routes ("trades", "trades_all").
+        self.failure_policy = StandaloneFailurePolicy(
+            venue="OKX",
+            streams=build_stream_table(
+                raw=(self.raw_wire_writer,),
+                derived={self.trades_writer.stream_name: "trades",
+                         self.trades_all_writer.stream_name: "trades_all",
+                         self.mark_writer.stream_name: "markprice",
+                         self.index_writer.stream_name: "indextickers",
+                         self.funding_writer.stream_name: "fundingrate",
+                         self.oi_writer.stream_name: "openinterest",
+                         self.liq_writer.stream_name: "liquidation"},
+                quality=(self.quality_writer,), dedup_route="trades"),
+            clients=lambda: (self.client,),
+            report=self._report_storage_failure)
 
         self.adapter = OKXAdapter(inst_id=inst_id, index_inst_id=index_inst_id)
         # P0-4: two independent trade representations, two anchors -- OKX's
@@ -143,7 +184,30 @@ class OKXCollectorApp:
             keepalive=OKX_KEEPALIVE,
             control_frames=frozenset({"pong"}),
             stream_group="okx",
+            on_fatal=self._on_fatal_storage,
         )
+
+    # -- F5 failure topology ------------------------------------------------
+
+    @property
+    def exit_code(self) -> int:
+        return self.failure_policy.exit_code
+
+    def _on_fatal_storage(self, exc, origin: str = "handler", *, route=None) -> str:
+        """Classify and latch one typed storage fatal (see ``failure_policy``).
+        Safe to call from the websocket worker: it only latches."""
+        return self.failure_policy.on_fatal(exc, origin, route=route)
+
+    def _report_storage_failure(self, record: FailureRecord) -> None:
+        """Durable record of a NEW derived/raw failure in this venue's quality
+        stream. Never called for a quality failure (the policy skips it).
+        ``_persist_quality_event`` contains a quality-channel fatal itself; the
+        policy guards this reporter against anything else it raises."""
+        self._persist_quality_event({
+            "exchange": "OKX", "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
+            "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
+                       f"stage={record.stage}:durability={record.durability}:origin={record.origin}"),
+            "local_ts": record.first_observed_ts})
 
     # -- raw capture --------------------------------------------------------
 
@@ -176,7 +240,35 @@ class OKXCollectorApp:
 
     # -- quality events -------------------------------------------------------
 
+    @property
+    def quality_degraded(self):
+        """The latched quality-channel ``FailureRecord`` (or ``None`` while healthy)."""
+        return self.failure_policy.quality_degraded
+
+    def quality_channel_status(self) -> dict:
+        """Operator view of the quality channel. Market-data capture is unaffected
+        by a degraded channel. This runner keeps NO durable quality WAL, so every
+        event counted in ``quality_events_lost`` is gone, not retained."""
+        record = self.failure_policy.quality_degraded
+        return {"quality_degraded": record is not None,
+                "quality_events_lost": self.quality_events_lost,
+                "quality_failure": None if record is None else record.as_dict()}
+
     def _persist_quality_event(self, event: dict) -> None:
+        """Single choke point for every OKX quality event.
+
+        F5: a typed ``FatalStorageError`` from THIS runner's quality writer means
+        that writer is FAILED. It is latched exactly once through
+        ``failure_policy`` (degrade the quality channel; origin
+        ``quality_writer``) and contained -- market-data capture keeps running.
+        After the latch the failed writer is never called again and later events
+        only bump ``quality_events_lost``: no error log and no alert per event.
+        A typed fatal of any OTHER stream is re-raised (never swallowed by the
+        quality handler); an ordinary exception keeps the log-and-continue path."""
+        policy = getattr(self, "failure_policy", None)
+        if policy is not None and policy.quality_degraded is not None:
+            self.quality_events_lost += 1
+            return
         event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType):
             event_type = event_type.value
@@ -191,6 +283,11 @@ class OKXCollectorApp:
                 "connection_id": event.get("connection_id"),
                 "local_receive_ts": event.get("local_receive_ts"), "local_process_ts": int(time.time() * 1000),
             })
+        except FatalStorageError as exc:
+            if policy is None or not policy.is_quality_channel_failure(exc):
+                raise
+            policy.on_fatal(exc, origin="quality_writer")
+            self.quality_events_lost += 1
         except Exception as exc:  # noqa: BLE001 - quality write must not break ingest
             logger.error("okx_quality_write_failed", error=str(exc))
 
@@ -204,12 +301,60 @@ class OKXCollectorApp:
 
     # -- message handling ---------------------------------------------------
 
+    #: adapter channel -> the F5 route a message on that channel feeds.
+    _CHANNEL_ROUTES = {"trades": "trades", "trades-all": "trades_all", "mark-price": "markprice",
+                       "index-tickers": "indextickers", "funding-rate": "fundingrate",
+                       "open-interest": "openinterest", "liquidation-orders": "liquidation"}
+
+    def _message_route(self, data):
+        """F5 route a decoded message feeds; ``None`` when unknown. Never raises."""
+        try:
+            return self._CHANNEL_ROUTES.get(self.adapter.route_message(data)) if isinstance(data, dict) else None
+        except Exception:  # noqa: BLE001 - a routing probe must not become a new failure mode
+            return None
+
+    @staticmethod
+    def _event_route(event):
+        """The F5 route an event is persisted on (``None``: not persisted)."""
+        if isinstance(event, CanonicalTradeEvent):
+            return "trades_all" if event.stream == "trades-all" else "trades"
+        if isinstance(event, CanonicalMarkPriceEvent):
+            return {"mark-price": "markprice", "index-tickers": "indextickers",
+                    "funding-rate": "fundingrate"}.get(event.stream)
+        if isinstance(event, CanonicalOIEvent):
+            return "openinterest"
+        if isinstance(event, CanonicalLiquidationEvent):
+            return "liquidation"
+        return None
+
     async def _handle_message(self, data: dict, local_receive_ts: int, connection_id=None) -> None:
         self.messages_handled += 1
+        message_route = self._message_route(data)
+        if message_route is not None and self.failure_policy.route_is_isolated(message_route):
+            # F5: this route's writer is FAILED and the route is cut off. Skip it
+            # BEFORE normalize (which runs trade dedup): a dead route costs a
+            # counter, not an error per frame. The raw frame was captured already.
+            self.failure_policy.note_short_circuit(message_route)
+            return
+        # F5: a typed storage fatal is NOT caught here. It propagates to the
+        # websocket worker boundary (the P0-4 contract), where the client calls
+        # ``on_fatal`` -> ``failure_policy`` -> isolate the route / terminate. This
+        # handler only records which route it was serving. normalize() runs trade
+        # dedup, and the message's own channel names the route: the two OKX trade
+        # streams must not be confused.
+        served_route = message_route or "trades"
         try:
             events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
             for event in events:
+                event_route = self._event_route(event)
+                if event_route is not None and self.failure_policy.route_is_isolated(event_route):
+                    self.failure_policy.note_short_circuit(event_route)
+                    continue
+                served_route = event_route
                 self._persist_event(event)
+        except FatalStorageError as exc:
+            tag_route(exc, served_route)
+            raise
         finally:
             # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
             segment_dedup = getattr(self, "segment_dedup", None)
@@ -274,7 +419,16 @@ class OKXCollectorApp:
         await self.client.start()
 
     async def shutdown(self) -> None:
-        await self.client.stop()
+        # Every step is guarded: none may stop the writer closes below.
+        # ``WebSocketClient.stop()`` is a plain method returning ``None``;
+        # awaiting it unconditionally raised ``TypeError`` here and skipped
+        # every writer close.
+        try:
+            stopped = self.client.stop()
+            if inspect.isawaitable(stopped):
+                await stopped
+        except Exception as exc:  # noqa: BLE001
+            logger.error("okx_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "OKX")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "OKX")
         self._close_writer_reporting_failure(self.trades_all_writer, "trades_all_writer", "OKX")
@@ -314,19 +468,19 @@ class OKXCollectorApp:
                                  writer=writer_name, error=str(sink_exc))
 
 
-async def _main(data_dir: str, url: str) -> None:
+async def _main(data_dir: str, url: str) -> int:
+    """Run the collector; return the process exit status (0 for a signalled
+    stop, ``EXIT_FATAL_STORAGE`` for a terminal raw-evidence failure). The
+    application task is supervised, never left as an unobserved background task."""
     app = OKXCollectorApp(data_dir=data_dir, url=url)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
-    run_task = asyncio.ensure_future(app.run())
-    await stop.wait()
-    await app.shutdown()
-    run_task.cancel()
+    return await supervise_standalone_runner(app, stop)
 
 
 if __name__ == "__main__":
@@ -337,4 +491,4 @@ if __name__ == "__main__":
     logger.info("okx_collector_starting", url=args.url, data_dir=args.data_dir,
                note="requires outbound access to ws.okx.com:8443; "
                     "not available in every environment (see docs/EXECUTION_STATUS.md)")
-    asyncio.run(_main(args.data_dir, args.url))
+    raise SystemExit(asyncio.run(_main(args.data_dir, args.url)))

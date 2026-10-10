@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import signal
 import time
@@ -74,12 +75,20 @@ from collector.collector.config import (
     SYMBOL,
 )
 from collector.collector.backoff import ExponentialBackoff
+from collector.collector.failure_topology import FailureRecord
 from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT, InstrumentIdError
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
 from collector.collector.quality_wal import QualityEventWAL, QualityWALCorruption
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
-from collector.collector.utils import logger
+from collector.collector.standalone_failure_policy import (
+    StandaloneFailurePolicy,
+    build_stream_table,
+    supervise_standalone_runner,
+    tag_route,
+)
+from collector.collector.storage_errors import FatalStorageError
+from collector.collector.utils import logger, send_telegram_alert
 from collector.collector.websocket_client import Keepalive, WebSocketClient
 
 
@@ -123,13 +132,18 @@ class BybitCollectorApp:
         self._recover_quality_wal(self.quality_writer.stream_dir / "wal")
         self.raw_wire_writer = ParquetWriter(
             "bybit_raw_wire", RAW_WIRE_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", quality_event_sink=self._persist_quality_event)
+            exchange="BYBIT", quality_event_sink=self._writer_quality_sink)
+        # F5 raw-evidence contract: a typed fatal from the raw writer is NOT
+        # absorbed by the fail-open path; it reaches the shared client's
+        # raw-frame boundary, is classified TERMINATE by ``failure_policy`` and
+        # ends in a controlled non-zero exit.
         self.raw_capture = RawCapture(
-            self.raw_wire_writer, None, quality_event_sink=self._persist_quality_event)
+            self.raw_wire_writer, None, quality_event_sink=self._writer_quality_sink,
+            fail_closed_on_fatal_storage=True)
 
         self.ob_writer = ParquetWriter(
             "bybit_orderbook", BYBIT_ORDERBOOK_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", quality_event_sink=self._persist_quality_event)
+            exchange="BYBIT", quality_event_sink=self._writer_quality_sink)
         self.trades_writer = ParquetWriter(
             "bybit_trades", BYBIT_TRADES_SCHEMA, base_dir=data_dir, exchange="BYBIT")
         self.mark_writer = ParquetWriter(
@@ -138,6 +152,22 @@ class BybitCollectorApp:
             "bybit_openinterest", BYBIT_OPENINTEREST_SCHEMA, base_dir=data_dir, exchange="BYBIT")
         self.liq_writer = ParquetWriter(
             "bybit_liquidation", BYBIT_LIQUIDATION_SCHEMA, base_dir=data_dir, exchange="BYBIT")
+
+        # F5 failure topology for THIS runner's streams (bybit_*), built from the
+        # live writers: raw -> terminate, derived -> isolate the route, quality
+        # -> degrade, anything unlisted -> terminate (default-deny).
+        self.failure_policy = StandaloneFailurePolicy(
+            venue="BYBIT",
+            streams=build_stream_table(
+                raw=(self.raw_wire_writer,),
+                derived={self.ob_writer.stream_name: "orderbook",
+                         self.trades_writer.stream_name: "trades",
+                         self.mark_writer.stream_name: "markprice",
+                         self.oi_writer.stream_name: "openinterest",
+                         self.liq_writer.stream_name: "liquidation"},
+                quality=(self.quality_writer,), dedup_route="trades"),
+            clients=lambda: (self.client,),
+            report=self._report_storage_failure)
 
         self.adapter = BybitAdapter()
         self.adapter.set_unhandled_sink(self._record_adapter_unhandled)
@@ -163,7 +193,70 @@ class BybitCollectorApp:
                                 expect=None, timeout_s=10.0),
             backoff=ExponentialBackoff(base_delay=1.0, max_delay=30.0, max_attempts=None),
             stream_group="bybit",
+            on_fatal=self._on_fatal_storage,
         )
+
+    # -- F5 failure topology ------------------------------------------------
+
+    @property
+    def exit_code(self) -> int:
+        return self.failure_policy.exit_code
+
+    def _on_fatal_storage(self, exc, origin: str = "handler", *, route=None) -> str:
+        """Classify and latch one typed storage fatal (see ``failure_policy``).
+        Safe to call from the websocket worker: it only latches."""
+        return self.failure_policy.on_fatal(exc, origin, route=route)
+
+    def _writer_quality_sink(self, event: dict) -> None:
+        """Quality sink handed to every writer / RawCapture.
+
+        ``_persist_quality_event`` re-raises when the quality writer is FAILED. A
+        raw or derived writer calls its sink unguarded at rollover / migration /
+        orphan-drop time, so that fatal must not escape into the OTHER writer's
+        write(): the raw boundary would read it as a raw-evidence failure. A
+        typed fatal of THIS runner's quality channel is latched (degrade, once)
+        and contained; a typed fatal of any other stream and every ordinary
+        exception propagate unchanged (see ``_emit_quality_event``)."""
+        self._emit_quality_event(event)
+
+    # -- quality channel status ---------------------------------------------
+
+    @property
+    def quality_degraded(self):
+        """The latched quality-channel ``FailureRecord`` (or ``None`` while healthy)."""
+        return self.failure_policy.quality_degraded
+
+    def quality_channel_status(self) -> dict:
+        """Operator view of the quality channel. Market-data capture is unaffected by
+        a degraded channel. The three counters are disjoint and mean exactly this:
+
+        * ``quality_events_wal_only``       -- the event's quality-WAL record is established
+          (the WAL append returned); it is replayed into Parquet by the next start.
+        * ``quality_events_wal_unconfirmed`` -- the WAL append raised after assigning an id,
+          so a record MAY exist. Neither counted as retained nor as lost.
+        * ``quality_events_lost``           -- no WAL record and no usable writer: gone.
+        """
+        record = self.failure_policy.quality_degraded
+        return {"quality_degraded": record is not None,
+                "quality_events_wal_only": self._quality_events_wal_only,
+                "quality_events_wal_unconfirmed": self._quality_events_wal_unconfirmed,
+                "quality_events_lost": self._quality_events_unrecorded,
+                "quality_checkpoint_blocked": self._quality_checkpoint_is_blocked(),
+                "quality_failure": None if record is None else record.as_dict()}
+
+    def _report_storage_failure(self, record: FailureRecord) -> None:
+        """Durable record of a NEW derived/raw failure in this venue's quality
+        stream. Never called for a quality failure (the policy skips it).
+        ``_persist_quality_event`` re-raises here, so it is guarded: reporting
+        must never abort the failure path."""
+        try:
+            self._persist_quality_event({
+                "exchange": "BYBIT", "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
+                "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
+                           f"stage={record.stage}:durability={record.durability}:origin={record.origin}"),
+                "local_ts": record.first_observed_ts})
+        except Exception:  # noqa: BLE001 - the structured log line is still the record
+            logger.error("bybit_storage_failure_quality_report_failed", stream=record.stream)
 
     # -- raw capture ---------------------------------------------------
 
@@ -216,6 +309,12 @@ class BybitCollectorApp:
         self._quality_wal_inflight = set()
         self._quality_segment_seqs = set()
         self._quality_published_hwm = None
+        # F5 degraded-channel accounting (see _account_degraded_quality_event). An event
+        # counts as retained ONLY when its quality-WAL record is established.
+        self._quality_events_wal_only = 0          # WAL record established; replayed at next start
+        self._quality_events_wal_unconfirmed = 0   # WAL append failed after assigning an id: a record MAY exist
+        self._quality_events_unrecorded = 0        # no WAL record and no writer: the event is lost
+        self._quality_unrecorded_alerted = False
 
     def _ensure_quality_state(self) -> None:
         if not hasattr(self, "_quality_wal_inflight"):
@@ -345,7 +444,12 @@ class BybitCollectorApp:
             try:
                 event_id = wal.append({**event, "event_type": event_type_for_wal})
             except Exception as exc:  # noqa: BLE001 - any append failure, not only OSError
-                logger.error("bybit_quality_event_wal_append_failed_in_persist", reason=event.get("reason"))
+                _policy = getattr(self, "failure_policy", None)
+                if _policy is None or _policy.quality_degraded is None:
+                    # While the channel is degraded this failure is counted (and logged
+                    # at powers of two) by _account_degraded_quality_event instead of
+                    # being logged once per event.
+                    logger.error("bybit_quality_event_wal_append_failed_in_persist", reason=event.get("reason"))
                 failed_id = getattr(exc, "quality_event_id", None)
                 if failed_id is not None:
                     # A WAL record may exist for this seq: keep the id on the
@@ -385,19 +489,136 @@ class BybitCollectorApp:
             # contain the row.
             if _seq is not None:
                 self._quality_segment_seqs.add(_seq)
+        # ``failure_policy`` is built AFTER the writers (startup WAL recovery runs
+        # through this method before it exists), hence the getattr.
+        policy = getattr(self, "failure_policy", None)
+        if policy is not None and policy.quality_degraded is not None:
+            # F5: the quality channel is latched degraded. The event's WAL record
+            # (written above) is its durable copy and the next start replays it.
+            # Calling the FAILED writer again could only raise once per event, so
+            # it is never called -- and the event is counted as retained ONLY if
+            # its WAL protection is real.
+            self._account_degraded_quality_event(event, wal_protected=wal_protected, wal_seq=wal_seq)
+            return
         try:
             self.quality_writer.write(row, bind=_bind)
-        except Exception:
+        except Exception as exc:
             # Writer state is now uncertain: fail closed, the event stays in
             # the WAL (if it got there), and the failure is NOT swallowed.
             self._block_quality_checkpoint("quality_writer_write_failed")
+            self._note_quality_writer_failure(exc)
+            self._account_tripping_quality_event(exc, event, wal_protected=wal_protected, wal_seq=wal_seq)
             raise
         if not wal_protected:
             try:
                 self.quality_writer.publish_open_segment()
-            except Exception:
+            except Exception as exc:
                 self._block_quality_checkpoint("unprotected_event_publish_failed")
+                self._note_quality_writer_failure(exc)
+                self._account_tripping_quality_event(exc, event, wal_protected=wal_protected, wal_seq=wal_seq)
                 raise
+
+    def _note_quality_writer_failure(self, exc: BaseException) -> None:
+        """Latch the quality channel degraded when ITS writer raised a typed fatal.
+
+        Only a typed fatal that Bybit's OWN failure policy maps to the quality channel
+        is latched here. Any other exception -- an ordinary one, or a typed fatal of
+        another stream -- is left to propagate to the boundary that classifies it, so
+        this path can neither swallow nor re-label it. Never calls ``quality_writer``
+        or ``_persist_quality_event``: a failed quality writer cannot recurse into
+        itself, and the policy never reports a quality failure through the quality
+        writer (``StandaloneFailurePolicy._report``)."""
+        policy = getattr(self, "failure_policy", None)
+        if policy is not None and policy.quality_degraded is None and policy.is_quality_channel_failure(exc):
+            policy.on_fatal(exc, origin="quality_writer")
+
+    def _account_tripping_quality_event(self, exc: BaseException, event: dict, *,
+                                        wal_protected: bool, wal_seq) -> None:
+        """Account the event whose own write latched the quality channel degraded.
+
+        It is counted by exactly the rules that apply to every later event
+        (``_account_degraded_quality_event``). Only a typed fatal that really
+        degraded the channel qualifies: an ordinary exception, or a fatal that was
+        classified otherwise, leaves the counters alone. Never raises, so the
+        caller's ``raise`` of the original exception is never replaced."""
+        try:
+            policy = getattr(self, "failure_policy", None)
+            if policy is not None and policy.quality_degraded is not None and policy.is_quality_channel_failure(exc):
+                self._account_degraded_quality_event(event, wal_protected=wal_protected, wal_seq=wal_seq)
+        except Exception as account_exc:  # noqa: BLE001 - accounting must not mask the original failure
+            logger.error("bybit_quality_event_accounting_failed",
+                         error=f"{type(account_exc).__name__}: {account_exc}")
+
+    def _account_degraded_quality_event(self, event: dict, *, wal_protected: bool, wal_seq) -> None:
+        """Count one event that arrived while the quality channel is degraded.
+
+        * ``wal_protected`` -> its WAL record is established: ``_quality_events_wal_only``.
+        * ``wal_seq`` only  -> the append raised after assigning an id (bytes written,
+          fsync failed): a record MAY exist. Not proven, so NOT "retained"; its seq is
+          already in-flight, which pins the checkpoint below it.
+        * neither           -> no WAL record and the writer is dead: the event is LOST.
+          Counted as unrecorded, never as retained, and never written through the
+          failed writer: a bounded log line (first, then powers of two) plus ONE
+          operator alert.
+
+        Nothing here advances a checkpoint, calls ``quality_writer`` or raises."""
+        if wal_protected:
+            self._quality_events_wal_only += 1
+            return
+        if wal_seq is not None:
+            self._quality_events_wal_unconfirmed += 1
+            unconfirmed = self._quality_events_wal_unconfirmed
+            if unconfirmed & (unconfirmed - 1) == 0:      # bounded: first, then powers of two
+                try:
+                    logger.error("bybit_quality_event_wal_unconfirmed", count=unconfirmed,
+                                 stream=event.get("stream"), reason=event.get("reason"))
+                except Exception:  # noqa: BLE001 - logging must never raise into market data
+                    pass
+            return
+        count = self._quality_events_unrecorded + 1
+        self._quality_events_unrecorded = count
+        try:
+            if not self._quality_checkpoint_is_blocked():
+                self._block_quality_checkpoint("quality_event_unrecorded")
+            if count & (count - 1) == 0:            # 1, 2, 4, 8, ...: bounded, never one line per event
+                logger.error("bybit_quality_event_unrecorded", count=count, stream=event.get("stream"),
+                             event_type=str(event.get("event_type")), reason=event.get("reason"),
+                             wal_only=self._quality_events_wal_only)
+            if not self._quality_unrecorded_alerted:
+                self._quality_unrecorded_alerted = True
+                send_telegram_alert(
+                    "QUALITY EVENTS UNRECORDED [BYBIT]: the quality channel is degraded and the quality WAL "
+                    "could not record events (market data and raw capture unaffected; quality telemetry "
+                    "is being lost)")
+        except Exception as exc:  # noqa: BLE001 - reporting a loss must never raise into market data
+            logger.error("bybit_quality_event_unrecorded_report_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _emit_quality_event(self, event: dict) -> bool:
+        """Quality telemetry from a MARKET-DATA path (book transitions, adapter
+        unhandled/duplicate messages, writer sinks, websocket events).
+
+        ``_persist_quality_event`` keeps its contract -- it raises when the quality
+        writer fails -- because startup replay, the shutdown reports and the
+        failure reporter need that to hold the checkpoint back. A market-data task
+        needs the opposite: telemetry failing must not take the task down.
+
+        Contained here, and ONLY here: a typed fatal that Bybit's own failure policy
+        classifies as a failure of ITS quality channel (``_persist_quality_event``
+        has already latched the channel, blocked the checkpoint and reported it once
+        through the recursion-safe path; the event itself is in the WAL). Everything
+        else propagates unchanged: an ordinary exception (P0-1) and a typed fatal of
+        any OTHER stream, which is never quality telemetry. Returns ``True`` when the
+        event reached the writer."""
+        try:
+            self._persist_quality_event(event)
+        except FatalStorageError as exc:
+            policy = getattr(self, "failure_policy", None)
+            if policy is None or not policy.is_quality_channel_failure(exc):
+                raise                  # cannot be classified as OUR quality channel: never swallowed
+            if policy.quality_degraded is None:
+                self._note_quality_writer_failure(exc)
+            return False
+        return True
 
     def _on_client_quality_event(self, event_type: str, reason: str,
                                  connection_id=None, stream_group=None) -> None:
@@ -406,12 +627,14 @@ class BybitCollectorApp:
         and from its except-branch out of the connection loop). So this
         boundary -- and only this one -- does not re-raise: a persistence
         failure is logged at ERROR and the checkpoint is already latched by
-        _persist_quality_event, leaving any WAL copy for restart recovery."""
+        _persist_quality_event, leaving any WAL copy for restart recovery.
+        A quality-channel fatal is contained by ``_emit_quality_event`` (latched and
+        reported once there), so this handler logs only for a NEW kind of failure."""
         try:
-            self._persist_quality_event({"stream": stream_group or "bybit_websocket",
-                                         "event_type": event_type, "reason": reason,
-                                         "connection_id": connection_id,
-                                         "local_ts": int(time.time() * 1000)})
+            self._emit_quality_event({"stream": stream_group or "bybit_websocket",
+                                      "event_type": event_type, "reason": reason,
+                                      "connection_id": connection_id,
+                                      "local_ts": int(time.time() * 1000)})
         except Exception:  # noqa: BLE001
             logger.error("bybit_websocket_quality_event_persist_failed",
                          event_type=event_type, reason=reason)
@@ -425,17 +648,85 @@ class BybitCollectorApp:
         Added here because trade deduplication's DUPLICATE quality event
         would otherwise be silently invisible for Bybit specifically,
         undermining this feature's cross-venue uniformity -- a direct
-        prerequisite for this task, not unrelated scope creep."""
-        self._persist_quality_event(message.to_quality_event())
+        prerequisite for this task, not unrelated scope creep.
+
+        F5: this runs INSIDE ``adapter.normalize()``, i.e. on the market-data path,
+        and the adapter invokes its sink under ``except Exception: pass``
+        (``ExchangeAdapter.unhandled``: "sink must never break ingest"). So:
+
+        * a quality-channel failure goes through ``_emit_quality_event``: latched
+          and reported ONCE here, instead of being swallowed by the adapter with the
+          dead writer called again for every duplicate / unrouted frame;
+        * a typed fatal that is NOT this channel's quality failure would be dropped
+          silently by that catch-all, so it is handed to the failure policy BEFORE
+          it propagates (classified by its own stream: terminate / isolate) and then
+          re-raised unchanged for any direct caller;
+        * an ordinary exception keeps the adapter's P0-1 behaviour (ingest goes on)."""
+        try:
+            self._emit_quality_event(message.to_quality_event())
+        except FatalStorageError as exc:
+            policy = getattr(self, "failure_policy", None)
+            if policy is not None:
+                policy.on_fatal(exc, origin="adapter_unhandled")
+            raise
 
     # -- message handling --------------------------------------------------
 
+    #: adapter route -> the F5 routes a message of that route feeds.
+    _MESSAGE_ROUTES = {"orderbook": ("orderbook",), "trades": ("trades",),
+                       "ticker": ("markprice", "openinterest"), "liquidation": ("liquidation",)}
+
+    def _message_routes(self, data) -> tuple:
+        """F5 routes a decoded message feeds; ``()`` when unknown. Never raises."""
+        try:
+            return self._MESSAGE_ROUTES.get(self.adapter.route_message(data), ()) if isinstance(data, dict) else ()
+        except Exception:  # noqa: BLE001 - a routing probe must not become a new failure mode
+            return ()
+
+    @staticmethod
+    def _event_route(event):
+        """The F5 route an event is persisted on (``None``: not persisted)."""
+        if isinstance(event, CanonicalOrderBookEvent):
+            return "orderbook"
+        if isinstance(event, CanonicalTradeEvent):
+            return "trades"
+        if isinstance(event, CanonicalMarkPriceEvent):
+            return "markprice"
+        if isinstance(event, CanonicalOIEvent):
+            return "openinterest"
+        if isinstance(event, CanonicalLiquidationEvent):
+            return "liquidation"
+        return None
+
     async def _handle_message(self, data: dict, local_receive_ts: int, connection_id=None) -> None:
         self.messages_handled += 1
+        routes = self._message_routes(data)
+        if routes and all(self.failure_policy.route_is_isolated(r) for r in routes):
+            # F5: every route this message feeds is cut off. Skip BEFORE
+            # normalize (which runs trade dedup): a dead route costs a counter,
+            # not an error per frame. The raw frame was captured already.
+            for route in routes:
+                self.failure_policy.note_short_circuit(route)
+            return
+        # F5: a typed storage fatal is NOT caught here. It propagates to the
+        # websocket worker boundary (the P0-4 contract), where the client calls
+        # ``on_fatal`` -> ``failure_policy`` -> isolate the route / terminate. This
+        # handler only records which route it was serving, so a failure that names
+        # a generic stream (``DedupStateError`` -> ``trades``) is still attributed
+        # to the right route.
+        served_route = "trades"          # normalize() runs trade dedup
         try:
             events = self.adapter.normalize(data, local_receive_ts=local_receive_ts)
             for event in events:
+                event_route = self._event_route(event)
+                if event_route is not None and self.failure_policy.route_is_isolated(event_route):
+                    self.failure_policy.note_short_circuit(event_route)
+                    continue
+                served_route = event_route
                 self._persist_event(event)
+        except FatalStorageError as exc:
+            tag_route(exc, served_route)
+            raise
         finally:
             # P0-4: message boundary on EVERY exit path (see SegmentDedupHandle.end_message).
             segment_dedup = getattr(self, "segment_dedup", None)
@@ -495,7 +786,10 @@ class BybitCollectorApp:
         applied = self.book.apply(event)
         after = self.book.state.state
         if before is not after:
-            self._persist_quality_event({
+            # F5: a book-state event is telemetry. If the quality channel is down it
+            # is latched/accounted by ``_emit_quality_event`` and the (VALID) order-book
+            # row below is still written; it must never stop this route.
+            self._emit_quality_event({
                 "stream": "bybit_orderbook", "event_type": QualityEventType.SEQUENCE_GAP.value
                 if after in (BookQuality.SEQUENCE_GAP, BookQuality.RECOVERING)
                 else QualityEventType.RECOVERY.value,
@@ -530,7 +824,16 @@ class BybitCollectorApp:
 
     async def shutdown(self) -> None:
         self.running = False
-        await self.client.stop()
+        # Every step is guarded: none may stop the writer closes below.
+        # ``WebSocketClient.stop()`` is a plain method returning ``None``;
+        # awaiting it unconditionally raised ``TypeError`` here and skipped
+        # every writer close.
+        try:
+            stopped = self.client.stop()
+            if inspect.isawaitable(stopped):
+                await stopped
+        except Exception as exc:  # noqa: BLE001
+            logger.error("bybit_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")
@@ -584,20 +887,19 @@ class BybitCollectorApp:
         return closed_ok
 
 
-async def _main(data_dir: str, url: str) -> None:
+async def _main(data_dir: str, url: str) -> int:
+    """Run the collector; return the process exit status (0 for a signalled
+    stop, ``EXIT_FATAL_STORAGE`` for a terminal raw-evidence failure). The
+    application task is supervised, never left as an unobserved background task."""
     app = BybitCollectorApp(data_dir=data_dir, url=url)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass  # not available on this platform
-
-    run_task = asyncio.ensure_future(app.run())
-    await stop.wait()
-    await app.shutdown()
-    run_task.cancel()
+    return await supervise_standalone_runner(app, stop)
 
 
 if __name__ == "__main__":
@@ -609,4 +911,4 @@ if __name__ == "__main__":
     logger.info("bybit_collector_starting", url=args.url, data_dir=args.data_dir,
                note="requires outbound access to stream.bybit.com:443; "
                     "not available in every environment")
-    asyncio.run(_main(args.data_dir, args.url))
+    raise SystemExit(asyncio.run(_main(args.data_dir, args.url)))

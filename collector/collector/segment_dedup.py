@@ -70,6 +70,7 @@ from .publication import (
     classify_segment, confirm_unmarked, fs_guard, fsync_dir, marker_path, orphan_marker, preserve_invalid,
     read_marker, read_segment_table, sha256_bytes,
 )
+from .storage_errors import FatalStorageError
 from .utils import logger
 
 #: ``PRAGMA user_version`` of the current index layout. History: 0/1 = no
@@ -91,10 +92,22 @@ UNIDENTIFIED = "<unidentified>"
 SegmentToken = Tuple[str, int]
 
 
-class DedupStateError(RuntimeError):
+class DedupStateError(FatalStorageError):
     """The dedup state cannot be established. Callers must stop ingestion for
     the affected stream -- never continue as if the identity were unseen or
-    already seen."""
+    already seen.
+
+    F5: participates in the typed fatal-storage hierarchy (``isinstance(exc,
+    FatalStorageError)``) while keeping its own name, its message-only
+    constructor and its ``RuntimeError`` ancestry. Its failure domain is the
+    trades route: the dedup index only ever guards the trade stream, so the
+    defaults below name that stream and the ``dedup`` component."""
+
+    def __init__(self, *args: object, stream: Optional[str] = "trades",
+                 component: Optional[str] = "dedup", stage: Optional[str] = "dedup_state",
+                 durability: Optional[str] = None) -> None:
+        super().__init__(*args, stream=stream, component=component, stage=stage,
+                         durability=durability)
 
 
 def dedup_identity_key(exchange: str, market_type: str, instrument_key: str,

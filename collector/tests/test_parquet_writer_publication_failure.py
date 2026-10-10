@@ -12,6 +12,7 @@ re-implements writer logic.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import stat
 from pathlib import Path
@@ -22,10 +23,38 @@ import pytest
 
 from collector.collector import parquet_writer as pw_module
 from collector.collector.parquet_writer import ParquetWriter
+from collector.collector.storage_errors import FatalStorageError
 
 SCHEMA = pa.schema([("timestamp", pa.int64()), ("value", pa.float64())])
 REAL_REPLACE = os.replace
 REAL_FSYNC = os.fsync
+
+
+@contextlib.contextmanager
+def expect_fatal(cause=OSError, *, stage=None, durability=None, stream=None):
+    """F5: the FIRST writer failure is a typed ``FatalStorageError`` -- not the
+    raw ``OSError`` any more -- and the original exception survives on
+    ``__cause__``, so stage-specific evidence (ENOSPC, EIO ...) is preserved.
+
+    This replaces ``pytest.raises(OSError)`` without weakening it: it still
+    pins WHICH low-level failure happened (``cause``) and, where given, which
+    publication stage / durability the writer reports. ``FatalStorageError``
+    must never itself be an ``OSError`` (an ``except OSError`` meant for a
+    recoverable condition elsewhere must not swallow a fatal storage failure).
+    """
+    with pytest.raises(FatalStorageError) as info:
+        yield info
+    error = info.value
+    assert not isinstance(error, OSError), "FatalStorageError must not inherit OSError"
+    assert isinstance(error.__cause__, cause), (
+        f"original failure must be chained on __cause__; got {error.__cause__!r}")
+    if stage is not None:
+        assert error.stage == stage, (error.stage, stage)
+    if durability is not None:
+        assert error.durability == durability, (error.durability, durability)
+    if stream is not None:
+        assert error.stream == stream, (error.stream, stream)
+    assert error.component == "parquet_writer"
 
 
 def _row(i: int) -> dict:
@@ -92,7 +121,7 @@ def test_1_os_replace_failure_fails_closed_and_publishes_nothing(tmp_path, monke
     w.flush()
     _fail_replace_to(monkeypatch, ".seg")
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     _assert_fails_closed(w)
@@ -114,7 +143,7 @@ def test_1b_os_replace_failure_during_hour_rollover_does_not_admit_the_triggerin
     next_hour = w.current_hour[:-2] + f"{(int(w.current_hour[-2:]) + 1) % 24:02d}"
     monkeypatch.setattr(w, "_get_current_hour_str", lambda: next_hour)
     _fail_replace_to(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.write(_row(1))                              # rollover publishes the old segment -> fails
     assert w.buffer == [], "the triggering row must not be appended to any segment"
     _assert_fails_closed(w)
@@ -129,7 +158,7 @@ def test_2_directory_fsync_failure_after_rename_is_uncertain_and_fails_closed(tm
     w.flush()
     _fail_dir_fsync(monkeypatch)
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     _assert_fails_closed(w)
@@ -159,7 +188,7 @@ def test_3_parquet_writer_close_failure_fails_closed(tmp_path):
     pq_handle = w.writer
     pq_handle.close = boom                            # instance attribute: the real pq writer
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     _assert_fails_closed(w)
@@ -182,7 +211,7 @@ def test_3b_flush_failure_fails_closed_and_accounts_unflushed_rows(tmp_path, mon
         raise OSError(28, "No space left on device (injected write_table)")
     monkeypatch.setattr(w.writer, "write_table", boom)
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     _assert_fails_closed(w)
@@ -200,7 +229,7 @@ def test_3c_failure_to_open_the_next_segment_fails_closed(tmp_path, monkeypatch)
         raise OSError(24, "Too many open files (injected)")
     monkeypatch.setattr(pw_module.pq, "ParquetWriter", boom)
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()                      # publishes fine, cannot open the next one
 
     assert len(published) == 1 and len(_segs(w, "*.seg")) == 1, "the published segment is untouched"
@@ -322,7 +351,7 @@ def test_6_restart_after_failed_publication_recovers_tmp_with_durable_drop_and_n
         w.write(_row(i))
     w.flush()
     _fail_replace_to(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     with pytest.raises(RuntimeError):
         w.close()                                     # the process "shuts down" with the failure
@@ -398,9 +427,10 @@ def test_sink_failure_cannot_mask_the_storage_error_or_unlatch_the_writer(tmp_pa
     w.write(_row(0))
     w.write(_row(1))
     _fail_replace_to(monkeypatch, ".seg", OSError(28, "No space left on device (injected)"))
-    with pytest.raises(OSError) as info:
+    with expect_fatal(OSError, stage="rename") as info:
         w.publish_open_segment()
-    assert info.value.errno == 28, "the ORIGINAL storage error must surface, not the sink's"
+    assert info.value.__cause__.errno == 28, \
+        "the ORIGINAL storage error must surface (chained on __cause__), not the sink's"
     _assert_fails_closed(w)
 
 
@@ -408,7 +438,7 @@ def test_failed_writer_without_any_sink_still_fails_closed(tmp_path, monkeypatch
     w = ParquetWriter("s", SCHEMA, base_dir=str(tmp_path))      # e.g. quality_writer itself
     w.write(_row(0))
     _fail_replace_to(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     _assert_fails_closed(w)
 
