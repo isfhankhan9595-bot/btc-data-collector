@@ -15,7 +15,11 @@ Contract under test
   after every writer is closed, and never mask an existing failure, change the exit
   status, or stop writer cleanup, even when logging itself raises;
 * ``quality_channel_status()`` gains ``quality_wal: False`` and every loss report says
-  the runner has no quality WAL and that lost events cannot be recovered;
+  what "lost" means (not durably published through the supported quality-storage path),
+  that the runner provides no supported quality WAL for replay or recovery, and that an
+  unpublished ``.tmp`` file may remain but is not guaranteed to be complete, recoverable
+  or authoritative. No report claims an event "cannot be recovered", and an unconfirmed
+  event is never called lost or retained;
 * a quality-only failure never ends otherwise healthy market-data / raw ingestion;
 * the three runners behave identically.
 
@@ -191,10 +195,20 @@ def test_a_loss_report_is_honest_about_the_missing_wal_and_stays_bounded_in_size
         _degrade(app, monkeypatch)
         app._persist_quality_event({"event_type": "ERROR", "stream": "s", "reason": "x" * 5000})
         (record,) = _records(caplog, LOSS_SUFFIX)
+        note = record["note"]
 
         assert record["quality_wal"] is False and record["count"] == 1
-        assert "no quality WAL" in record["note"] and "cannot be recovered" in record["note"]
-        assert "retained" not in record["note"] and "replay" not in record["note"].lower()
+        # what "lost" means: not durably published through the supported quality-storage path
+        assert "counted as lost: not durably published through the supported quality-storage path" in note
+        # no supported WAL: the words "replay"/"recovery" appear only inside that negation
+        assert "provides no supported quality WAL for replay or recovery" in note
+        # an unpublished .tmp is never presented as a recoverable or valid durable record
+        assert "unpublished .tmp file may remain but is not guaranteed to be complete, recoverable or authoritative" in note
+        # no absolute or positive claim in either direction, and no unconfirmed wording on a lost event
+        for claim in ("cannot be recovered", "unrecoverable", "is gone", "can be recovered", "will be replayed",
+                      "retained", "neither confirmed"):
+            assert claim not in note.lower(), f"loss report must not say {claim!r}: {note!r}"
+        assert len(note) <= 300, "the loss note is a fixed, bounded operator message"
         assert len(record["reason"]) == 200 and record["event_type"] == "ERROR"
     finally:
         _cleanup_any(app)
@@ -228,6 +242,9 @@ def test_lost_and_unconfirmed_are_reported_distinctly_per_trigger_stage(kind, fa
             assert record["event"] == f"{PREFIX[kind]}{UNCONFIRMED_SUFFIX}" and "lost" not in record["event"]
             assert "neither confirmed lost nor confirmed retained" in record["note"]
             assert "cannot be recovered" not in record["note"], "an unconfirmed event must not be called unrecoverable"
+            # nor definitely lost (the lost wording), nor given the lost-event .tmp / no-WAL outcome
+            for claim in ("counted as lost", "not durably published", "unrecoverable", "is gone", ".tmp"):
+                assert claim not in record["note"].lower(), f"unconfirmed report must not say {claim!r}"
         for record in loss:
             assert "unconfirmed" not in record["event"]
     finally:
@@ -295,7 +312,12 @@ def test_shutdown_reports_the_final_counts_once_and_still_closes_every_writer(ki
         assert final["event"] == f"{PREFIX[kind]}{FINAL_SUFFIX}"
         assert final["quality_degraded"] is True and final["quality_wal"] is False
         assert (final["quality_events_lost"], final["quality_events_unconfirmed"]) == (N_EVENTS - 1, 1)
-        assert "no quality WAL" in final["note"] and "neither confirmed lost nor confirmed retained" in final["note"]
+        note = final["note"]
+        assert "no supported quality WAL" in note and "neither confirmed lost nor confirmed retained" in note
+        assert "not guaranteed to be complete, recoverable or authoritative" in note
+        for claim in ("cannot be recovered", "unrecoverable", "is gone", "can be recovered", "will be replayed"):
+            assert claim not in note.lower(), f"final report must not say {claim!r}: {note!r}"
+        assert len(note) <= 400, "the final note is a fixed, bounded operator message"
         _assert_all_closed(app)
 
         _shutdown(app)                                      # shutdown is repeatable; the report is not

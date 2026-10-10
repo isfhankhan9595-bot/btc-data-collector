@@ -276,15 +276,24 @@ class StandaloneFailurePolicy:
         self.route_short_circuits[route] = self.route_short_circuits.get(route, 0) + 1
 
 
-#: Said in every loss report, and in the status as ``quality_wal: False``: these
-#: runners (Binance Spot, OKX, OKX capture-only) have NO quality WAL, so a quality
-#: event that was not persisted is gone. Nothing here can recover it.
-NO_QUALITY_WAL_NOTE = ("this runner keeps no quality WAL: an event counted as lost is gone and "
-                       "cannot be recovered")
+#: Said in every loss report, and in the status as ``quality_wal: False``. "Lost"
+#: means the event was not durably published through the supported quality-storage
+#: path. These runners (Binance Spot, OKX, OKX capture-only) provide no supported
+#: quality WAL for replay or recovery, and an unpublished ``.tmp`` file that may
+#: remain is not a durable record: it is not guaranteed to be complete, recoverable
+#: or authoritative. The text makes no claim beyond that.
+NO_QUALITY_WAL_NOTE = ("counted as lost: not durably published through the supported quality-storage "
+                       "path; this runner provides no supported quality WAL for replay or recovery; "
+                       "an unpublished .tmp file may remain but is not guaranteed to be complete, "
+                       "recoverable or authoritative")
 
 #: An ``unconfirmed`` event is never given a definite outcome.
 UNCONFIRMED_QUALITY_EVENT_NOTE = ("durability could not be established: the event is neither "
                                   "confirmed lost nor confirmed retained")
+
+#: The unconfirmed clause of the final shutdown report (same meaning, counter-level).
+_FINAL_UNCONFIRMED_CLAUSE = ("unconfirmed events: durability could not be established, so each is "
+                             "neither confirmed lost nor confirmed retained")
 
 #: Longest ``reason`` copied into a loss log line (a log line must stay bounded).
 _LOSS_LOG_REASON_MAX = 200
@@ -316,7 +325,7 @@ class DegradedQualityLossReporting:
     quality_log_prefix: str = "runner"
 
     def _count_quality_event_lost(self, event: Optional[Mapping[str, Any]] = None) -> None:
-        """One quality event demonstrably not persisted (and unrecoverable: no WAL)."""
+        """One quality event demonstrably not durably published (no supported quality WAL)."""
         self.quality_events_lost += 1
         count = self.quality_events_lost
         if is_bounded_report_point(count):
@@ -367,7 +376,7 @@ class DegradedQualityLossReporting:
             logger.error(
                 f"{self.quality_log_prefix}_quality_channel_final", quality_degraded=degraded,
                 quality_events_lost=lost, quality_events_unconfirmed=unconfirmed, quality_wal=False,
-                note=f"{NO_QUALITY_WAL_NOTE}; unconfirmed events are neither confirmed lost nor confirmed retained")
+                note=f"{NO_QUALITY_WAL_NOTE}; {_FINAL_UNCONFIRMED_CLAUSE}")
         except Exception:  # noqa: BLE001 - a final report must never mask a failure or stop cleanup
             pass
 
