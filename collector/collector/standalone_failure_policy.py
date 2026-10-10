@@ -45,6 +45,7 @@ from .failure_topology import (
     VERDICT_ISOLATE,
     VERDICT_TERMINATE,
     FailureRecord,
+    classify_stream,
 )
 from .storage_errors import FatalStorageError
 from .utils import logger, send_telegram_alert
@@ -184,6 +185,13 @@ class StandaloneFailurePolicy:
         if record.verdict == VERDICT_ISOLATE and route is not None and record.route != route:
             record = dataclasses.replace(record, route=route)
         return self._latch(record)
+
+    def is_quality_channel_failure(self, exc: BaseException) -> bool:
+        """True only for a TYPED fatal this runner's OWN table maps to the quality
+        channel (venue-prefixed names such as ``bybit_quality_events``; never the
+        USD-M default table, never message text). Pure: latches nothing."""
+        return (isinstance(exc, FatalStorageError)
+                and classify_stream(exc.stream, table=self._streams)[0] == VERDICT_DEGRADE_QUALITY)
 
     def _latch(self, record: FailureRecord) -> str:
         key = record.key if record.verdict != VERDICT_ISOLATE else f"{record.key}@{record.route}"

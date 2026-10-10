@@ -745,7 +745,8 @@ def test_quality_writer_failure_degrades_the_channel_without_killing_healthy_raw
 
     # later events: no writer call, no per-event raise/log flood; the WAL copy is the durable record
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "later"})
-    assert app._quality_events_wal_only == 1
+    # both events have an established WAL record: "first" (which tripped the writer) and "later"
+    assert app._quality_events_wal_only == 2
     assert {"first", "later"} <= {e["reason"] for e in _wal_events(app)}
 
     # raw capture is untouched

@@ -106,16 +106,27 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
   * `ParquetWriter._deliver_to_sink` stops a quality-channel fatal raised by the *sink* from
     surfacing as the **emitting writer's** failure (the unguarded migration / crashed-segment
     `DATA_DROP` paths inside `write()`). Without it, a quality failure carried through a `raw_wire`
-    write was classified at the raw-frame boundary, which is TERMINATE by construction.
+    write was classified at the raw-frame boundary, which is TERMINATE by construction. Its classification
+    uses the **default (USD-M) stream table**, i.e. it recognises `quality_events` only. Venue runners whose
+    quality sink re-raises must contain their own quality stream themselves: Bybit does so in
+    `_writer_quality_sink`, which uses the runner's own table (`StandaloneFailurePolicy.is_quality_channel_failure`),
+    latches the degrade once and re-raises every other typed fatal. Spot, OKX and OKX capture-only swallow
+    quality-write exceptions inside their own `_persist_quality_event` (a log line per event, as on base), so
+    nothing escapes their sinks.
   * Genuine raw (`raw_wire`/`raw_rest`) fatals still terminate; derived-writer fatals still isolate
     their route; a failed quality writer is never called again and never resurrected in-process.
-* **Degraded-channel accounting (remediation Part 2A)** — for each event arriving after the channel
-  degraded: `_quality_events_wal_only` = WAL record established (replayed on next start);
+* **Degraded-channel accounting (remediation Parts 2A/2B)** — for each event that reaches the degraded
+  channel, **including the event whose own write tripped the quality writer** (Part 2B: it was
+  previously left out of the count although its WAL record was already durable): `_quality_events_wal_only` = WAL record established (replayed on next start);
   `_quality_events_wal_unconfirmed` = the append failed *after* assigning an id (a record may exist; its
   seq pins the checkpoint, but it is not claimed retained); `_quality_events_unrecorded` = no WAL
   record and no writer: the event is **lost**, reported as such (bounded log: first, then powers of two;
   one operator alert) and never through the failed writer. No path advances a checkpoint over an event
-  whose durability is unproven.
+  whose durability is unproven. The counters are a lower bound of events whose only durable copy is the
+  WAL: rows already buffered in the failed segment before the trip are held by their in-flight seqs
+  (checkpoint blocked) but are not added to `_quality_events_wal_only`. An ordinary (non-typed) quality
+  writer exception is not degraded-channel accounting. These counters exist in the Binance USD-M
+  `CollectorApp` only.
 * **Shutdown** — unchanged order. A failed writer's `close()` raising does not stop the other
   writers from closing (`_close_writer_reporting_failure`).
 
@@ -215,13 +226,23 @@ F5 requires `RAW EVIDENCE → production replay path → authoritative canonical
 contacting the exchange. It does **not** claim, and nothing here verifies, exact reproduction of
 the feature-Parquet outputs.
 
+## Part 2B: client lifecycle and exact queue accounting
+
+* `WebSocketClient.start()` refuses a client that is already latched in discard mode: it connects to nothing,
+  enqueues nothing and runs only the shutdown tail (a latched fatal with no classifier is still raised). A
+  connection that completes *after* the latch landed is dropped before `on_reconnect`, the CONNECT quality
+  event and the subscribe. A fresh client starts exactly as before.
+* The full-queue wait re-checks `running` after its sleep, immediately before the next `put_nowait`. Before, a
+  producer parked on a full queue could enqueue one item after the worker had drained and exited (for discard
+  mode and for an ordinary `stop()`), leaving `join()` to wait out the drain timeout. Such a frame is now counted
+  in `frames_abandoned_at_shutdown` and reported; `task_done()` stays exactly once per queued item.
+* Idle secondary client (observed, not changed): a client blocked in `recv()` on a quiet socket does not see the
+  latch until a frame arrives, on base as well. The terminal contract does not depend on it: the supervisor cancels
+  the client task and the worker exits by itself. Covered by a test.
+
 ## Not changed
 
-F1 publication semantics, the P0-1 queue design, replay, the systemd unit, and `WebSocketClient`
-itself (including the fact that `start()` sets `running = True` unconditionally: calling it again on a
-client that is already in discard mode would reconnect. Nothing does: the application starts it once and
-the supervisor cancels, never restarts, the task. This is observed, not changed, and not covered by a
-guard test).
+F1 publication semantics, the P0-1 queue design, replay and the systemd unit.
 
 ## Not verified
 

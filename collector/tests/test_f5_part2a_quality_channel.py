@@ -155,7 +155,9 @@ def test_F3_drains_keep_going_after_a_quality_channel_failure(app, monkeypatch):
     app.binance_book.drain_quality_events = lambda: list(events)
     app._drain_integrity_quality_events()                              # strict hot-path drain
     assert {e["reason"] for e in _wal_events(app)} >= {f"integrity{i}" for i in range(5)}
-    assert app._quality_events_wal_only == 4
+    # integrity0 tripped the writer and integrity1..4 arrived degraded: all five have a durable
+    # WAL record, so all five are WAL-retained (the tripping event used to be left out).
+    assert app._quality_events_wal_only == 5
 
 
 def test_F3_unrouted_frame_survives_a_quality_channel_failure(app, monkeypatch):
@@ -263,7 +265,9 @@ def test_F3_no_error_flood_after_the_channel_is_degraded(app, monkeypatch):
         app._emit_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": f"e{i}"})
     assert writes["n"] == 1, "the failed writer is never resurrected or re-called"
     assert app.failure_repeats == {}, "no repeated latch/report churn per event"
-    assert app._quality_events_wal_only == 199
+    # All 200 have an established WAL record, including e0, the event whose write
+    # tripped the writer (it was previously left out of the count: F-4 follow-up).
+    assert app._quality_events_wal_only == 200
 
 
 def test_F3_idle_publish_failure_latches_degraded_and_reports_once(app, monkeypatch):
@@ -327,14 +331,14 @@ def test_F4_failed_wal_append_is_not_counted_as_wal_retained(app, monkeypatch, a
     ``_quality_events_wal_only`` counted all three."""
     writes = _degrade(app, monkeypatch)
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "B-wal-ok"})
-    assert app._quality_events_wal_only == 1
+    assert app._quality_events_wal_only == 2, "A (tripped the writer, WAL record established) and B"
 
     ckpt_before = qed._disk_ckpt(tmp_path)
     _wal_append_fails(app, monkeypatch)
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "C-no-wal"})   # no raise
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "D-no-wal"})
 
-    assert app._quality_events_wal_only == 1, "C and D are NOT WAL-retained"
+    assert app._quality_events_wal_only == 2, "C and D are NOT WAL-retained"
     assert app._quality_events_unrecorded == 2, "...they are reported as unrecorded"
     assert writes["n"] == 1, "fallback reporting never touched the failed quality writer"
     reasons = {e["reason"] for e in _wal_events(app)}
@@ -349,7 +353,7 @@ def test_F4_event_without_wal_protection_is_not_counted_as_retained(app, monkeyp
     writes = _degrade(app, monkeypatch)
     app._quality_wal = None                                  # no WAL at all: nothing can protect the event
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "no-wal-at-all"})
-    assert app._quality_events_wal_only == 0
+    assert app._quality_events_wal_only == 1, "only A (the tripping event, which DID have a WAL record)"
     assert app._quality_events_unrecorded == 1
     assert writes["n"] == 1
 
@@ -360,7 +364,7 @@ def test_F4_wal_append_with_a_possible_record_is_unconfirmed_and_pins_the_checkp
     _degrade(app, monkeypatch)
     _wal_append_fails(app, monkeypatch, quality_event_id="evt-0000000000000099")
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "maybe-in-wal"})
-    assert app._quality_events_wal_only == 0
+    assert app._quality_events_wal_only == 1, "only A; the unconfirmed append is not added to the retained count"
     assert app._quality_events_wal_unconfirmed == 1
     assert 99 in app._quality_wal_inflight, "an unproven seq pins the checkpoint below it"
     assert app._quality_events_unrecorded == 0, "a record may exist: not claimed lost either"
@@ -372,7 +376,7 @@ def test_F4_event_with_wal_provenance_still_counts_as_retained(app, monkeypatch)
     seq = int(event_id.rsplit("-", 1)[-1])
     app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "provenance",
                                 "quality_event_id": event_id, "_wal_seq": seq})
-    assert app._quality_events_wal_only == 1 and app._quality_events_unrecorded == 0
+    assert app._quality_events_wal_only == 2 and app._quality_events_unrecorded == 0   # A + the provenance event
 
 
 def test_F4_loss_reporting_is_bounded_and_never_floods(app, monkeypatch, alerts):
@@ -380,7 +384,7 @@ def test_F4_loss_reporting_is_bounded_and_never_floods(app, monkeypatch, alerts)
     _wal_append_fails(app, monkeypatch)
     for i in range(500):
         app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": f"lost{i}"})
-    assert app._quality_events_unrecorded == 500 and app._quality_events_wal_only == 0
+    assert app._quality_events_unrecorded == 500 and app._quality_events_wal_only == 1   # only A, the tripping event
     assert writes["n"] == 1
     assert len([m for m in alerts if "unrecorded" in m.lower()]) == 1
 
@@ -390,6 +394,87 @@ def test_F4_healthy_channel_accounting_is_unchanged(app):
     assert app.quality_degraded is None
     assert getattr(app, "_quality_events_wal_only", 0) == 0
     assert getattr(app, "_quality_events_unrecorded", 0) == 0
+
+
+# --- the TRIPPING event: the one whose own write degrades the channel -------------------------
+def _trip(app, reason="tripping"):
+    with pytest.raises(FatalStorageError):                   # the first failing event still raises (existing contract)
+        app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": reason})
+
+
+def test_F4_tripping_event_with_an_established_wal_record_is_counted_as_retained(app, monkeypatch, tmp_path):
+    _quality_down(app, monkeypatch)
+    writes = _count_quality_writes(app)
+    ckpt_before = qed._disk_ckpt(tmp_path)
+    _trip(app)
+    assert app._quality_events_wal_only == 1, "its WAL record is durable: it is WAL-retained"
+    assert app._quality_events_unrecorded == 0 and app._quality_events_wal_unconfirmed == 0
+    assert "tripping" in {e["reason"] for e in _wal_events(app)}, "...and the record really is in the WAL"
+    assert app._quality_checkpoint_is_blocked() and qed._disk_ckpt(tmp_path) == ckpt_before
+    assert writes["n"] == 1, "accounting never calls the failed writer"
+
+
+def test_F4_tripping_event_without_any_wal_record_is_unrecorded_not_retained(app, monkeypatch, alerts):
+    _quality_down(app, monkeypatch)
+    _wal_append_fails(app, monkeypatch)                      # no record, no id: nothing proves it is durable
+    _trip(app)
+    assert app._quality_events_wal_only == 0, "no durable WAL evidence => never counted as retained"
+    assert app._quality_events_unrecorded == 1 and app._quality_events_wal_unconfirmed == 0
+    assert "tripping" not in {e["reason"] for e in _wal_events(app)}
+    assert app._quality_checkpoint_is_blocked()
+    assert len([m for m in alerts if "unrecorded" in m.lower()]) == 1
+
+
+def test_F4_tripping_event_with_an_unconfirmed_wal_append_is_not_reported_as_retained(app, monkeypatch):
+    _quality_down(app, monkeypatch)
+    _wal_append_fails(app, monkeypatch, quality_event_id="evt-0000000000000077")
+    _trip(app)
+    assert app._quality_events_wal_only == 0, "an unconfirmed append is not durable evidence"
+    assert app._quality_events_wal_unconfirmed == 1 and app._quality_events_unrecorded == 0
+    assert 77 in app._quality_wal_inflight, "its seq pins the checkpoint below it"
+    assert app._quality_checkpoint_is_blocked()
+
+
+def test_F4_tripping_event_with_no_wal_configured_is_unrecorded(app, monkeypatch):
+    _quality_down(app, monkeypatch)
+    app._quality_wal = None
+    _trip(app)
+    assert app._quality_events_wal_only == 0 and app._quality_events_unrecorded == 1
+
+
+def test_F4_unprotected_event_whose_forced_publish_trips_the_channel_is_unrecorded(app, monkeypatch):
+    """No WAL: the row is written, then force-published, and THAT fails. The row sits in the dead
+    writer's RAM only, so it must not be reported as retained."""
+    app._quality_wal = None
+    _fail_segment_publish_for(monkeypatch, "quality_events")      # segment_rows left large: write() buffers, publish fails
+    _trip(app, "unprotected")
+    assert app.quality_degraded is not None and app.terminal_failure is None
+    assert app._quality_events_wal_only == 0 and app._quality_events_unrecorded == 1
+
+
+def test_F4_an_ordinary_quality_writer_exception_is_not_degraded_accounting(app, monkeypatch):
+    """P0-1: an ordinary exception stays ordinary. It latches nothing and counts nothing here; the
+    checkpoint is still held back and the exception still propagates."""
+    def boom(*a, **k):
+        raise RuntimeError("ordinary, not a storage fatal")
+    monkeypatch.setattr(app.quality_writer, "write", boom)
+    with pytest.raises(RuntimeError):
+        app._persist_quality_event({"stream": "unrouted", "event_type": "ERROR", "reason": "ordinary"})
+    assert app.quality_degraded is None and app.terminal_failure is None
+    assert getattr(app, "_quality_events_wal_only", 0) == 0
+    assert getattr(app, "_quality_events_unrecorded", 0) == 0
+    assert app._quality_checkpoint_is_blocked()
+
+
+def test_F4_tripping_event_accounting_does_not_hide_a_later_genuine_raw_terminal(app, monkeypatch):
+    _quality_down(app, monkeypatch)
+    _trip(app)
+    assert app.quality_degraded is not None and app.terminal_failure is None
+    verdict = app._on_fatal_storage(FatalStorageError(
+        "raw evidence lost", stream="raw_wire", component="parquet_writer", stage="rename",
+        durability="unpublished"), origin="raw_frame")
+    assert verdict == "terminate" and app.terminal_failure is not None, "quality degradation never swallows a raw fatal"
+    assert app.exit_code != 0
 
 
 # ======================================================================== RawCapture counter

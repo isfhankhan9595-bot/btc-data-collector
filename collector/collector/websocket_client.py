@@ -294,8 +294,19 @@ class WebSocketClient:
         return "connection_id" in parameters
 
     async def start(self):
-        self.running = True
-        logger.info("Starting WebSocket client", url=self.url)
+        if self._discard_mode:
+            # Terminal latch (a failed-writer fatal): the client is never
+            # revived by start(). ``running`` stays False so the loop below is
+            # skipped and only the shutdown tail runs (nothing to drain, and
+            # a latched fatal with no classifier is still raised). A fresh,
+            # un-latched client takes the ordinary path.
+            self.running = False
+            self.connected = False
+            logger.error("websocket_start_refused_terminal_latch",
+                         stream_group=self.stream_group, reason=self.discard_reason)
+        else:
+            self.running = True
+            logger.info("Starting WebSocket client", url=self.url)
 
         while self.running:
             try:
@@ -304,6 +315,16 @@ class WebSocketClient:
                     connection = await connection
 
                 async with connection as ws:
+                    if self._discard_mode:
+                        # The terminal latch landed while this connection was
+                        # being established. A latched client is never revived
+                        # by a reconnect: drop the socket before announcing it
+                        # (no CONNECT quality event, no on_reconnect, no
+                        # subscribe) and leave the loop without a backoff.
+                        self.connected = False
+                        logger.error("websocket_connection_dropped_terminal_latch",
+                                     stream_group=self.stream_group, reason=self.discard_reason)
+                        break
                     self.connected = True
                     self._connection_serial += 1
                     self.connection_id = f"{self.stream_group}-{self._connection_serial}"
@@ -600,13 +621,21 @@ class WebSocketClient:
                                 "BACKPRESSURE", f"ingest_queue_full:{self.ingest_queue_maxsize}",
                                 self.connection_id, self.stream_group)
                         first_wait = False
+                    await asyncio.sleep(0.01)
                     if not self.running:
-                        # Shutdown was requested while the queue stayed
-                        # full. The frame's raw evidence already exists
-                        # (on_raw_frame already ran above); only its
-                        # on_message processing in *this* run is being
-                        # abandoned, and that is counted and reported,
-                        # never silent.
+                        # Shutdown (or the terminal discard latch) was
+                        # requested while the queue stayed full. The frame's
+                        # raw evidence already exists (on_raw_frame already
+                        # ran above); only its on_message processing in
+                        # *this* run is being abandoned, and that is counted
+                        # and reported, never silent.
+                        #
+                        # Checked AFTER the wait, immediately before the next
+                        # put_nowait (no await in between): the worker leaves
+                        # its loop once ``running`` is False and the queue is
+                        # empty, so a put that landed after that point would
+                        # strand one item behind a dead worker and make
+                        # join() wait out the whole drain timeout.
                         self.frames_abandoned_at_shutdown += 1
                         logger.error("ingest_enqueue_abandoned_at_shutdown",
                                      stream_group=self.stream_group)
@@ -615,7 +644,6 @@ class WebSocketClient:
                                 "ERROR", "ingest_enqueue_abandoned_at_shutdown",
                                 self.connection_id, self.stream_group)
                         return
-                    await asyncio.sleep(0.01)
             self.frames_enqueued += 1
             depth = self._ingest_queue.qsize()
             if depth > self.queue_high_watermark:

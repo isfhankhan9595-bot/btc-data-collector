@@ -937,6 +937,7 @@ class CollectorApp:
             # segment may be half-closed): fail closed, event stays in WAL.
             self._block_quality_checkpoint("quality_writer_write_failed")
             self._note_quality_writer_failure(exc)
+            self._account_tripping_quality_event(exc, event, wal_protected=wal_protected, wal_seq=wal_seq)
             raise
         if not wal_protected:
             try:
@@ -944,7 +945,25 @@ class CollectorApp:
             except Exception as exc:
                 self._block_quality_checkpoint("unprotected_event_publish_failed")
                 self._note_quality_writer_failure(exc)
+                self._account_tripping_quality_event(exc, event, wal_protected=wal_protected, wal_seq=wal_seq)
                 raise
+
+    def _account_tripping_quality_event(self, exc: BaseException, event: dict, *,
+                                        wal_protected: bool, wal_seq) -> None:
+        """Account the event whose own write latched the quality channel degraded.
+
+        It is counted by exactly the rules that apply to every later event
+        (``_account_degraded_quality_event``): retained only if its WAL record is
+        established, unconfirmed if the append is in doubt, unrecorded if there is
+        no WAL evidence at all. Only a typed fatal that really degraded the channel
+        qualifies: an ordinary exception, or a fatal that was classified
+        otherwise, leaves the counters alone. Never raises, so the caller's
+        ``raise`` of the original exception is never replaced."""
+        try:
+            if self._is_quality_channel_failure(exc) and getattr(self, "quality_degraded", None) is not None:
+                self._account_degraded_quality_event(event, wal_protected=wal_protected, wal_seq=wal_seq)
+        except Exception as account_exc:  # noqa: BLE001 - accounting must not mask the original failure
+            logger.error("quality_event_accounting_failed", error=f"{type(account_exc).__name__}: {account_exc}")
 
     def _note_quality_writer_failure(self, exc: BaseException) -> None:
         """Latch the quality channel degraded when ITS writer raised a typed fatal.

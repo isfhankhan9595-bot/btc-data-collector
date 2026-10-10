@@ -132,18 +132,18 @@ class BybitCollectorApp:
         self._recover_quality_wal(self.quality_writer.stream_dir / "wal")
         self.raw_wire_writer = ParquetWriter(
             "bybit_raw_wire", RAW_WIRE_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", quality_event_sink=self._persist_quality_event)
+            exchange="BYBIT", quality_event_sink=self._writer_quality_sink)
         # F5 raw-evidence contract: a typed fatal from the raw writer is NOT
         # absorbed by the fail-open path; it reaches the shared client's
         # raw-frame boundary, is classified TERMINATE by ``failure_policy`` and
         # ends in a controlled non-zero exit.
         self.raw_capture = RawCapture(
-            self.raw_wire_writer, None, quality_event_sink=self._persist_quality_event,
+            self.raw_wire_writer, None, quality_event_sink=self._writer_quality_sink,
             fail_closed_on_fatal_storage=True)
 
         self.ob_writer = ParquetWriter(
             "bybit_orderbook", BYBIT_ORDERBOOK_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", quality_event_sink=self._persist_quality_event)
+            exchange="BYBIT", quality_event_sink=self._writer_quality_sink)
         self.trades_writer = ParquetWriter(
             "bybit_trades", BYBIT_TRADES_SCHEMA, base_dir=data_dir, exchange="BYBIT")
         self.mark_writer = ParquetWriter(
@@ -206,6 +206,23 @@ class BybitCollectorApp:
         """Classify and latch one typed storage fatal (see ``failure_policy``).
         Safe to call from the websocket worker: it only latches."""
         return self.failure_policy.on_fatal(exc, origin, route=route)
+
+    def _writer_quality_sink(self, event: dict) -> None:
+        """Quality sink handed to every writer / RawCapture.
+
+        ``_persist_quality_event`` re-raises when the quality writer is FAILED. A
+        raw or derived writer calls its sink unguarded at rollover / migration /
+        orphan-drop time, so that fatal must not escape into the OTHER writer's
+        write(): the raw boundary would read it as a raw-evidence failure. A
+        typed fatal of THIS runner's quality channel is latched (degrade, once)
+        and contained; a typed fatal of any other stream and every ordinary
+        exception propagate unchanged."""
+        try:
+            self._persist_quality_event(event)
+        except FatalStorageError as exc:
+            if not self.failure_policy.is_quality_channel_failure(exc):
+                raise
+            self.failure_policy.on_fatal(exc, origin="quality_sink")
 
     def _report_storage_failure(self, record: FailureRecord) -> None:
         """Durable record of a NEW derived/raw failure in this venue's quality
