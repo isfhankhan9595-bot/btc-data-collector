@@ -49,6 +49,7 @@ from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.storage_errors import FatalStorageError, WriterFailureSnapshot
 from collector.collector.failure_topology import (
     EXIT_FATAL_STORAGE, FailureRecord, VERDICT_DEGRADE_QUALITY, VERDICT_ISOLATE, VERDICT_TERMINATE,
+    classify_stream,
 )
 from collector.collector.websocket_client import WebSocketClient
 
@@ -107,7 +108,7 @@ class CollectorApp:
             name="binance_orderbook", min_interval_s=1.0, max_per_window=5,
             window_s=60.0,
             backoff=ExponentialBackoff(base_delay=1.0, max_delay=60.0, max_attempts=10),
-            quality_sink=self._persist_quality_event)
+            quality_sink=self._emit_quality_event)
         self._quality_queue = asyncio.Queue(maxsize=1024)
         self._quality_task = None
         self._quality_overflow = 0
@@ -444,7 +445,7 @@ class CollectorApp:
     def _record_adapter_unhandled(self, message):
         """An adapter could not turn a message into events. Make it durable."""
         self.stream_counters["adapter_unhandled"]["received"] += 1
-        self._persist_quality_event(message.to_quality_event())
+        self._emit_quality_event(message.to_quality_event())
 
     def _capture_rest(self, record) -> bool:
         """Persist one raw REST record. Returns ``False`` ONLY when the raw_rest
@@ -481,9 +482,9 @@ class CollectorApp:
                 continue
             for event in drain():
                 if isinstance(event, QualityEvent):
-                    self._persist_quality_event(event.record())
+                    self._emit_quality_event(event.record())
                 elif isinstance(event, dict):
-                    self._persist_quality_event(event)
+                    self._emit_quality_event(event)
 
     def _drain_integrity_quality_events_safely(self) -> None:
         """Shutdown-path variant of ``_drain_integrity_quality_events``: it never
@@ -542,7 +543,7 @@ class CollectorApp:
             # information, and its absence must not look like silence.
             self.stream_counters["malformed_envelope"]["received"] += 1
             keys = sorted(str(k) for k in msg.keys()) if isinstance(msg, dict) else []
-            self._persist_quality_event({
+            self._emit_quality_event({
                 "stream": "unrouted", "event_type": QualityEventType.DATA_DROP,
                 "reason": f"non_envelope_frame:keys={','.join(keys) or type(msg).__name__}",
                 "rows_lost": 1, "connection_id": connection_id,
@@ -563,7 +564,7 @@ class CollectorApp:
             logger.warning("Unrouted stream message", stream=stream)
             # Durable, not log-only: an unrouted stream is data the collector
             # received and chose not to process.
-            self._persist_quality_event({
+            self._emit_quality_event({
                 "stream": "unrouted", "event_type": QualityEventType.DATA_DROP,
                 "reason": f"unrouted_stream:{stream}", "rows_lost": 1,
                 "connection_id": connection_id,
@@ -603,6 +604,12 @@ class CollectorApp:
         self._quality_segment_seqs = set()
         self._quality_published_hwm = None
         self._quality_overflow_unpersisted = 0
+        # F5 degraded-channel accounting (see _account_degraded_quality_event). An event
+        # is "WAL-retained" ONLY when its WAL record is established.
+        self._quality_events_wal_only = 0          # WAL record established; replayed next start
+        self._quality_events_wal_unconfirmed = 0   # append failed after assigning an id: a record MAY exist
+        self._quality_events_unrecorded = 0        # no WAL record and no writer: the event is lost
+        self._quality_unrecorded_alerted = False
 
     def _ensure_quality_state(self) -> None:
         if not hasattr(self, "_quality_wal_inflight"):
@@ -654,6 +661,10 @@ class CollectorApp:
             self.quality_writer.publish_if_due()
         except Exception as exc:  # noqa: BLE001
             self._block_quality_checkpoint(f"idle_publish_failed:{type(exc).__name__}")
+            # A typed fatal here is the quality writer failing while quiet: latch the
+            # channel degraded (reported once) instead of leaving it a log line.
+            if self._is_quality_channel_failure(exc) and getattr(self, "quality_degraded", None) is None:
+                self._note_quality_writer_failure(exc)
 
     def _drain_quality_queue_sync(self) -> None:
         """Persist whatever is still queued, synchronously. Shutdown-only:
@@ -706,7 +717,7 @@ class CollectorApp:
             self._quality_checkpoint_block_reason = "wal_corruption_on_startup"
         self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
         if self._quality_wal_recovery_error is not None:
-            self._persist_quality_event({
+            self._emit_quality_event({
                 "stream": "quality_events", "event_type": QualityEventType.ERROR,
                 "reason": f"quality_wal_corruption_on_startup:{self._quality_wal_recovery_error}",
                 "rows_lost": None})
@@ -765,7 +776,7 @@ class CollectorApp:
         event={"exchange":"BINANCE", "stream":stream_group, "event_type":event_type, "reason":reason,
                "connection_id":connection_id, "local_ts":int(time.time()*1000)}
         if not hasattr(self, "_quality_queue"):
-            self._persist_quality_event(event)
+            self._emit_quality_event(event)
             return
         self._ensure_quality_state()
         wal = getattr(self, "_quality_wal", None)
@@ -912,10 +923,12 @@ class CollectorApp:
             if _seq is not None:
                 self._quality_segment_seqs.add(_seq)
         if getattr(self, "quality_degraded", None) is not None:
-            # F5: the quality channel is latched degraded. Its WAL copy (written
-            # above) is the durable record and the next start replays it; calling
-            # the failed writer again would only raise once per event.
-            self._quality_events_wal_only = getattr(self, "_quality_events_wal_only", 0) + 1
+            # F5: the quality channel is latched degraded. When the event's WAL copy
+            # (written above) is established it is the durable record and the next
+            # start replays it. Calling the failed writer again would only raise
+            # once per event, so it is never called -- but the event is counted as
+            # WAL-retained ONLY if that WAL protection is real.
+            self._account_degraded_quality_event(event, wal_protected=wal_protected, wal_seq=wal_seq)
             return
         try:
             self.quality_writer.write(row, bind=_bind)
@@ -942,10 +955,75 @@ class CollectorApp:
         if isinstance(exc, FatalStorageError):
             self._on_fatal_storage(exc, origin="quality_writer")
 
+    @staticmethod
+    def _is_quality_channel_failure(exc: BaseException) -> bool:
+        """True only for a TYPED fatal that failure_topology maps to the quality
+        channel. Never by RuntimeError-ness, message text or class name."""
+        return isinstance(exc, FatalStorageError) and classify_stream(exc.stream)[0] == VERDICT_DEGRADE_QUALITY
+
+    def _emit_quality_event(self, event: dict) -> bool:
+        """Quality telemetry from a MARKET-DATA path (handlers, recovery, drains).
+
+        ``_persist_quality_event`` keeps its contract -- it raises when the quality
+        writer fails -- because the persistence loop, startup replay, overflow and
+        shutdown paths need that to hold the checkpoint back. A market-data task
+        needs the opposite: telemetry failing must not take the task down.
+
+        Contained here, and ONLY here: a typed fatal of the quality channel
+        (``_persist_quality_event`` has already latched the channel degraded, blocked
+        the checkpoint and reported it once through the recursion-safe path; the
+        event itself is in the WAL). Everything else propagates unchanged: ordinary
+        exceptions (P0-1) and a typed fatal of any OTHER stream, which is never
+        quality telemetry. Returns ``True`` when the event reached the writer."""
+        try:
+            self._persist_quality_event(event)
+        except FatalStorageError as exc:
+            if not self._is_quality_channel_failure(exc):
+                raise
+            if getattr(self, "quality_degraded", None) is None:
+                self._note_quality_writer_failure(exc)
+            return False
+        return True
+
+    def _account_degraded_quality_event(self, event: dict, *, wal_protected: bool, wal_seq) -> None:
+        """Count one event that arrived while the quality channel is degraded.
+
+        * ``wal_protected``  -> its WAL record is established: ``_quality_events_wal_only``.
+        * ``wal_seq`` only   -> the append raised after assigning an id (write ok, fsync
+          failed): a record MAY exist. Not proven, so NOT "retained"; its seq is already
+          in-flight, which pins the checkpoint below it.
+        * neither            -> no WAL record and the writer is dead: the event is LOST.
+          Reported as unrecorded, never as retained, and never through the failed
+          writer: a bounded log line (first, then powers of two) plus ONE operator alert.
+
+        Nothing here advances a checkpoint, calls ``quality_writer``, or raises."""
+        if wal_protected:
+            self._quality_events_wal_only = getattr(self, "_quality_events_wal_only", 0) + 1
+            return
+        if wal_seq is not None:
+            self._quality_events_wal_unconfirmed = getattr(self, "_quality_events_wal_unconfirmed", 0) + 1
+            return
+        count = getattr(self, "_quality_events_unrecorded", 0) + 1
+        self._quality_events_unrecorded = count
+        if not self._quality_checkpoint_is_blocked():
+            self._block_quality_checkpoint("quality_event_unrecorded")
+        try:
+            if count & (count - 1) == 0:            # 1, 2, 4, 8, ...: bounded, never one line per event
+                logger.error("quality_event_unrecorded", count=count, stream=event.get("stream"),
+                             event_type=str(event.get("event_type")), reason=event.get("reason"),
+                             wal_only=getattr(self, "_quality_events_wal_only", 0))
+            if not getattr(self, "_quality_unrecorded_alerted", False):
+                self._quality_unrecorded_alerted = True
+                send_telegram_alert(
+                    "QUALITY EVENTS UNRECORDED: the quality channel is degraded and the quality WAL could "
+                    "not record events (market data and raw capture unaffected; quality telemetry is being lost)")
+        except Exception as exc:  # noqa: BLE001 - reporting a loss must never raise into market data
+            logger.error("quality_event_unrecorded_report_failed", error=f"{type(exc).__name__}: {exc}")
+
     def _record_book_quality(self, kind, reason, transition=None, event=None):
         transition=transition or self.binance_book.last_transition
         event=event or getattr(transition, "event", None)
-        self._persist_quality_event({"exchange":"BINANCE", "stream":"orderbook", "event_type":kind, "reason":reason,
+        self._emit_quality_event({"exchange":"BINANCE", "stream":"orderbook", "event_type":kind, "reason":reason,
             "local_ts":int(time.time()*1000), "previous_state":getattr(getattr(transition,"previous_state",None),"value",None),
             "new_state":getattr(getattr(transition,"new_state",None),"value",None),
             "expected_previous_update_id":getattr(transition,"expected_previous_update_id",None),
@@ -1200,7 +1278,7 @@ class CollectorApp:
             if trade_id is None:
                 self.stream_counters["trades"]["rejected"] += 1
                 self._record_validation_rejection("trades", "legacy_trade_id_not_lossless")
-                self._persist_quality_event({"stream":"trades", "event_type":QualityEventType.ERROR, "reason":"legacy_trade_id_not_lossless"})
+                self._emit_quality_event({"stream":"trades", "event_type":QualityEventType.ERROR, "reason":"legacy_trade_id_not_lossless"})
                 continue
             features = {
                 "timestamp": process_ts, "local_timestamp": event.local_receive_ts,
@@ -1286,7 +1364,7 @@ class CollectorApp:
         (older/partial payloads); only an explicit mismatch is.
         """
         if native_symbol is not None and native_symbol != SYMBOL:
-            self._persist_quality_event({
+            self._emit_quality_event({
                 "stream": stream_name, "event_type": QualityEventType.ERROR,
                 "reason": f"symbol_contradicts_configured_instrument:{native_symbol}",
                 "rows_lost": 1, "local_ts": int(time.time() * 1000)})
@@ -1504,7 +1582,7 @@ class CollectorApp:
                         local_process_ts=process_ts, symbol=SYMBOL)
                 except BinanceOIParseError as exc:
                     self.stream_counters["openinterest"]["empty_features"] += 1
-                    self._persist_quality_event({
+                    self._emit_quality_event({
                         "stream": "openinterest", "event_type": QualityEventType.ERROR,
                         "reason": f"oi_malformed_response:{exc}",
                         "local_ts": process_ts})
@@ -1547,7 +1625,7 @@ class CollectorApp:
                         request_params={"symbol": SYMBOL}, http_status=status,
                         ok=False, error=f"{type(e).__name__}:{e}", payload=body,
                         symbol=SYMBOL))
-                self._persist_quality_event({
+                self._emit_quality_event({
                     "stream": "openinterest", "event_type": QualityEventType.ERROR,
                     "reason": f"oi_poll_failed:{type(e).__name__}",
                     "local_ts": int(time.time() * 1000)})

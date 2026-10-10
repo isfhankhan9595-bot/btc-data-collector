@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from .numeric import column_value
 from .utils import logger
 from .publication import CONFIRMED_BY_WRITER, sha256_file, write_marker_atomic
+from .failure_topology import VERDICT_DEGRADE_QUALITY, classify_stream
 from .storage_errors import FatalStorageError, WriterFailureSnapshot
 from .storage_layout import (
     SegmentKind, check_stream_namespace, iter_segments, parse_segment_name, segment_path,
@@ -332,7 +333,26 @@ class ParquetWriter:
         }
         logger.warning("storage_quality_event", **event)
         if self.quality_event_sink:
+            self._deliver_to_sink(event)
+
+    def _deliver_to_sink(self, event: Dict[str, Any]) -> None:
+        """Hand one event to ``quality_event_sink``.
+
+        F5: a typed fatal raised by the SINK that belongs to the quality channel
+        (its writer already latched itself and the application degraded the
+        channel) is not a failure of THIS writer. Letting it propagate out of
+        write() would make a telemetry failure look like this stream's failure --
+        for ``raw_wire`` / ``raw_rest`` that is the difference between degrading
+        telemetry and terminating the collector. Contained here, logged, and
+        nothing else: a typed fatal of any OTHER stream, and every ordinary
+        exception, still propagates exactly as before."""
+        try:
             self.quality_event_sink(event)
+        except FatalStorageError as exc:
+            if classify_stream(exc.stream)[0] != VERDICT_DEGRADE_QUALITY:
+                raise
+            logger.error("storage_quality_channel_failed_in_sink", stream=self.stream_name,
+                         sink_stream=exc.stream, sink_stage=exc.stage, event_type=event.get("event_type"))
 
     def _next_sequence(self, hour: str) -> int:
         """Return the next unused segment sequence for ``hour``.
@@ -437,10 +457,10 @@ class ParquetWriter:
         logger.warning("segment_data_drop", **event)
         if self.quality_event_sink:
             if not guarded:
-                self.quality_event_sink(event)
+                self._deliver_to_sink(event)
                 return
             try:
-                self.quality_event_sink(event)
+                self._deliver_to_sink(event)
             except Exception as exc:  # noqa: BLE001 - see _emit_quality_guarded
                 logger.error("storage_quality_event_sink_failed", stream=self.stream_name,
                              event_type="DATA_DROP", error=f"{type(exc).__name__}: {exc}")

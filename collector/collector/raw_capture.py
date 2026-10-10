@@ -359,7 +359,11 @@ class RawCapture:
         self.fatal_capture_failures = 0
 
     def _fail_open(self, kind: str, exc: BaseException) -> None:
-        """Raw capture must never take the ingest path down with it."""
+        """Raw capture must never take the ingest path down with it.
+
+        Counts the failed attempt exactly once: every caller reaches the counter
+        either here (fail-open) or by incrementing itself immediately before it
+        re-raises (fail-closed) -- never both."""
         self.capture_failures += 1
         if self.quality_event_sink is None:
             return
@@ -391,9 +395,11 @@ class RawCapture:
             # sink may be the very thing that is broken), just count and, when
             # fail-closed, let the application's fatal boundary decide.
             self.fatal_capture_failures += 1
-            self.capture_failures += 1
             if self.fail_closed_on_fatal_storage:
+                self.capture_failures += 1
                 raise
+            # Fail-open: _fail_open() is the single place that counts this attempt.
+            # (Counting here as well made every typed fatal count twice.)
             self._fail_open("wire", exc)
             return False
         except Exception as exc:  # noqa: BLE001 - ordinary failures fail open
@@ -414,10 +420,10 @@ class RawCapture:
         except FatalStorageError as exc:
             # See capture_wire: typed branch first, never via the quality sink.
             self.fatal_capture_failures += 1
-            self.capture_failures += 1
             if self.fail_closed_on_fatal_storage:
+                self.capture_failures += 1
                 raise
-            self._fail_open("rest", exc)
+            self._fail_open("rest", exc)         # counts this attempt exactly once
             return False
         except Exception as exc:  # noqa: BLE001 - ordinary failures fail open
             self._fail_open("rest", exc)

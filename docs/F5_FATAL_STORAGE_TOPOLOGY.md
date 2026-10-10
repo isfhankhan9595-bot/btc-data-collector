@@ -89,8 +89,33 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
 * **Reporting (recursion-safe)** — synchronous structured log → the quality WAL directly (its seq is
   held in-flight so a later checkpoint cannot cover it; the next start replays it) → one operator
   alert. It never calls `quality_writer` or `_persist_quality_event`. Once the quality channel is
-  degraded, `_persist_quality_event` stops calling the failed writer (WAL copy only; counted in
-  `_quality_events_wal_only`).
+  degraded, `_persist_quality_event` stops calling the failed writer. An event is counted in
+  `_quality_events_wal_only` **only when its WAL record is established**; see
+  "Quality-channel failure boundaries" below for the other two outcomes.
+* **Quality-channel failure boundaries (remediation Part 2A)** — a failing *quality* writer degrades
+  telemetry; it never terminates healthy market-data processing and is never mistaken for a raw or
+  derived failure. Three boundaries are handled differently on purpose:
+  * `_persist_quality_event` **keeps its contract: it raises** when the quality writer fails (the
+    persistence loop, startup replay, overflow and shutdown paths depend on that to hold the
+    checkpoint back). It latches the channel degraded, blocks the checkpoint and reports once.
+  * `_emit_quality_event` is the market-data-path variant (handlers, order-book recovery, drains,
+    OI polling, startup corruption report). It contains **only** a typed fatal that `failure_topology`
+    maps to the quality channel (the event is already in the WAL). Ordinary exceptions (P0-1) and a
+    typed fatal of any other stream still propagate. Order-book recovery therefore always finishes
+    its lifecycle (`controller.succeed()/fail()`), and an OI error handler cannot crash the task.
+  * `ParquetWriter._deliver_to_sink` stops a quality-channel fatal raised by the *sink* from
+    surfacing as the **emitting writer's** failure (the unguarded migration / crashed-segment
+    `DATA_DROP` paths inside `write()`). Without it, a quality failure carried through a `raw_wire`
+    write was classified at the raw-frame boundary, which is TERMINATE by construction.
+  * Genuine raw (`raw_wire`/`raw_rest`) fatals still terminate; derived-writer fatals still isolate
+    their route; a failed quality writer is never called again and never resurrected in-process.
+* **Degraded-channel accounting (remediation Part 2A)** — for each event arriving after the channel
+  degraded: `_quality_events_wal_only` = WAL record established (replayed on next start);
+  `_quality_events_wal_unconfirmed` = the append failed *after* assigning an id (a record may exist; its
+  seq pins the checkpoint, but it is not claimed retained); `_quality_events_unrecorded` = no WAL
+  record and no writer: the event is **lost**, reported as such (bounded log: first, then powers of two;
+  one operator alert) and never through the failed writer. No path advances a checkpoint over an event
+  whose durability is unproven.
 * **Shutdown** — unchanged order. A failed writer's `close()` raising does not stop the other
   writers from closing (`_close_writer_reporting_failure`).
 
