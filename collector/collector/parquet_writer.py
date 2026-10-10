@@ -719,7 +719,22 @@ class ParquetWriter:
         """Append ``record``. ``bind(token)``, if given, is called with the
         token of the segment that will receive the record -- after any hour
         rollover, before the append -- so a caller can attribute the record to
-        its segment exactly (a rotation after the append cannot race it)."""
+        its segment exactly (a rotation after the append cannot race it).
+
+        A ``FatalStorageError`` raised from here carries ``record_accepted``:
+        ``True`` once ``record`` was appended to this writer's buffer (so a
+        later flush / publish / next-segment failure concerns a segment that
+        contains it), ``False`` if the call failed before admitting it. No
+        control flow changes; this is evidence only."""
+        accepted = [False]
+        try:
+            self._write_record(record, bind, accepted)
+        except FatalStorageError as exc:
+            exc.record_accepted = accepted[0]
+            raise
+
+    def _write_record(self, record: Dict[str, Any],
+                      bind: Optional[Callable[[Tuple[str, int]], None]], accepted: list) -> None:
         self._raise_if_storage_failed()
         if self._publication_failure is not None:
             raise self._publication_fatal("writes")
@@ -761,6 +776,7 @@ class ParquetWriter:
         if bind is not None:
             bind((self.current_hour, self._seq))
         self.buffer.append(record)
+        accepted[0] = True
         if self._first_row_monotonic is None:
             self._first_row_monotonic = time.monotonic()
         ts = _epoch_ms(record.get("timestamp"))

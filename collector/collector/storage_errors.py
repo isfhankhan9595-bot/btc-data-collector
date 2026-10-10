@@ -27,6 +27,17 @@ What the fields mean
                 ``unconfirmed``, ``published`` (durable, but the writer can
                 no longer continue) or ``None`` when not applicable.
 
+``record_accepted``  set ONLY by ``ParquetWriter.write``: whether the record
+                that call was writing had been appended to a segment buffer
+                before the failure was raised (``True``), or the call failed
+                before the record was admitted anywhere (``False``). ``None``
+                means no such evidence exists (an exception that did not come
+                from ``write``). ``stage`` and ``durability`` describe the
+                WRITER's segment, not this record: an ``open_next_segment``
+                failure raised on an hour rollover is "published" for the
+                previous segment while the triggering record was never
+                written. ``trigger_event_disposition`` combines both.
+
 The original cause is chained (``raise FatalStorageError(...) from exc``), so
 the stage-specific evidence (``OSError(ENOSPC)`` and so on) is preserved on
 ``__cause__``.
@@ -36,7 +47,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-__all__ = ["FatalStorageError", "WriterFailureSnapshot"]
+__all__ = ["FatalStorageError", "WriterFailureSnapshot",
+           "EVENT_PUBLISHED", "EVENT_UNCONFIRMED", "EVENT_LOST"]
+
+#: Disposition of the single record whose ``write`` raised (see
+#: ``FatalStorageError.trigger_event_disposition``).
+EVENT_PUBLISHED = "published"      # its row is in a durably published segment
+EVENT_UNCONFIRMED = "unconfirmed"  # durability could not be established either way
+EVENT_LOST = "lost"                # demonstrably not durable (never admitted, or in an unpublished segment)
 
 
 class FatalStorageError(RuntimeError):
@@ -56,6 +74,34 @@ class FatalStorageError(RuntimeError):
         self.component = component
         self.stage = stage
         self.durability = durability
+        self.record_accepted: Optional[bool] = None
+
+    def trigger_event_disposition(self) -> str:
+        """What is PROVEN about the record whose ``write`` raised this.
+
+        Never claims more than the evidence supports:
+
+        * ``record_accepted is False`` -> ``lost``: the record was never admitted
+          to any segment, whatever ``stage``/``durability`` say about the writer's
+          earlier segment (a rollover failure, or a refusal by an already-failed
+          writer).
+        * accepted + durability ``published`` -> ``published``: the segment that
+          holds the record was durably published before the writer failed (e.g.
+          ``open_next_segment`` after a full segment).
+        * accepted + ``unpublished`` -> ``lost`` (segment never renamed into place).
+        * accepted + ``unconfirmed``, or any unrecognised durability -> ``unconfirmed``.
+        * no ``record_accepted`` evidence at all -> ``unconfirmed``: nothing is
+          fabricated in either direction.
+        """
+        if self.record_accepted is None:
+            return EVENT_UNCONFIRMED
+        if self.record_accepted is False:
+            return EVENT_LOST
+        if self.durability == "published":
+            return EVENT_PUBLISHED
+        if self.durability == "unpublished":
+            return EVENT_LOST
+        return EVENT_UNCONFIRMED
 
     def describe(self) -> dict:
         """Structured, JSON-safe view for logs, alerts and failure records."""

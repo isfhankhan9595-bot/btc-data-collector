@@ -180,7 +180,8 @@ def test_quality_writer_fatal_latches_once_with_one_alert_and_bounded_logs(kind,
     try:
         policy = app.failure_policy
         assert app.quality_degraded is None and app.quality_channel_status() == {
-            "quality_degraded": False, "quality_events_lost": 0, "quality_failure": None}
+            "quality_degraded": False, "quality_events_lost": 0, "quality_events_unconfirmed": 0,
+            "quality_failure": None}
         _Disk(monkeypatch).arm(app.quality_writer)
         writes = _spy_quality_writer(app)
         latches = _spy_on_fatal(policy)
