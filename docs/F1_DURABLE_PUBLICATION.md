@@ -196,8 +196,9 @@ F1 publication semantics and ordering are unchanged. What changed is the excepti
 publication step (flush, close, fsync, rename, directory fsync, opening the next segment), a failed
 marker, or a failed dedup hook now surfaces as `FatalStorageError` (original exception on
 `__cause__`, plus `stage` / `durability`) instead of a bare `OSError` / `RuntimeError`, and the
-application maps the owning writer's stream to a verdict (terminate for `raw_wire`/`raw_rest`,
-isolate the route otherwise). A latched marker/hook failure is also visible through
+application maps the owning writer's stream to a verdict (terminate for `raw_wire`/`raw_rest` and for
+any stream not in the table, isolate the route for a derived writer, degrade the quality channel for
+`quality_events`). A latched marker/hook failure is also visible through
 `ParquetWriter.failure_snapshot()` before any further write. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
 ## Known UNKNOWN / out of scope

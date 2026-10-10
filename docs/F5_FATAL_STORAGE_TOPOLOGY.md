@@ -92,17 +92,26 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
   degraded, `_persist_quality_event` stops calling the failed writer. An event is counted in
   `_quality_events_wal_only` **only when its WAL record is established**; see
   "Quality-channel failure boundaries" below for the other two outcomes.
-* **Quality-channel failure boundaries (remediation Part 2A)** — a failing *quality* writer degrades
-  telemetry; it never terminates healthy market-data processing and is never mistaken for a raw or
-  derived failure. Three boundaries are handled differently on purpose:
+* **Quality-channel failure boundaries (remediation Part 2A)** — the intent is that a failing *quality*
+  writer degrades telemetry, does not terminate healthy market-data processing and is not read as a raw
+  or derived failure. That is enforced at the specific boundaries below, not as a blanket guarantee: see
+  *Exception handling: what is contained, what propagates (A5.1)* for the full list, including the places
+  where a typed fatal is still contained or dropped. Three boundaries are handled differently on purpose:
   * `_persist_quality_event` **keeps its contract: it raises** when the quality writer fails (the
     persistence loop, startup replay, overflow and shutdown paths depend on that to hold the
     checkpoint back). It latches the channel degraded, blocks the checkpoint and reports once.
   * `_emit_quality_event` is the market-data-path variant (handlers, order-book recovery, drains,
     OI polling, startup corruption report). It contains **only** a typed fatal that `failure_topology`
-    maps to the quality channel (the event is already in the WAL). Ordinary exceptions (P0-1) and a
-    typed fatal of any other stream still propagate. Order-book recovery therefore always finishes
-    its lifecycle (`controller.succeed()/fail()`), and an OI error handler cannot crash the task.
+    maps to the quality channel (USD-M checks `classify_stream(exc.stream)` against the default table,
+    i.e. the `quality_events` stream). By then `_persist_quality_event` has latched the channel, blocked
+    the checkpoint and reported once. Whether the *event itself* is in the WAL depends on its WAL append
+    having succeeded; otherwise it is counted as unconfirmed or unrecorded (see *Degraded-channel
+    accounting* below). Ordinary exceptions (P0-1) and a typed fatal of any other stream still propagate
+    out of this method; where they end up is listed under *Exception handling* (A5.1). A quality-channel
+    fatal therefore no longer stops order-book recovery from reaching `controller.succeed()/fail()`, and
+    no longer lets an OI error handler crash the task; an unrelated typed fatal or an ordinary exception
+    still takes the existing paths (recovery classifies a typed fatal with `origin="recovery"` and
+    returns without calling the controller).
   * `ParquetWriter._deliver_to_sink` stops a quality-channel fatal raised by the *sink* from
     surfacing as the **emitting writer's** failure (the unguarded migration / crashed-segment
     `DATA_DROP` paths inside `write()`). Without it, a quality failure carried through a `raw_wire`
@@ -114,8 +123,10 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
     every other typed fatal is re-raised. Spot, OKX and OKX capture-only do the same
     inside their own `_persist_quality_event` (final fix, Finding A): a typed fatal that the runner's OWN table
     maps to its quality stream is latched once through `StandaloneFailurePolicy.on_fatal(origin="quality_writer")`
-    (one structured log + one operator alert) and contained, so nothing escapes their sinks; any other typed
+    (one structured log + one operator alert) and contained, so a quality-stream fatal does not escape their sinks; any other typed
     fatal is re-raised; an ordinary exception keeps the log-and-continue path (a log line per event, as on base).
+    Before the policy exists (startup) the test is the narrower `exc.stream == quality_writer.stream_name`:
+    a match is held and latched once the policy is built; any other typed fatal is re-raised.
     Before this, the typed fatal was caught by the blanket `except Exception`, never latched, and logged once
     per event with no alert and a healthy-looking quality state.
   * **No WAL on these runners.** Spot, OKX and OKX capture-only keep no durable quality WAL, so a degraded
@@ -341,6 +352,99 @@ exceptions from its sink).
 * `quality_channel_status()` is exposed on the runner object; Bybit has no status printout or health endpoint
   wired to it yet.
 * Not exercised against a real full disk or under systemd (fault injection at `os.replace` / WAL `fsync`).
+
+## Exception handling: what is contained, what propagates (A5.1)
+
+Neither this document nor the code comments promise that a typed fatal is never swallowed, in the
+absolute. The contract is per boundary. This section was re-derived from the code and tests at head `cb84cac`, not
+from comments. "Typed fatal" always means `isinstance(exc, FatalStorageError)` (`DedupStateError` included).
+
+**Where typed fatals come from.** The only places in the package that construct one are `ParquetWriter`
+(`_storage_fatal`, `_publication_fatal`; both stamp the writer's *own* `stream_name`) and `DedupStateError`
+(stream `trades` by default). The quality writer has no dedup state and no quality sink, so on the current
+code a quality-writer call raises only the quality stream's own fatal. The "typed fatal of another stream"
+branches below are therefore default-deny guards that the tests exercise by fault injection (they
+monkeypatch `quality_writer.write`); no production source of one was found on the quality path.
+
+### 1. Typed fatals that are intentionally contained
+
+"Contained" means the exception stops there. The verdict is still latched through the failure policy or,
+for the quality channel, as degraded telemetry, so the failure stays visible.
+
+| Boundary | What is contained | Check that permits containment | Anything else |
+|---|---|---|---|
+| USD-M `CollectorApp._emit_quality_event` | typed fatal of the quality channel | `classify_stream(exc.stream)` against the **default table** is `degrade_quality` (stream `quality_events`) | re-raised unchanged |
+| `BybitCollectorApp._emit_quality_event` | typed fatal of Bybit's quality channel | `failure_policy.is_quality_channel_failure(exc)`, the runner's *own* table; with no policy yet nothing is contained | re-raised unchanged |
+| Spot / OKX / OKX capture-only `_persist_quality_event` | typed fatal of the runner's quality channel | `policy.is_quality_channel_failure(exc)`; before the policy exists only `exc.stream == quality_writer.stream_name` (held, latched once the policy is built) | re-raised unchanged |
+| `ParquetWriter._deliver_to_sink` (the *unguarded* `_emit_quality` / `_emit_drop` paths) | typed fatal raised by the writer's quality sink | `classify_stream(exc.stream)` against the **default (USD-M) table** is `degrade_quality`; logged as `storage_quality_channel_failed_in_sink` | re-raised unchanged |
+| `BybitCollectorApp._on_client_quality_event` (called unguarded by the websocket client) | the quality fatal (via `_emit_quality_event`) and, after classification, any other typed fatal | another stream's fatal is first given to `failure_policy.on_fatal(exc, origin="client_quality_event")` (terminate or isolate by its own stream) and only then contained; with no policy it is re-raised | ordinary exceptions: logged, checkpoint blocked |
+| `WebSocketClient._handle_fatal` | every typed fatal at the raw-frame callback, the worker and the connection loop | `except FatalStorageError` precedes the generic handlers; the error goes to `on_fatal`; the client enters discard mode if the origin is `raw_frame`, no hook is set, or the hook raised | none |
+
+### 2. Typed fatals that propagate or are passed to the failure policy
+
+* **A typed fatal of another stream at a quality boundary** (anything the check in the table above rejects) is
+  re-raised unchanged by `_emit_quality_event`, `_persist_quality_event` and `_deliver_to_sink`. It is never
+  latched as a quality failure and never counted as lost or unconfirmed. It is classified *by its own stream*
+  where it lands: raw evidence or an unmapped stream terminates (default-deny), a derived stream isolates its
+  route. Landing points are the client's worker boundary (`on_fatal(exc, "worker")`), USD-M `handle_message`
+  and recovery (`origin="recovery"`).
+* **Bybit's adapter-unhandled path** passes a non-quality typed fatal to the failure policy
+  (`origin="adapter_unhandled"`) *before* re-raising it, because the adapter drops it afterwards (4a).
+* **Standalone-runner handlers** do not catch typed fatals; they `tag_route` and re-raise to the worker boundary.
+* **Raw evidence.** A fail-closed `RawCapture` re-raises any typed fatal from the raw writers without
+  consulting the quality sink, and the origins `raw_frame`, `raw_rest` and `run_task` are TERMINATE whatever
+  stream the exception names.
+
+### 3. Ordinary exceptions
+
+An ordinary exception, a plain `RuntimeError` included (a closed writer's refusal is one), is never
+classified as a storage fatal (A3 tests). It keeps its pre-F5 (P0-1) behaviour, which differs by boundary:
+
+| Boundary | Ordinary exception |
+|---|---|
+| WebSocket worker | counted as a processing error; the worker stays alive |
+| USD-M and Bybit `_persist_quality_event` | checkpoint blocked, then re-raised; `_emit_quality_event` lets it propagate |
+| Spot / OKX / OKX capture-only `_persist_quality_event` | `spot_quality_write_failed` / `okx_quality_write_failed` logged (per event), ingest continues; the writer is *not* latched and is called again |
+| Bybit `_on_client_quality_event` | logged, checkpoint blocked, contained |
+| Fail-open `RawCapture` (ordinary writer error) | `DATA_DROP` quality event, the frame still flows |
+| `ExchangeAdapter.unhandled` sink | dropped silently (4a) |
+
+### 4. Where a typed fatal is still swallowed or dropped, and other limitations
+
+* **a. `ExchangeAdapter.unhandled`** calls its sink under `except Exception: pass` (`adapters/base.py`), so
+  anything the sink raises, a typed fatal included, is dropped by the adapter. Only Bybit compensates
+  (section 2). In USD-M (`_record_adapter_unhandled` -> `_emit_quality_event`), Spot and OKX (-> `_persist_quality_event`)
+  a typed fatal of a non-quality stream raised there would be re-raised by the handler and then dropped by
+  the adapter without reaching the failure policy. No production source of such a fatal was found (see
+  above), so this limits the guard rather than describing a demonstrated live defect. No test was found that
+  covers it for those three runners; the Bybit equivalent is covered.
+* **b. `ParquetWriter` guarded sink calls.** `_emit_quality_guarded` and `_emit_drop(..., guarded=True)` run only
+  after the writer has latched a publication, marker or hook failure. They catch *every* exception from the
+  sink, a typed fatal of another stream included, and only log `storage_quality_event_sink_failed`; the
+  writer's own latch, not the sink, enforces fail-closed. The existing test of this path
+  (`test_sink_failure_cannot_mask_the_storage_error_or_unlatch_the_writer`) uses an ordinary-exception sink,
+  so a typed fatal from the sink on a guarded path rests on the code and a one-off fault-injection check,
+  not on a committed test.
+* **c. `RawCapture` quality-sink calls.** `_fail_open` and `_emit_truncation` swallow any exception from the
+  quality sink (`except Exception`), so a quality-sink failure during raw capture never propagates, a typed
+  fatal from the sink included. A typed fatal from the *raw writer itself* is not affected: it takes the typed
+  branch first (section 2).
+* **d. Default-table classification in the writer.** `ParquetWriter._deliver_to_sink` recognises only the USD-M
+  `quality_events` stream, so a venue sink that re-raised its own venue-prefixed quality fatal would not be
+  contained there. Today that cannot happen: Bybit contains it in `_writer_quality_sink`, and in Spot, OKX and
+  OKX capture-only the raw writers' sink is the runner's own `_persist_quality_event`, which contains the
+  runner's quality fatal itself, so `_deliver_to_sink` never has to classify it. Those runners' derived
+  writers have no sink. A new venue sink must do the same.
+* **e. Websocket quality callback (Spot, OKX).** `_on_client_quality_event` calls `_persist_quality_event`
+  directly, so a re-raised non-quality typed fatal would leave the callback. At the CONNECT call site, which is
+  inside the connection loop's `try`, it reaches `except FatalStorageError` and `_handle_fatal`. Whether every
+  other `on_quality_event` call site does the same was not traced.
+
+Evidence: `test_f5_part2a_quality_channel.py` (USD-M emit, writer sink), `test_f5_final_quality_writer_latch.py`
+(Spot / OKX / OKX capture-only, including an unrelated typed fatal and an ordinary error),
+`test_f5_final_bybit_quality_containment.py` and `test_f5_final_bybit_ws_callback_fatal.py` (Bybit),
+`test_f5_a3_ordinary_runtime_error.py` (ordinary `RuntimeError`), `test_f5_fatal_storage_topology.py`
+(topology, raw capture).
 
 ## Not changed
 
