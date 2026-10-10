@@ -109,8 +109,9 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
     write was classified at the raw-frame boundary, which is TERMINATE by construction. Its classification
     uses the **default (USD-M) stream table**, i.e. it recognises `quality_events` only. Venue runners whose
     quality sink re-raises must contain their own quality stream themselves: Bybit does so in
-    `_writer_quality_sink`, which uses the runner's own table (`StandaloneFailurePolicy.is_quality_channel_failure`),
-    latches the degrade once and re-raises every other typed fatal. Spot, OKX and OKX capture-only do the same
+    `_writer_quality_sink`, which delegates to `_emit_quality_event` (see "Final fix, Part 2 (Finding B)" below): the
+    runner's own table (`StandaloneFailurePolicy.is_quality_channel_failure`) decides, the degrade is latched once and
+    every other typed fatal is re-raised. Spot, OKX and OKX capture-only do the same
     inside their own `_persist_quality_event` (final fix, Finding A): a typed fatal that the runner's OWN table
     maps to its quality stream is latched once through `StandaloneFailurePolicy.on_fatal(origin="quality_writer")`
     (one structured log + one operator alert) and contained, so nothing escapes their sinks; any other typed
@@ -141,7 +142,8 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
   WAL: rows already buffered in the failed segment before the trip are held by their in-flight seqs
   (checkpoint blocked) but are not added to `_quality_events_wal_only`. An ordinary (non-typed) quality
   writer exception is not degraded-channel accounting. These counters exist in the Binance USD-M
-  `CollectorApp` only.
+  `CollectorApp` and (final fix, Part 2) in `BybitCollectorApp`; Spot, OKX and OKX capture-only keep no WAL and
+  expose the single `quality_events_lost` counter instead.
 * **Shutdown** — unchanged order. A failed writer's `close()` raising does not stop the other
   writers from closing (`_close_writer_reporting_failure`).
 
@@ -254,6 +256,65 @@ the feature-Parquet outputs.
 * Idle secondary client (observed, not changed): a client blocked in `recv()` on a quiet socket does not see the
   latch until a frame arrives, on base as well. The terminal contract does not depend on it: the supervisor cancels
   the client task and the worker exits by itself. Covered by a test.
+
+## Final fix, Part 2 (Finding B): Bybit quality-channel containment
+
+**Defect.** `BybitCollectorApp._apply_orderbook` and `_record_adapter_unhandled` called `_persist_quality_event`
+directly from the market-data path, and `_persist_quality_event` re-raises when the quality writer is FAILED.
+Reproduced on the unfixed head (snapshot, then a delta with a decreasing update id, quality writer failing):
+
+* `_apply_orderbook`: the snapshot's RECOVERING→VALID transition event raised before `ob_writer.write`, so the
+  **canonical order-book row was lost** and the client counted a worker fatal for every book transition; the failed
+  quality writer was called again once per transition (`bybit_quality_checkpoint_blocked` each time).
+* `_record_adapter_unhandled`: the adapter invokes its sink under `except Exception: pass`
+  (`ExchangeAdapter.unhandled`), so the typed quality fatal was **swallowed silently**: never latched, never alerted,
+  the dead writer called again for every duplicate-trade / unrouted frame. (The frame itself was not aborted here.)
+
+**Fix (`run_bybit_collector.py` only).**
+
+* `_emit_quality_event` is the market-data-path variant (same contract as USD-M's). It contains **only** a typed
+  fatal that Bybit's *own* failure policy maps to *its* quality channel. Any other typed fatal, and every ordinary
+  exception, propagates unchanged. Used by `_apply_orderbook`, `_record_adapter_unhandled`, `_on_client_quality_event`
+  and `_writer_quality_sink`. `_persist_quality_event` keeps its raise-on-failure contract (startup replay, shutdown
+  reports and the failure reporter rely on it).
+* `_persist_quality_event` latches the channel once on the first failing write/publish
+  (`StandaloneFailurePolicy.on_fatal(origin="quality_writer")`: one structured log, one operator alert) and, once
+  degraded, **never calls the failed writer again**: the event is WAL-protected first, then only accounted.
+  Only a fatal the runner's own table maps to the quality stream is latched here, so an unrelated typed fatal is
+  neither swallowed nor relabelled.
+* `_record_adapter_unhandled` hands a typed fatal that is *not* the quality channel's to the failure policy
+  (`origin="adapter_unhandled"`) before re-raising, because the adapter's catch-all would otherwise drop it.
+* While degraded, the per-event `bybit_quality_event_wal_append_failed_in_persist` error log is replaced by the
+  bounded accounting log (a full disk typically breaks the WAL and Parquet together).
+
+**Degraded-channel counters** (`quality_channel_status()`, also `quality_degraded`), disjoint, counted for every
+event that reaches the degraded channel including the one whose write tripped the latch:
+
+| counter | meaning |
+|---|---|
+| `quality_events_wal_only` | WAL append returned: the record is established and the next start replays it into Parquet |
+| `quality_events_wal_unconfirmed` | append raised after assigning an id (e.g. fsync failed): a record *may* exist; neither "retained" nor "lost" |
+| `quality_events_lost` | no WAL record and no usable writer: gone. Bounded log (first, then powers of two) + one alert |
+
+Verified against reality, not just against each other: the WAL on disk holds exactly the `wal_only` events,
+none of them is checkpointed, and a restart on a healthy disk publishes each exactly once.
+
+**Unchanged by design.** Raw-evidence fatal → exit 70 (also while quality is degraded); real order-book writer
+fatal → isolate the `orderbook` route; unknown typed fatal → terminate; ordinary exception → P0-1 (a plain exception
+from the quality writer on the book path still drops that frame's row; the adapter still swallows ordinary
+exceptions from its sink).
+
+**Remaining limitations.**
+
+* While degraded, every event is still appended to the quality WAL and its seq kept in memory
+  (`_quality_wal_inflight`). WAL size rotation only runs from the segment-published hook, which never fires for a
+  dead writer, so a long degradation with a high event rate grows the WAL until restart. Same as USD-M.
+* Events already buffered in the failed segment before the trip are covered by their in-flight seqs but are not
+  counted in `quality_events_wal_only` (the counter is a lower bound).
+* The counters are in-process: they restart at 0 with the process; replayed events are not re-counted.
+* `quality_channel_status()` is exposed on the runner object; Bybit has no status printout or health endpoint
+  wired to it yet.
+* Not exercised against a real full disk or under systemd (fault injection at `os.replace` / WAL `fsync`).
 
 ## Not changed
 
