@@ -237,7 +237,14 @@ class StandaloneFailurePolicy:
         """Recursion-safe, never raises. Structured log first; an operator alert;
         then the runner's own reporter -- but never through the quality writer
         for a quality failure (it may be the failed component)."""
-        if self._reporting:
+        # ``_reporting`` stops a NON-quality report from nesting inside another
+        # one (the runner's reporter writes to the quality stream). A quality
+        # record may nest: it only logs and alerts -- ``_report_extra`` is never
+        # called for it, so nothing here can reach the failed quality writer. On
+        # a full disk the quality write made by a raw/derived failure's reporter
+        # fails too; without this the quality latch would be recorded silently.
+        nested = self._reporting
+        if nested and record.verdict != VERDICT_DEGRADE_QUALITY:
             return
         self._reporting = True
         try:
@@ -256,7 +263,7 @@ class StandaloneFailurePolicy:
                     logger.error("storage_failure_report_failed", venue=self.venue,
                                  error=f"{type(exc).__name__}: {exc}")
         finally:
-            self._reporting = False
+            self._reporting = nested
 
     # -- route isolation -----------------------------------------------------
 

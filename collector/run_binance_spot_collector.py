@@ -124,6 +124,13 @@ class BinanceSpotCollectorApp:
         self.url = url
         self.snapshot_url = snapshot_url
 
+        # Quality events NOT persisted because the quality channel is degraded:
+        # the event that tripped the latch plus every later one, which is
+        # short-circuited without calling the failed writer. A counter, never a
+        # log line per event. Set before any writer exists: a writer may emit
+        # through ``_persist_quality_event`` while it is being constructed.
+        self.quality_events_lost = 0
+
         self.quality_writer = ParquetWriter(
             venue_stream(VENUE, "quality_events"), QUALITY_EVENTS_SCHEMA,
             base_dir=data_dir, exchange="BINANCE_SPOT", segment_rows=1, segment_seconds=1)
@@ -213,8 +220,9 @@ class BinanceSpotCollectorApp:
 
     def _report_storage_failure(self, record: FailureRecord) -> None:
         """Durable record of a NEW derived/raw failure in this venue's quality
-        stream. Never called for a quality failure (the policy skips it), and
-        ``_persist_quality_event`` itself never raises."""
+        stream. Never called for a quality failure (the policy skips it).
+        ``_persist_quality_event`` contains a quality-channel fatal itself; the
+        policy guards this reporter against anything else it raises."""
         self._persist_quality_event({
             "exchange": VENUE, "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
             "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
@@ -277,7 +285,35 @@ class BinanceSpotCollectorApp:
 
     # -- quality events -------------------------------------------------------
 
+    @property
+    def quality_degraded(self):
+        """The latched quality-channel ``FailureRecord`` (or ``None`` while healthy)."""
+        return self.failure_policy.quality_degraded
+
+    def quality_channel_status(self) -> dict:
+        """Operator view of the quality channel. Market-data capture is unaffected
+        by a degraded channel. This runner keeps NO durable quality WAL, so every
+        event counted in ``quality_events_lost`` is gone, not retained."""
+        record = self.failure_policy.quality_degraded
+        return {"quality_degraded": record is not None,
+                "quality_events_lost": self.quality_events_lost,
+                "quality_failure": None if record is None else record.as_dict()}
+
     def _persist_quality_event(self, event: dict) -> None:
+        """Single choke point for every Spot quality event.
+
+        F5: a typed ``FatalStorageError`` from THIS runner's quality writer means
+        that writer is FAILED. It is latched exactly once through
+        ``failure_policy`` (degrade the quality channel; origin
+        ``quality_writer``) and contained -- market-data capture keeps running.
+        After the latch the failed writer is never called again and later events
+        only bump ``quality_events_lost``: no error log and no alert per event.
+        A typed fatal of any OTHER stream is re-raised (never swallowed by the
+        quality handler); an ordinary exception keeps the log-and-continue path."""
+        policy = getattr(self, "failure_policy", None)
+        if policy is not None and policy.quality_degraded is not None:
+            self.quality_events_lost += 1
+            return
         event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType):
             event_type = event_type.value
@@ -299,6 +335,11 @@ class BinanceSpotCollectorApp:
                 "local_receive_ts": event.get("local_receive_ts"),
                 "local_process_ts": int(time.time() * 1000),
             })
+        except FatalStorageError as exc:
+            if policy is None or not policy.is_quality_channel_failure(exc):
+                raise
+            policy.on_fatal(exc, origin="quality_writer")
+            self.quality_events_lost += 1
         except Exception as exc:  # noqa: BLE001 - quality write must not break ingest
             logger.error("spot_quality_write_failed", error=str(exc))
 

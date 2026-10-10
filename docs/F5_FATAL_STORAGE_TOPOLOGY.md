@@ -110,9 +110,24 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
     uses the **default (USD-M) stream table**, i.e. it recognises `quality_events` only. Venue runners whose
     quality sink re-raises must contain their own quality stream themselves: Bybit does so in
     `_writer_quality_sink`, which uses the runner's own table (`StandaloneFailurePolicy.is_quality_channel_failure`),
-    latches the degrade once and re-raises every other typed fatal. Spot, OKX and OKX capture-only swallow
-    quality-write exceptions inside their own `_persist_quality_event` (a log line per event, as on base), so
-    nothing escapes their sinks.
+    latches the degrade once and re-raises every other typed fatal. Spot, OKX and OKX capture-only do the same
+    inside their own `_persist_quality_event` (final fix, Finding A): a typed fatal that the runner's OWN table
+    maps to its quality stream is latched once through `StandaloneFailurePolicy.on_fatal(origin="quality_writer")`
+    (one structured log + one operator alert) and contained, so nothing escapes their sinks; any other typed
+    fatal is re-raised; an ordinary exception keeps the log-and-continue path (a log line per event, as on base).
+    Before this, the typed fatal was caught by the blanket `except Exception`, never latched, and logged once
+    per event with no alert and a healthy-looking quality state.
+  * **No WAL on these runners.** Spot, OKX and OKX capture-only keep no durable quality WAL, so a degraded
+    quality channel means the events are *lost*, not retained. Once latched, the failed writer is never called
+    again; every later event (and the one that tripped the latch) only increments `quality_events_lost`.
+    `quality_degraded` (the latched `FailureRecord`) and `quality_channel_status()` expose this on the runner,
+    and OKX capture-only adds it to the status it returns and prints. Raw capture, market-data routes and the
+    process exit status are unaffected by a quality-only failure; a later raw-evidence fatal still exits 70.
+  * `StandaloneFailurePolicy._report` lets a *quality* record nest inside another failure's report (it only logs
+    and alerts; the runner's reporter is never called for it, so nothing reaches the failed quality writer).
+    On a full disk the derived writers of Spot/OKX have no quality sink, so the first write to the quality
+    writer is the one made by the derived failure's own reporter; without this the quality latch made there
+    was recorded silently. A nested non-quality report is still suppressed.
   * Genuine raw (`raw_wire`/`raw_rest`) fatals still terminate; derived-writer fatals still isolate
     their route; a failed quality writer is never called again and never resurrected in-process.
 * **Degraded-channel accounting (remediation Parts 2A/2B)** — for each event that reaches the degraded

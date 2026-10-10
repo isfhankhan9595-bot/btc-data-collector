@@ -38,6 +38,7 @@ from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RawCapture
 from collector.collector.standalone_failure_policy import StandaloneFailurePolicy, build_stream_table
+from collector.collector.storage_errors import FatalStorageError
 from collector.collector.storage_layout import venue_stream
 from collector.collector.utils import logger
 
@@ -49,6 +50,12 @@ TERMINAL_STOP_GRACE_S = 10.0
 
 class OKXCaptureApp:
     def __init__(self, channels, inst_id: str, data_dir: str, url: str) -> None:
+        # Quality events NOT persisted because the quality channel is degraded:
+        # the event that tripped the latch plus every later one, which is
+        # short-circuited without calling the failed writer. A counter, never a
+        # log line per event. Set before any writer exists: a writer may emit
+        # through ``_persist_quality_event`` while it is being constructed.
+        self.quality_events_lost = 0
         # Own stream directories, not Binance's ``raw_wire``/``quality_events``:
         # segment sequence numbers and .tmp files are scoped to a stream
         # directory, so sharing one with the Binance runner shares both. The
@@ -93,15 +100,44 @@ class OKXCaptureApp:
 
     def _report_storage_failure(self, record: FailureRecord) -> None:
         """Durable record of a NEW raw failure in this venue's quality stream.
-        Never called for a quality failure (the policy skips it), and
-        ``_persist_quality_event`` itself never raises."""
+        Never called for a quality failure (the policy skips it).
+        ``_persist_quality_event`` contains a quality-channel fatal itself; the
+        policy guards this reporter against anything else it raises."""
         self._persist_quality_event({
             "exchange": "OKX", "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
             "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
                        f"stage={record.stage}:durability={record.durability}:origin={record.origin}"),
             "local_ts": record.first_observed_ts})
 
+    @property
+    def quality_degraded(self):
+        """The latched quality-channel ``FailureRecord`` (or ``None`` while healthy)."""
+        return self.failure_policy.quality_degraded
+
+    def quality_channel_status(self) -> dict:
+        """Operator view of the quality channel. Raw capture is unaffected by a
+        degraded channel. This runner keeps NO durable quality WAL, so every
+        event counted in ``quality_events_lost`` is gone, not retained."""
+        record = self.failure_policy.quality_degraded
+        return {"quality_degraded": record is not None,
+                "quality_events_lost": self.quality_events_lost,
+                "quality_failure": None if record is None else record.as_dict()}
+
     def _persist_quality_event(self, event: dict) -> None:
+        """Single choke point for every OKX capture quality event.
+
+        F5: a typed ``FatalStorageError`` from THIS runner's quality writer means
+        that writer is FAILED. It is latched exactly once through
+        ``failure_policy`` (degrade the quality channel; origin
+        ``quality_writer``) and contained -- raw capture keeps running. After the
+        latch the failed writer is never called again and later events only bump
+        ``quality_events_lost``: no error log and no alert per event. A typed
+        fatal of any OTHER stream is re-raised (never swallowed by the quality
+        handler); an ordinary exception keeps the log-and-continue path."""
+        policy = getattr(self, "failure_policy", None)
+        if policy is not None and policy.quality_degraded is not None:
+            self.quality_events_lost += 1
+            return
         event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType):
             event_type = event_type.value
@@ -120,6 +156,11 @@ class OKXCaptureApp:
                 "local_receive_ts": event.get("local_receive_ts"),
                 "local_ts": local_ts,
             })
+        except FatalStorageError as exc:
+            if policy is None or not policy.is_quality_channel_failure(exc):
+                raise
+            policy.on_fatal(exc, origin="quality_writer")
+            self.quality_events_lost += 1
         except Exception as exc:  # noqa: BLE001 - never break capture
             logger.error("okx_quality_write_failed", error=str(exc))
 
@@ -159,7 +200,7 @@ class OKXCaptureApp:
                 helper.cancel()
             await asyncio.gather(*helpers, return_exceptions=True)
             self.close()
-        return self.capture.status()
+        return {**self.capture.status(), **self.quality_channel_status()}
 
     def close(self) -> None:
         for writer in (self.raw_wire_writer, self.quality_writer):
