@@ -181,7 +181,7 @@ def test_quality_writer_fatal_latches_once_with_one_alert_and_bounded_logs(kind,
         policy = app.failure_policy
         assert app.quality_degraded is None and app.quality_channel_status() == {
             "quality_degraded": False, "quality_events_lost": 0, "quality_events_unconfirmed": 0,
-            "quality_failure": None}
+            "quality_wal": False, "quality_failure": None}
         _Disk(monkeypatch).arm(app.quality_writer)
         writes = _spy_quality_writer(app)
         latches = _spy_on_fatal(policy)
@@ -202,20 +202,26 @@ def test_quality_writer_fatal_latches_once_with_one_alert_and_bounded_logs(kind,
         # the failed writer is never called again
         assert len(writes) == 1, f"the FAILED quality writer was called {len(writes)} times"
 
-        # exactly one bounded operator alert, and the log volume does NOT grow with the event count
+        # exactly one operator alert, and the log volume does NOT grow with the event count:
+        # A2 reports losses at a bounded cadence (first, then powers of two), never one per event
         assert len(alerts) == 1 and len(_quality_alerts(alerts, app)) == 1, alerts
-        assert _error_events(caplog) == errors_after_first, "an error log was emitted per later event"
         errors = _error_events(caplog)
+        loss_logs = [e for e in errors if e.endswith("_quality_event_lost")]
+        assert [e for e in errors if e not in loss_logs] == [e for e in errors_after_first
+                                                              if not e.endswith("_quality_event_lost")], \
+            "an unrelated error log was emitted per later event"
+        assert 1 <= len(loss_logs) <= N_EVENTS.bit_length() < N_EVENTS // 4, "loss logging is not bounded"
         assert errors.count("storage_failure_latched") == 1
         assert QUALITY_WRITE_FAILED_LOG[kind] not in errors
-        assert len(errors) <= 3
+        assert len(errors) <= 3 + N_EVENTS.bit_length()
 
         # observable, and honest about loss: no WAL is claimed for a runner that has none
         status = app.quality_channel_status()
         assert status["quality_degraded"] is True and status["quality_events_lost"] == N_EVENTS
         assert status["quality_failure"]["origin"] == "quality_writer"
         assert not hasattr(app, "_quality_wal")
-        assert "wal" not in (alerts[0] + json.dumps(status)).lower()
+        assert status["quality_wal"] is False, "the status must say these runners have no quality WAL"
+        assert "wal" not in alerts[0].lower(), "the alert must not claim a WAL"
     finally:
         _cleanup_any(app)
 

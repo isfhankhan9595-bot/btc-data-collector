@@ -124,6 +124,26 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
     `quality_degraded` (the latched `FailureRecord`) and `quality_channel_status()` expose this on the runner,
     and OKX capture-only adds it to the status it returns and prints. Raw capture, market-data routes and the
     process exit status are unaffected by a quality-only failure; a later raw-evidence fatal still exits 70.
+  * **Operator visibility of the loss (A2).** The same three runners report the loss through one shared mixin
+    (`DegradedQualityLossReporting` in `standalone_failure_policy.py`), so they cannot drift:
+    * *Bounded logs.* The first lost event is logged, then only at power-of-two counts (1, 2, 4, 8, ...): the
+      number of lines grows with log2 of the losses, never with the losses. Events are
+      `<spot|okx|okx_capture>_quality_event_lost`, each with the running totals, the stream / event type /
+      (truncated) reason of the event that reached that count, `quality_wal=False` and a note that the runner
+      keeps no quality WAL and the event cannot be recovered. No extra alert: the one-time latch alert is the
+      policy's and is unchanged, and the failed writer is still never retried.
+    * *Distinct counters.* `quality_events_lost` (demonstrably not persisted) and `quality_events_unconfirmed`
+      (the A4 trigger event whose durability could not be established) are counted and logged separately, each on
+      its own cadence (`..._quality_event_unconfirmed`). An unconfirmed event is never labelled lost or retained and
+      its report never says it is unrecoverable. Event disposition (A4) is unchanged.
+    * *Status.* `quality_channel_status()` gains `quality_wal: False` (always). In-repository consumers: the OKX
+      capture-only `run()` result / printed JSON (spreads the status, so it carries the field) and the tests;
+      nothing else reads this status.
+    * *Shutdown.* Once every writer has been closed, `shutdown()` (Spot, OKX) and `close()` (OKX capture-only)
+      log `<prefix>_quality_channel_final` with the final counters, only if the channel ever degraded and once
+      per distinct snapshot. It never raises, so it cannot mask an existing failure, change the exit status or
+      prevent writer cleanup. A process that is killed (`SIGKILL`, crash) never reaches it; the periodic
+      power-of-two lines are then the record.
   * `StandaloneFailurePolicy._report` lets a *quality* record nest inside another failure's report (it only logs
     and alerts; the runner's reporter is never called for it, so nothing reaches the failed quality writer).
     On a full disk the derived writers of Spot/OKX have no quality sink, so the first write to the quality
@@ -143,7 +163,7 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
   (checkpoint blocked) but are not added to `_quality_events_wal_only`. An ordinary (non-typed) quality
   writer exception is not degraded-channel accounting. These counters exist in the Binance USD-M
   `CollectorApp` and (final fix, Part 2) in `BybitCollectorApp`; Spot, OKX and OKX capture-only keep no WAL and
-  expose the single `quality_events_lost` counter instead.
+  expose `quality_events_lost` plus `quality_events_unconfirmed` (A4) and `quality_wal: False` (A2) instead.
 * **Shutdown** — unchanged order. A failed writer's `close()` raising does not stop the other
   writers from closing (`_close_writer_reporting_failure`).
 

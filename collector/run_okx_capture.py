@@ -37,7 +37,8 @@ from collector.collector.failure_topology import FailureRecord
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RawCapture
-from collector.collector.standalone_failure_policy import StandaloneFailurePolicy, build_stream_table
+from collector.collector.standalone_failure_policy import (
+    DegradedQualityLossReporting, StandaloneFailurePolicy, build_stream_table)
 from collector.collector.storage_errors import EVENT_LOST, EVENT_UNCONFIRMED, FatalStorageError
 from collector.collector.storage_layout import venue_stream
 from collector.collector.utils import logger
@@ -48,15 +49,18 @@ from collector.collector.utils import logger
 TERMINAL_STOP_GRACE_S = 10.0
 
 
-class OKXCaptureApp:
+class OKXCaptureApp(DegradedQualityLossReporting):
+    quality_log_prefix = "okx_capture"
+
     def __init__(self, channels, inst_id: str, data_dir: str, url: str) -> None:
         # Quality events NOT persisted because the quality channel is degraded:
         # every later event (short-circuited without calling the failed writer)
         # plus the event that tripped the latch IF it is demonstrably not
         # durable. The tripping event is judged from the writer's evidence
         # (``_account_trigger_event``): published -> counted nowhere,
-        # unconfirmed -> ``quality_events_unconfirmed``, lost -> here. A counter,
-        # never a log line per event. Set before any writer exists: a writer may
+        # unconfirmed -> ``quality_events_unconfirmed``, lost -> here. A counter
+        # reported at a bounded cadence (first, then powers of two), never a log line
+        # per event. Set before any writer exists: a writer may
         # emit through ``_persist_quality_event`` while it is being constructed.
         self.quality_events_lost = 0
         # The tripping event whose durability could not be established either way
@@ -134,14 +138,16 @@ class OKXCaptureApp:
         degraded channel. This runner keeps NO durable quality WAL, so every
         event counted in ``quality_events_lost`` is gone, not retained;
         ``quality_events_unconfirmed`` counts the tripping event whose
-        durability could not be established (neither lost nor retained)."""
+        durability could not be established (neither lost nor retained).
+        ``quality_wal`` is always ``False``: nothing counted lost can be recovered."""
         record = self.failure_policy.quality_degraded
         return {"quality_degraded": record is not None,
                 "quality_events_lost": self.quality_events_lost,
                 "quality_events_unconfirmed": self.quality_events_unconfirmed,
+                "quality_wal": False,
                 "quality_failure": None if record is None else record.as_dict()}
 
-    def _account_trigger_event(self, exc: FatalStorageError) -> None:
+    def _account_trigger_event(self, exc: FatalStorageError, event: dict | None = None) -> None:
         """Count the ONE event whose ``quality_writer.write`` raised ``exc``, from
         the writer's own evidence and never from the fact that it raised. That
         event may already be durable (a full segment published, then opening the
@@ -152,9 +158,9 @@ class OKXCaptureApp:
         unconfirmed one is never given a definite retained/lost outcome."""
         disposition = exc.trigger_event_disposition()
         if disposition == EVENT_LOST:
-            self.quality_events_lost += 1
+            self._count_quality_event_lost(event)
         elif disposition == EVENT_UNCONFIRMED:
-            self.quality_events_unconfirmed += 1
+            self._count_quality_event_unconfirmed(event)
 
     def _latch_pre_policy_quality_failure(self) -> None:
         """Latch, once, a quality-writer failure held while the policy did not
@@ -173,13 +179,14 @@ class OKXCaptureApp:
         ``failure_policy`` (degrade the quality channel; origin
         ``quality_writer``) and contained -- raw capture keeps running. After the
         latch the failed writer is never called again and later events only bump
-        ``quality_events_lost``: no error log and no alert per event. A typed
+        ``quality_events_lost``: no alert per event, and a log line only at a bounded
+        cadence (first loss, then powers of two; see ``DegradedQualityLossReporting``). A typed
         fatal of any OTHER stream is re-raised (never swallowed by the quality
         handler); an ordinary exception keeps the log-and-continue path."""
         policy = getattr(self, "failure_policy", None)
         if (policy is not None and policy.quality_degraded is not None) \
                 or self._pre_policy_quality_failure is not None:
-            self.quality_events_lost += 1
+            self._count_quality_event_lost(event)
             return
         event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType):
@@ -208,12 +215,12 @@ class OKXCaptureApp:
                 if exc.stream != self.quality_writer.stream_name:
                     raise
                 self._pre_policy_quality_failure = exc
-                self._account_trigger_event(exc)
+                self._account_trigger_event(exc, event)
                 return
             if not policy.is_quality_channel_failure(exc):
                 raise
             policy.on_fatal(exc, origin="quality_writer")
-            self._account_trigger_event(exc)
+            self._account_trigger_event(exc, event)
         except Exception as exc:  # noqa: BLE001 - never break capture
             logger.error("okx_quality_write_failed", error=str(exc))
 
@@ -261,6 +268,8 @@ class OKXCaptureApp:
                 writer.close()
             except Exception as exc:  # noqa: BLE001
                 logger.error("okx_writer_close_failed", error=str(exc))
+        # Last, so the counts include anything the closes above reported. Cannot raise.
+        self._report_quality_channel_final()
 
 
 def build_parser() -> argparse.ArgumentParser:

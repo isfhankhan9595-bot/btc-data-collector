@@ -54,6 +54,8 @@ __all__ = [
     "EXIT_FATAL_STORAGE", "EXIT_RUN_TASK_CRASHED", "SHUTDOWN_TASK_TIMEOUT_S",
     "DEDUP_DEFAULT_STREAM", "ROUTE_TAG_ATTRIBUTE", "tag_route", "build_stream_table",
     "StandaloneFailurePolicy", "supervise_standalone_runner",
+    "NO_QUALITY_WAL_NOTE", "UNCONFIRMED_QUALITY_EVENT_NOTE", "is_bounded_report_point",
+    "DegradedQualityLossReporting",
 ]
 
 #: Exit status when the application task died of an exception that is NOT a
@@ -272,6 +274,102 @@ class StandaloneFailurePolicy:
 
     def note_short_circuit(self, route: str) -> None:
         self.route_short_circuits[route] = self.route_short_circuits.get(route, 0) + 1
+
+
+#: Said in every loss report, and in the status as ``quality_wal: False``: these
+#: runners (Binance Spot, OKX, OKX capture-only) have NO quality WAL, so a quality
+#: event that was not persisted is gone. Nothing here can recover it.
+NO_QUALITY_WAL_NOTE = ("this runner keeps no quality WAL: an event counted as lost is gone and "
+                       "cannot be recovered")
+
+#: An ``unconfirmed`` event is never given a definite outcome.
+UNCONFIRMED_QUALITY_EVENT_NOTE = ("durability could not be established: the event is neither "
+                                  "confirmed lost nor confirmed retained")
+
+#: Longest ``reason`` copied into a loss log line (a log line must stay bounded).
+_LOSS_LOG_REASON_MAX = 200
+
+
+def is_bounded_report_point(count: int) -> bool:
+    """True for 1, 2, 4, 8, ...: the counts at which a loss is logged. The first
+    loss is always reported, and the number of reports grows with log2 of the
+    losses, never with the losses themselves."""
+    return count > 0 and (count & (count - 1)) == 0
+
+
+class DegradedQualityLossReporting:
+    """Operator visibility for a degraded quality channel on a runner with NO quality WAL.
+
+    Shared by Binance Spot, OKX and OKX capture-only so the three cannot drift. The
+    host class provides ``quality_events_lost``, ``quality_events_unconfirmed``,
+    ``failure_policy`` and a ``quality_log_prefix`` (the log-event prefix, e.g.
+    ``spot``). The counters must exist before any writer does: a writer may emit a
+    quality event while it is being constructed.
+
+    Reporting is separate from accounting. The increment always happens; logging a
+    count is best-effort and never raises into market data, a latch or a shutdown.
+    This class never touches the failed quality writer, the failure policy's
+    verdicts or an exit code, and sends no alert: the one-time latch alert stays the
+    policy's.
+    """
+
+    quality_log_prefix: str = "runner"
+
+    def _count_quality_event_lost(self, event: Optional[Mapping[str, Any]] = None) -> None:
+        """One quality event demonstrably not persisted (and unrecoverable: no WAL)."""
+        self.quality_events_lost += 1
+        count = self.quality_events_lost
+        if is_bounded_report_point(count):
+            self._log_quality_loss("quality_event_lost", count, event, NO_QUALITY_WAL_NOTE)
+
+    def _count_quality_event_unconfirmed(self, event: Optional[Mapping[str, Any]] = None) -> None:
+        """One quality event whose durability could not be established either way."""
+        self.quality_events_unconfirmed += 1
+        count = self.quality_events_unconfirmed
+        if is_bounded_report_point(count):
+            self._log_quality_loss("quality_event_unconfirmed", count, event,
+                                   UNCONFIRMED_QUALITY_EVENT_NOTE)
+
+    def _log_quality_loss(self, name: str, count: int, event: Optional[Mapping[str, Any]],
+                          note: str) -> None:
+        try:
+            event = event or {}
+            event_type = event.get("event_type")
+            reason = event.get("reason")
+            logger.error(
+                f"{self.quality_log_prefix}_{name}", count=count,
+                quality_events_lost=self.quality_events_lost,
+                quality_events_unconfirmed=self.quality_events_unconfirmed,
+                quality_wal=False, stream=event.get("stream"),
+                event_type=None if event_type is None else str(getattr(event_type, "value", event_type)),
+                reason=None if reason is None else str(reason)[:_LOSS_LOG_REASON_MAX], note=note)
+        except Exception:  # noqa: BLE001 - reporting a loss must never raise into market data
+            pass
+
+    def _report_quality_channel_final(self) -> None:
+        """Log the final counters once at shutdown, if the channel ever degraded.
+
+        Called AFTER every writer has been closed, so the counts include anything the
+        close path itself reported. It never raises, so a failure here cannot mask an
+        existing failure or prevent cleanup. A healthy runner logs nothing, and an
+        unchanged snapshot is not logged twice."""
+        try:
+            lost = self.quality_events_lost
+            unconfirmed = self.quality_events_unconfirmed
+            policy = getattr(self, "failure_policy", None)
+            degraded = policy is not None and policy.quality_degraded is not None
+            if not (degraded or lost or unconfirmed):
+                return
+            snapshot = (degraded, lost, unconfirmed)
+            if snapshot == getattr(self, "_quality_final_reported", None):
+                return
+            self._quality_final_reported = snapshot
+            logger.error(
+                f"{self.quality_log_prefix}_quality_channel_final", quality_degraded=degraded,
+                quality_events_lost=lost, quality_events_unconfirmed=unconfirmed, quality_wal=False,
+                note=f"{NO_QUALITY_WAL_NOTE}; unconfirmed events are neither confirmed lost nor confirmed retained")
+        except Exception:  # noqa: BLE001 - a final report must never mask a failure or stop cleanup
+            pass
 
 
 async def _bounded_wait(task: "asyncio.Future[Any]", timeout: float, what: str) -> None:

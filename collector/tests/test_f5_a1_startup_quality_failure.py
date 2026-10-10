@@ -172,7 +172,8 @@ def test_startup_completes_and_the_quality_failure_is_latched_once_with_one_aler
         assert status["quality_degraded"] is True and status["quality_events_lost"] == emitted
         assert status["quality_failure"]["origin"] == "quality_writer"
         assert not hasattr(app, "_quality_wal")
-        assert "wal" not in (alerts[0] + json.dumps(status)).lower()
+        assert status["quality_wal"] is False, "the status must say these runners have no quality WAL"
+        assert "wal" not in alerts[0].lower(), "the alert must not claim a WAL"
     finally:
         _cleanup_any(app)
 
@@ -193,7 +194,10 @@ def test_the_failed_quality_writer_is_not_retried_during_or_after_startup(kind, 
         assert len(calls) == 1, f"the FAILED quality writer was called again ({len(calls)} calls)"
         assert app.quality_channel_status()["quality_events_lost"] == emitted + LATER_EVENTS
         assert len(alerts) == 1, "later events must not raise further alerts"
-        assert _error_events(caplog) == errors_after_startup, "an error log was emitted per later event"
+        # A2: a loss is logged at a bounded cadence (first, then powers of two); anything else is silent
+        later = _error_events(caplog)[len(errors_after_startup):]
+        assert all(e.endswith("_quality_event_lost") for e in later), later
+        assert len(later) <= LATER_EVENTS and len(later) <= (emitted + LATER_EVENTS).bit_length()
         assert len(app.failure_policy.failed_components) == 1 and app.failure_policy.failure_repeats == {}
     finally:
         _cleanup_any(app)
