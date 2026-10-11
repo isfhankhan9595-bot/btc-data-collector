@@ -89,6 +89,9 @@ from collector.collector.standalone_failure_policy import (
 )
 from collector.collector.storage_errors import EVENT_PUBLISHED, EVENT_UNCONFIRMED, FatalStorageError
 from collector.collector.utils import logger, send_telegram_alert
+from collector.collector.disk_pressure import (
+    EXIT_DISK_PRESSURE, DiskPressureConfig, Severity, StoragePressureMonitor,
+)
 from collector.collector.websocket_client import Keepalive, WebSocketClient
 
 
@@ -195,12 +198,70 @@ class BybitCollectorApp:
             stream_group="bybit",
             on_fatal=self._on_fatal_storage,
         )
+        # F5-QA-04: continuous storage-pressure monitor for THIS runner's data / WAL directories.
+        # An invalid threshold configuration raises here: startup fails, nothing is coerced.
+        self._disk_emergency = None
+        self._disk_task = None
+        self.stop_event = None      # set by ``_run_supervised``: the supervisor's own stop request
+        self.storage_pressure = StoragePressureMonitor(
+            label="BYBIT", config=DiskPressureConfig.from_env(),
+            paths=lambda: [self.quality_writer.base_dir, self._quality_wal.wal_dir],
+            wal_dir=lambda: self._quality_wal.wal_dir,
+            checkpoint_state=lambda: (self._quality_checkpoint_is_blocked(),
+                                      getattr(self, "_quality_checkpoint_block_reason", None)))
 
     # -- F5 failure topology ------------------------------------------------
 
     @property
     def exit_code(self) -> int:
-        return self.failure_policy.exit_code
+        code = self.failure_policy.exit_code
+        if code == 0 and getattr(self, "_disk_emergency", None) is not None:
+            return EXIT_DISK_PRESSURE          # 70 keeps priority over a disk-pressure stop
+        return code
+
+    # -- F5-QA-04 storage pressure ---------------------------------------------
+
+    def storage_pressure_status(self) -> dict:
+        """Read-only storage-pressure view, separate from ``quality_channel_status`` (writer
+        failure / lost / unconfirmed / WAL-only counters are not touched by disk pressure)."""
+        monitor = getattr(self, "storage_pressure", None)
+        if monitor is None:
+            return {"monitoring": False, "severity": Severity.UNKNOWN.value}
+        return monitor.status()
+
+    @property
+    def disk_emergency(self):
+        return getattr(self, "_disk_emergency", None)
+
+    def storage_pressure_preflight_failed(self) -> bool:
+        """True when storage is ALREADY at EMERGENCY pressure. The caller shuts down through
+        ``shutdown()`` and never starts the websocket client. A failed measurement does not
+        block startup; the periodic task keeps retrying and alerting."""
+        monitor = getattr(self, "storage_pressure", None)
+        if monitor is None:
+            return False
+        if monitor.poll().severity != Severity.EMERGENCY:
+            return False
+        self._disk_emergency = monitor.status()
+        logger.error("bybit_storage_pressure_emergency_at_startup", exit_status=EXIT_DISK_PRESSURE)
+        return True
+
+    def _on_disk_emergency(self, result) -> None:
+        """Runtime EMERGENCY: latch (exit status 1) and ask the supervisor for its normal
+        controlled stop (the same event a SIGTERM sets). Raises if no stop channel exists, so
+        the monitor retries instead of silently giving up."""
+        monitor = getattr(self, "storage_pressure", None)
+        self._disk_emergency = monitor.status() if monitor is not None else {"severity": "EMERGENCY"}
+        logger.error("bybit_storage_pressure_emergency_shutdown", exit_status=EXIT_DISK_PRESSURE)
+        stop = getattr(self, "stop_event", None)
+        if stop is None:
+            raise RuntimeError("no supervisor stop channel for the disk-pressure emergency")
+        stop.set()
+
+    async def _storage_pressure_loop(self) -> None:
+        monitor = getattr(self, "storage_pressure", None)
+        if monitor is not None:
+            await monitor.run(self._on_disk_emergency)
 
     def _on_fatal_storage(self, exc, origin: str = "handler", *, route=None) -> str:
         """Classify and latch one typed storage fatal (see ``failure_policy``).
@@ -918,10 +979,15 @@ class BybitCollectorApp:
 
     async def run(self) -> None:
         self.running = True
+        self._disk_task = asyncio.create_task(self._storage_pressure_loop())
         await self.client.start()
 
     async def shutdown(self) -> None:
         self.running = False
+        # F5-QA-04: stop the (read-only) monitor first; it touches no writer or WAL.
+        task = getattr(self, "_disk_task", None)
+        if task is not None and not task.done():
+            task.cancel()
         # Every step is guarded: none may stop the writer closes below.
         # ``WebSocketClient.stop()`` is a plain method returning ``None``;
         # awaiting it unconditionally raised ``TypeError`` here and skipped
@@ -997,7 +1063,28 @@ async def _main(data_dir: str, url: str) -> int:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass  # not available on this platform
-    return await supervise_standalone_runner(app, stop)
+    return await _run_supervised(app, stop)
+
+
+async def _run_supervised(app: "BybitCollectorApp", stop: asyncio.Event) -> int:
+    """Startup disk preflight, then the standard supervised run (F5-QA-04).
+
+    A disk-pressure EMERGENCY (at startup or at runtime) ends in the supervisor's normal
+    controlled shutdown and exit status ``EXIT_DISK_PRESSURE`` (1). Status 70 (a terminal
+    raw-evidence storage failure) and an ordinary task crash keep their own statuses.
+    Nothing restarts Bybit: there is no systemd unit for this runner, so after an emergency
+    stop it stays stopped unless an external supervisor is configured."""
+    app.stop_event = stop
+    if app.storage_pressure_preflight_failed():
+        try:
+            await app.shutdown()
+        except Exception as exc:  # noqa: BLE001 - controlled and logged, never masks the exit status
+            logger.error("bybit_startup_emergency_shutdown_failed", error=f"{type(exc).__name__}: {exc}")
+        return EXIT_DISK_PRESSURE
+    status = await supervise_standalone_runner(app, stop)
+    if status == 0 and app.disk_emergency is not None:
+        return EXIT_DISK_PRESSURE
+    return status
 
 
 if __name__ == "__main__":

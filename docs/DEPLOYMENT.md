@@ -45,6 +45,11 @@ Not in the unit. `EnvironmentFile=/etc/btc-collector.env` (root-owned, 0600) sup
   counts toward `StartLimitBurst` like any other failed start. A *derived* writer failure does not
   exit: only that route is isolated and the operator is alerted. The unit file is unchanged;
   behaviour under a real systemd/disk fault is not verified live. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
+- **F5-QA-04 disk pressure:** both WAL-backed runners monitor free space continuously (defaults warn at
+  7 GiB, critical at 4 GiB, controlled stop with exit status **1** below 2 GiB; configurable via
+  `COLLECTOR_DISK_*`). There is no hard WAL size cap. The unit file is unchanged and Bybit has no unit,
+  so it stays stopped after an emergency stop unless an external supervisor is configured. See
+  `F5_QA_04_STORAGE_PRESSURE.md`.
 
 ## Runner coverage (repository evidence, P0-12 finalization)
 

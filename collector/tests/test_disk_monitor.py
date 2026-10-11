@@ -1,44 +1,44 @@
-import pytest
 import sys
+
 from collector.collector.disk_monitor import DiskMonitor
 
+
+class _MockShutil:
+    def __init__(self, free_gib):
+        self._free = int(free_gib * 1024 ** 3)
+
+    def disk_usage(self, path):
+        return (1000 * 1024 ** 3, 1000 * 1024 ** 3 - self._free, self._free)
+
+
 def test_disk_monitor_get_free_gb(monkeypatch):
-    class MockShutil:
-        @staticmethod
-        def disk_usage(path):
-            return (1000 * 1024**3, 500 * 1024**3, 500 * 1024**3)
+    monkeypatch.setattr("collector.collector.disk_monitor.shutil", _MockShutil(500))
+    assert DiskMonitor().get_free_gb() == 500.0
 
-    monkeypatch.setattr("collector.collector.disk_monitor.shutil", MockShutil)
 
+def test_disk_monitor_uses_the_configured_directory(monkeypatch):
+    seen = []
+
+    class Spy(_MockShutil):
+        def disk_usage(self, path):
+            seen.append(path)
+            return super().disk_usage(path)
+
+    monkeypatch.setattr("collector.collector.disk_monitor.shutil", Spy(10))
+    DiskMonitor(data_dir="/some/other/dir").get_free_gb()
+    assert seen == ["/some/other/dir"]
+
+
+def test_disk_monitor_never_exits_or_calls_back_even_below_emergency(monkeypatch):
+    """F5-QA-04: the monitor is a probe. It must not call sys.exit or a shutdown callback
+    (the old emergency path ran against a half-initialised app)."""
+    monkeypatch.setattr("collector.collector.disk_monitor.shutil", _MockShutil(1))
+
+    def boom(code=None):  # pragma: no cover - must not run
+        raise AssertionError("DiskMonitor must not call sys.exit")
+
+    monkeypatch.setattr(sys, "exit", boom)
     monitor = DiskMonitor()
-    assert monitor.get_free_gb() == 500.0
-
-def test_disk_monitor_emergency(monkeypatch):
-    class MockShutil:
-        @staticmethod
-        def disk_usage(path):
-            return (1000 * 1024**3, 999 * 1024**3, 1 * 1024**3) # 1GB free
-
-    monkeypatch.setattr("collector.collector.disk_monitor.shutil", MockShutil)
-
-    # Mock sys.exit
-    exited = False
-    shutdown_called = False
-    def mock_exit(code):
-        nonlocal exited
-        exited = True
-
-    def mock_shutdown():
-        nonlocal shutdown_called
-        shutdown_called = True
-
-    monkeypatch.setattr(sys, "exit", mock_exit)
-
-    # Mock telegram
-    monkeypatch.setattr("collector.collector.disk_monitor.send_telegram_alert", lambda msg: None)
-
-    monitor = DiskMonitor(shutdown_callback=mock_shutdown)
-    monitor.check_disk_space()
-
-    assert shutdown_called
-    assert exited
+    assert monitor.get_free_gb() == 1.0
+    assert not hasattr(monitor, "check_disk_space")
+    assert not hasattr(monitor, "shutdown_callback")
