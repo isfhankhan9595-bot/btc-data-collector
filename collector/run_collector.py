@@ -621,8 +621,12 @@ class CollectorApp:
 
     def _block_quality_checkpoint(self, why: str) -> None:
         """Latch: stop advancing the WAL checkpoint for the rest of this
-        process's life. Everything stays in the WAL and is reconciled (same
-        quality_event_id) by the next startup's recovery. Fail closed."""
+        process's life. Everything stays in the WAL and is REPLAYED by the next
+        startup's recovery (at-least-once). Events published while the latch is
+        set remain uncheckpointed until restart, so the replay can write a
+        second row with the same quality_event_id. The collector does not
+        reconcile or deduplicate those rows; that is a downstream
+        responsibility. Fail closed."""
         self._ensure_quality_state()
         if not self._quality_checkpoint_blocked:
             self._quality_checkpoint_block_reason = why
@@ -730,8 +734,9 @@ class CollectorApp:
         # returns events in strict seq order, so the first failure is the
         # correct place to stop advancing the checkpoint; the failed event
         # and everything after it remain in the WAL, recoverable on the
-        # next restart (potentially re-persisted as a reconcilable
-        # duplicate, per this module's own accepted design).
+        # next restart (potentially re-persisted as a duplicate row with the
+        # same quality_event_id: replay is at-least-once and the collector
+        # does not deduplicate; reconciliation is downstream).
         # Replay in strict seq order. Each event is tracked in-flight BEFORE
         # it is written and only leaves in-flight when its segment is
         # published, so the checkpoint can only ever reach the contiguous
@@ -743,7 +748,9 @@ class CollectorApp:
             try:
                 # "_wal_seq" = this event is already durably in the WAL (do
                 # not append again); quality_event_id flows through so a
-                # replayed row is reconcilable with any earlier copy by id.
+                # replayed row carries the same id as any earlier copy,
+                # which lets a downstream consumer identify the duplicate
+                # (no automatic deduplication exists in the collector).
                 self._persist_quality_event({**recovered, "_wal_seq": recovered["seq"]})
             except Exception:
                 logger.error("quality_event_recovery_persist_failed", seq=recovered.get("seq"))
@@ -792,7 +799,8 @@ class CollectorApp:
                 # WAL provenance, force-publishes it (never a RAM-only row).
                 # The id was assigned before the failure and bytes may already
                 # be in the WAL file (write+flush ok, fsync failed): stamping
-                # it makes any WAL-resident copy reconcilable by id.
+                # it gives any WAL-resident copy the same id, so a downstream
+                # consumer can identify it (it is not removed automatically).
                 logger.error("quality_wal_append_failed", reason=reason)
                 event["quality_event_id"] = getattr(wal_exc, "quality_event_id", None)
                 try:

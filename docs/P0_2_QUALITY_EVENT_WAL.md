@@ -87,9 +87,11 @@ Parquet." Three properties, each independently tested:
    the instant any event fails to persist, via
    `_block_quality_checkpoint()` -- a latch that, once set, blocks every
    later checkpoint call for the rest of the process's life. The failed
-   event and everything after it stay in the WAL, replayed (as a
-   reconcilable, same-id duplicate where it already landed once) on the
-   next restart.
+   event and everything after it stay in the WAL and are replayed on the
+   next restart. Events published while the latch is set also stay
+   uncheckpointed until then. Replay is at-least-once: where an event
+   already landed once, the replay writes a second row with the same id.
+   Published-row reconciliation is NOT implemented; see section G2.
 
 `_delete_fully_checkpointed_files()` never deletes the currently active
 file (verified directly: a test checkpoints exactly up to the active
@@ -103,8 +105,9 @@ seq check, and retried on the next checkpoint).
 If `append()` raises, the event is persisted directly and synchronously
 (`quality_writer`, `segment_rows=1`, so still fsync'd) -- carrying the
 **same** `quality_event_id` the failed append already assigned, so a
-partially-written WAL copy (write/flush succeeded, only fsync failed) is
-reconcilable rather than an anonymous duplicate if it is ever recovered.
+partially-written WAL copy (write/flush succeeded, only fsync failed)
+carries the same id as the direct row if it is ever recovered, which lets
+a downstream consumer identify it. The collector does not remove it.
 
 If that fallback *also* fails, the double failure is logged distinctly
 (`quality_event_double_failure_possible_loss`, verified via `caplog`, not
@@ -138,6 +141,30 @@ so it does not become a needless duplicate on the next restart.
 - **Correct scope statement:** the id is **WAL-directory-unique**, not
   provably globally unique. It is never claimed as globally unique in
   this document or in the module's own docstring.
+
+## G2. Delivery guarantee and duplicate reconciliation (FACT / NOT IMPLEMENTED)
+
+- **FACT:** replay is **at-least-once**. A crash, checkpoint-write failure
+  or checkpoint latch after a segment was published but before the
+  checkpoint covered it makes the next start publish that event again,
+  with the same `quality_event_id`.
+- **FACT:** `quality_event_id` identifies an event and lets a consumer
+  recognise matching replay duplicates. It is not an idempotency key that
+  any collector component enforces. No automatic quality-event
+  deduplication exists in this repository: recovery does not scan
+  published segments, and `scripts/compact_daily.py` does not process
+  quality streams. Earlier wording that called the id an idempotent key
+  "at the Parquet-compaction layer" described a layer that does not exist.
+- **FACT:** reconciliation of published rows is a downstream
+  responsibility, not an automatic collector guarantee. Rows written with
+  no WAL id have a null `quality_event_id` and cannot be matched.
+- **SUGGESTION, not existing behavior:** a future reader that wants one
+  row per event can key on `(exchange, stream, quality_event_id)`,
+  excluding null ids.
+- **Scope of durability evidence:** the tests in this repository inject
+  exceptions at syscall boundaries (and restart a second app on the same
+  directory); they do not demonstrate real power-loss behavior. Statements
+  about fsync/rename durability rest on the existing storage contract.
 
 ## H. Disk-failure analysis (Step 8) -- FACT, all deterministically injected
 

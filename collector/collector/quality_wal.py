@@ -34,6 +34,11 @@ What can still be lost: an event whose ``append()`` call was itself
 interrupted mid-write by the kill -- a single in-flight write, not the
 entire queue. ``os.fsync()`` makes a *completed* write durable; it cannot
 protect a write that never finished, and no software-only mechanism can.
+
+These statements are scoped to the storage contract that ``os.fsync()``
+returns only once the data is durable on the underlying device. The test
+suite injects exceptions at syscall boundaries; it does not demonstrate
+real power-loss behavior.
 This is a fundamentally narrower, explicitly documented loss window, not
 an unstated gap -- do not describe this as zero-loss durability, because
 it is not: it is "at most one in-flight event, never an unbounded queue".
@@ -95,6 +100,22 @@ open a new file before the old one's contents are checkpointed. A WAL file
 is never deleted, or rewritten, before its checkpoint is durable on disk;
 the checkpoint file itself is the only thing this module ever overwrites
 in place, and only atomically.
+
+============================================================================
+DELIVERY: AT-LEAST-ONCE, NO AUTOMATIC DEDUPLICATION
+============================================================================
+
+Recovery replays every record above the durable checkpoint. A crash (or a
+checkpoint-write failure / latch) after a segment was published but before
+the checkpoint covered it makes the next start write that event again, so
+the same ``quality_event_id`` can appear in more than one published row.
+``quality_event_id`` identifies an event and lets a consumer recognise
+matching replay duplicates; NO component in this repository removes or
+reconciles them. Treat delivery as at-least-once, never exactly-once.
+A downstream reader that needs one row per event can key on
+``(exchange, stream, quality_event_id)`` with null ids excluded (rows
+written without a WAL id have none). That is a suggestion for consumers,
+not existing collector behavior.
 """
 from __future__ import annotations
 
@@ -196,8 +217,11 @@ class QualityEventWAL:
                 # the file (e.g. write() and flush() succeeded but fsync()
                 # failed). Attach it so a caller that falls back to a
                 # direct write can stamp the SAME id on that row -- a
-                # WAL-resident copy recovered later is then reconcilable
-                # by id instead of being an anonymous duplicate.
+                # WAL-resident copy recovered later then carries the same
+                # id, so a downstream consumer CAN identify it as a replay
+                # of that row. The collector does not remove such a
+                # duplicate: no automatic quality-event deduplication is
+                # implemented in this repository.
                 exc.quality_event_id = event_id
                 raise
             return event_id
@@ -351,8 +375,11 @@ def _read_checkpointed_seq(wal_dir: Path) -> int:
         # A corrupted checkpoint file must never be read as "everything is
         # checkpointed" -- that would silently drop real recovery
         # candidates. Treated as "nothing checkpointed" instead: strictly
-        # safer, at the cost of a possible harmless re-persist (idempotent
-        # via quality_event_id at the Parquet-compaction layer).
+        # safer, at the cost of possible duplicate rows: a re-persisted
+        # event carries the same quality_event_id, which lets a downstream
+        # consumer identify the duplicate. Nothing in this repository
+        # deduplicates quality events automatically (replay is
+        # at-least-once; reconciliation is a downstream responsibility).
         return -1
 
 

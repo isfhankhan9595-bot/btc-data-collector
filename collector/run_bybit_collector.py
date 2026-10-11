@@ -328,8 +328,12 @@ class BybitCollectorApp:
 
     def _block_quality_checkpoint(self, why: str) -> None:
         """Latch: stop advancing the WAL checkpoint for the rest of this
-        process's life. Everything stays in the WAL and is reconciled (same
-        quality_event_id) by the next startup's recovery. Fail closed."""
+        process's life. Everything stays in the WAL and is REPLAYED by the next
+        startup's recovery (at-least-once). Events published while the latch is
+        set remain uncheckpointed until restart, so the replay can write a
+        second row with the same quality_event_id. The collector does not
+        reconcile or deduplicate those rows; that is a downstream
+        responsibility. Fail closed."""
         self._ensure_quality_state()
         if not self._quality_checkpoint_blocked:
             self._quality_checkpoint_block_reason = why
@@ -395,8 +399,10 @@ class BybitCollectorApp:
         for recovered in recovered_events:
             try:
                 # "_wal_seq" = already durably in the WAL (do not append again);
-                # quality_event_id flows through so the replayed row is
-                # reconcilable with any earlier copy by id.
+                # quality_event_id flows through so the replayed row carries
+                # the same id as any earlier copy, which lets a downstream
+                # consumer identify the duplicate (the collector does not
+                # deduplicate; replay is at-least-once).
                 self._persist_quality_event({**recovered, "_wal_seq": recovered["seq"]})
             except Exception:  # noqa: BLE001
                 logger.error("bybit_quality_event_recovery_persist_failed", seq=recovered.get("seq"))
@@ -422,8 +428,9 @@ class BybitCollectorApp:
         published; only then may the checkpoint cover it.
 
         If the WAL append fails the event is still written (stamped with the
-        id the failed append assigned, so any WAL-resident copy is
-        reconcilable), and since no WAL record is known to back it the open
+        id the failed append assigned, so a downstream consumer can match any
+        WAL-resident copy by id; it is not deduplicated automatically), and
+        since no WAL record is known to back it the open
         segment is force-published immediately. A write or publish failure
         latches the checkpoint closed and PROPAGATES -- never swallowed.
         """
