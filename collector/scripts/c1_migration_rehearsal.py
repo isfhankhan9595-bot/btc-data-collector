@@ -483,7 +483,10 @@ class Rehearsal:
         t = self.marker_tallies
         if marker.status is pub.MarkerStatus.ABSENT:
             (t["absent_v1_hint"] if marker.v1 else t["absent"]).add(key)
-        elif marker.status is pub.MarkerStatus.INVALID:
+        elif marker.status in (pub.MarkerStatus.INVALID, pub.MarkerStatus.UNKNOWN_IO):
+            # Report-only tally, unchanged output: an unreadable marker (UNKNOWN_IO) keeps its
+            # "unreadable: ..." reason text here. Without this branch it would fall through to the
+            # ``valid`` branch below and trip ``marker.publication``.
             t["invalid"].add(f"{key}: {_marker_reason(marker.reason)[:100]}")
         else:
             t["valid"].add(key)
