@@ -53,7 +53,9 @@ DEEP_VERIFY_ENV = "DEDUP_DEEP_VERIFY"
 VERIFIED_FILESYSTEMS = frozenset({"ext4", "xfs"})
 
 QUARANTINE_DIRNAME = "quarantine"
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# fullmatch semantics via \Z: ``$`` also matches before a trailing newline, which would accept
+# "<64 hex>\n" as a SHA-256. The writer never emits one; a verifier must not call it valid.
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CHUNK = 1024 * 1024
 
 
@@ -229,24 +231,28 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def read_marker(seg_path: Path | str) -> MarkerResult:
-    """Classify ``<seg>.meta.json``: VALID / INVALID / ABSENT. Never raises.
+def parse_marker_bytes(raw: bytes, seg_name: str) -> MarkerResult:
+    """Pure classification of the bytes of ``<seg_name>.meta.json``. No filesystem access; never raises
+    for ordinary malformed input.
 
-    * no file -> ABSENT
+    This is the single authority for what a schema-2 publication marker must look like. It is shared
+    by :func:`read_marker` (recovery) and the read-only source catalog's bounded marker validator, so
+    the two cannot drift apart. It is given bytes that the *caller* has already read and bounded; it
+    neither opens, sizes nor limits anything, and it cannot say "absent" (a file that does not exist
+    has no bytes to give it):
+
+    * not UTF-8 / not JSON / not an object -> INVALID
     * a JSON object with no ``publication`` key (pre-F1 hint) -> ABSENT, ``v1=True``
-    * anything else that is not a fully valid schema-2 marker for THIS segment -> INVALID
+    * anything else that is not a fully valid schema-2 marker for the segment named ``seg_name`` -> INVALID
+    * otherwise VALID
 
-    VALID does not check the segment's actual size/bytes: that is
-    :func:`classify_segment`'s / the coordinator's job (they hold the file).
+    VALID does not check the segment's actual size or bytes (see :func:`read_marker`).
+
+    One pre-existing behaviour is deliberately kept, so ``read_marker``'s callers see no change:
+    pathologically nested JSON makes ``json.loads`` raise ``RecursionError`` (not ``ValueError``),
+    and it propagates from here. A caller that must never raise (the catalog's bounded validator)
+    catches it itself and reports it as invalid *content*.
     """
-    seg = Path(seg_path)
-    path = marker_path(seg)
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return MarkerResult(MarkerStatus.ABSENT, reason="no marker file")
-    except OSError as exc:
-        return MarkerResult(MarkerStatus.INVALID, reason=f"unreadable: {type(exc).__name__}: {exc}")
     try:
         obj = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -263,7 +269,7 @@ def read_marker(seg_path: Path | str) -> MarkerResult:
         problems.append("schema != 2")
     if pub.get("state") != STATE_CONFIRMED:
         problems.append("state != PUBLICATION_CONFIRMED")
-    if pub.get("segment") != seg.name:
+    if pub.get("segment") != seg_name:
         problems.append("segment name does not match")
     if not _is_int(pub.get("size_bytes")) or pub["size_bytes"] < 0:
         problems.append("size_bytes invalid")
@@ -282,6 +288,32 @@ def read_marker(seg_path: Path | str) -> MarkerResult:
     if problems:
         return MarkerResult(MarkerStatus.INVALID, reason="; ".join(problems))
     return MarkerResult(MarkerStatus.VALID, data=obj)
+
+
+def read_marker(seg_path: Path | str) -> MarkerResult:
+    """Classify ``<seg>.meta.json``: VALID / INVALID / ABSENT. Never raises.
+
+    * no file -> ABSENT
+    * a JSON object with no ``publication`` key (pre-F1 hint) -> ABSENT, ``v1=True``
+    * anything else that is not a fully valid schema-2 marker for THIS segment -> INVALID
+
+    VALID does not check the segment's actual size/bytes: that is
+    :func:`classify_segment`'s / the coordinator's job (they hold the file).
+
+    The content rules live in :func:`parse_marker_bytes`. This function is the *recovery* reader: it
+    reads the whole file unbounded and maps any ``OSError`` other than "not found" to INVALID, which
+    is a conservative recovery verdict and NOT evidence about the marker's content. Read-only
+    verifiers must not reuse it: see ``collector.collector.marker_validation``.
+    """
+    seg = Path(seg_path)
+    path = marker_path(seg)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return MarkerResult(MarkerStatus.ABSENT, reason="no marker file")
+    except OSError as exc:
+        return MarkerResult(MarkerStatus.INVALID, reason=f"unreadable: {type(exc).__name__}: {exc}")
+    return parse_marker_bytes(raw, seg.name)
 
 
 def classify_segment(seg_path: Path | str, marker: MarkerResult) -> PublicationState:
