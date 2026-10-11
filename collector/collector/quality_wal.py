@@ -115,7 +115,10 @@ reconciles them. Treat delivery as at-least-once, never exactly-once.
 A downstream reader that needs one row per event can key on
 ``(exchange, stream, quality_event_id)`` with null ids excluded (rows
 written without a WAL id have none). That is a suggestion for consumers,
-not existing collector behavior.
+not existing collector behavior, and it is suitable only when the source
+/ WAL namespace is unambiguous: the id is WAL-directory-unique and the row
+carries no source or WAL-namespace column, so a reader combining several
+WAL namespaces may also need a stable source identity from outside the row.
 """
 from __future__ import annotations
 

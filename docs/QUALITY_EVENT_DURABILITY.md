@@ -31,6 +31,7 @@ A latch (`_block_quality_checkpoint`) additionally stops all checkpointing for t
 * `quality_event_id` identifies an event and lets a consumer recognise matching replay duplicates. No component in this repository removes or reconciles duplicate quality-event rows; `scripts/compact_daily.py` does not handle quality streams. Reconciliation is a downstream responsibility, not an automatic collector guarantee.
 * Rows written with no WAL id (WAL append failed before an id existed) carry a null `quality_event_id` and cannot be matched this way.
 * **Suggested** future-reader key (not existing code behavior): `(exchange, stream, quality_event_id)`, excluding null ids. The id alone is only WAL-directory-unique, hence the extra columns.
+  * **Qualification:** that key is suitable only when the source / WAL namespace is unambiguous (for example one data directory, and therefore one quality WAL, per exchange). `exchange` and `stream` do not identify the WAL directory that issued an id, and the quality row schema has no source or WAL-namespace column. A reader that combines datasets from more than one WAL namespace (several hosts or deployments, restored or relocated data directories) may also need a stable source or WAL-namespace identity, which it would have to take from dataset provenance outside the row.
 * Reproduced behavior (injected faults on a scratch copy, not a real power-loss test): a checkpoint-write failure after publish, or a directory-fsync failure after rename, followed by a restart on the same directory, produced two published rows with the same `quality_event_id`.
 
 ## Shutdown order
@@ -47,4 +48,10 @@ stop intake -> drain queue synchronously -> close other writers (their failure r
 
 ## Scope / not changed
 
-Bybit, OKX and Binance-spot runners build their own `quality_events` writers with `segment_rows=1`. They have no WAL, so batching them would weaken durability; left as is.
+The Bybit, OKX, OKX capture-only and Binance-spot runners build their own quality-events writers with `segment_rows=1`; P0-3 batching is not applied to them and is left as is.
+
+WAL scope by runner:
+
+* **Futures (`CollectorApp`)** -- has the quality-event WAL; its quality writer is batched (P0-3).
+* **Bybit (`BybitCollectorApp`)** -- **has a quality-event WAL** (P0-2 parity), with the same append / in-flight / checkpoint-after-publish contract. It keeps one-row segments, so each event publishes its own segment.
+* **Binance Spot, OKX and OKX capture-only** -- provide **no supported quality WAL** for replay or recovery. Their one-row segments are the only durability mechanism for quality events (see `docs/F5_FATAL_STORAGE_TOPOLOGY.md`, "No quality WAL").

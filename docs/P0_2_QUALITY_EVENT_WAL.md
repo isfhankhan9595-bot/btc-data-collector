@@ -160,7 +160,13 @@ so it does not become a needless duplicate on the next restart.
   no WAL id have a null `quality_event_id` and cannot be matched.
 - **SUGGESTION, not existing behavior:** a future reader that wants one
   row per event can key on `(exchange, stream, quality_event_id)`,
-  excluding null ids.
+  excluding null ids. This is suitable only when the source / WAL
+  namespace is unambiguous (for example one data directory, hence one
+  quality WAL, per exchange). `exchange` and `stream` do not identify the
+  WAL directory that issued an id, and the quality row schema carries no
+  source or WAL-namespace column; a reader combining several WAL
+  namespaces may also need a stable source or WAL-namespace identity from
+  dataset provenance outside the row. See section G for the id's scope.
 - **Scope of durability evidence:** the tests in this repository inject
   exceptions at syscall boundaries (and restart a second app on the same
   directory); they do not demonstrate real power-loss behavior. Statements
