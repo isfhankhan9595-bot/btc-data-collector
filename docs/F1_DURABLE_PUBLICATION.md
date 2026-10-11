@@ -39,7 +39,7 @@ sequence (two directory fsyncs, one marker-tmp fsync); the new cost is one SHA-2
 
 | Failure | Segment | Behaviour |
 |---|---|---|
-| before rename (flush, close, tmp fsync, digest) | not published | writer FAILED, `.tmp` kept, `DATA_DROP` accounting unchanged |
+| before rename (flush, close, tmp fsync, digest) | not published | writer FAILED, `.tmp` kept (unpublished: not a durable record), `DATA_DROP` accounting unchanged |
 | rename ok, directory fsync fails | visible, **unconfirmed** | writer FAILED, no marker, no hook, nothing indexed, `.seg` left in place |
 | marker write / fsync / replace / dir-fsync fails | durable | **no hook**, writer latched (`_publication_failure`), `STORAGE_METADATA_FAILED` (+ `DEDUP_STATE_FAILED` if a hook is wired), **no `DATA_DROP`**; restart confirms and indexes |
 | dedup hook / SQLite fails | durable, marker valid | writer latched, `DEDUP_STATE_FAILED`; restart re-indexes |
@@ -200,6 +200,13 @@ application maps the owning writer's stream to a verdict (terminate for `raw_wir
 any stream not in the table, isolate the route for a derived writer, degrade the quality channel for
 `quality_events`). A latched marker/hook failure is also visible through
 `ParquetWriter.failure_snapshot()` before any further write. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
+
+An unpublished `.seg.tmp` left by a failed publication is not a published segment: it has no marker, is neither
+trusted nor indexable (state machine above), and is not guaranteed to be complete, recoverable or authoritative.
+For the quality stream on runners without a quality WAL (Spot, OKX, OKX capture-only), an event whose only copy
+would be in such a file is counted as lost (not durably published through the supported quality-storage path);
+an event whose durability could not be established is counted as unconfirmed, never as lost. See
+"Quality-event wording" in `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
 ## Known UNKNOWN / out of scope
 

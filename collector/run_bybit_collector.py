@@ -234,7 +234,8 @@ class BybitCollectorApp:
           (the WAL append returned); it is replayed into Parquet by the next start.
         * ``quality_events_wal_unconfirmed`` -- the WAL append raised after assigning an id,
           so a record MAY exist. Neither counted as retained nor as lost.
-        * ``quality_events_lost``           -- no WAL record and no usable writer: gone.
+        * ``quality_events_lost``           -- no WAL record and no usable writer: not
+          durably recorded, so counted as lost.
         """
         record = self.failure_policy.quality_degraded
         return {"quality_degraded": record is not None,

@@ -276,13 +276,16 @@ class StandaloneFailurePolicy:
         self.route_short_circuits[route] = self.route_short_circuits.get(route, 0) + 1
 
 
-#: Said in every loss report, and in the status as ``quality_wal: False``. "Lost"
-#: means the event was not durably published through the supported quality-storage
-#: path. These runners (Binance Spot, OKX, OKX capture-only) provide no supported
-#: quality WAL for replay or recovery, and an unpublished ``.tmp`` file that may
-#: remain is not a durable record: it is not guaranteed to be complete, recoverable
-#: or authoritative. The text makes no claim beyond that.
-NO_QUALITY_WAL_NOTE = ("counted as lost: not durably published through the supported quality-storage "
+#: Said in every per-event loss report (``<prefix>_quality_event_lost``); the status
+#: carries ``quality_wal: False``. "Lost" means the event was not durably published
+#: through the supported quality-storage path. These runners (Binance Spot, OKX, OKX
+#: capture-only) provide no supported quality WAL for replay or recovery, and an
+#: unpublished ``.tmp`` file that may remain is not a durable record: it is not
+#: guaranteed to be complete, recoverable or authoritative. The text makes no claim
+#: beyond that. The final shutdown report does NOT reuse this note: it is built from
+#: the counters by ``_final_quality_note`` so it never says "counted as lost" when
+#: no event was counted lost.
+NO_QUALITY_WAL_NOTE =("counted as lost: not durably published through the supported quality-storage "
                        "path; this runner provides no supported quality WAL for replay or recovery; "
                        "an unpublished .tmp file may remain but is not guaranteed to be complete, "
                        "recoverable or authoritative")
@@ -291,9 +294,30 @@ NO_QUALITY_WAL_NOTE = ("counted as lost: not durably published through the suppo
 UNCONFIRMED_QUALITY_EVENT_NOTE = ("durability could not be established: the event is neither "
                                   "confirmed lost nor confirmed retained")
 
-#: The unconfirmed clause of the final shutdown report (same meaning, counter-level).
+#: Clauses of the final shutdown report. Each describes one counter and is included only
+#: when that counter is non-zero; the no-WAL clause is always included. Presentation
+#: only: no counter, cadence, latch or control flow depends on this text.
+_FINAL_LOST_CLAUSE = ("lost events: not durably published through the supported quality-storage path")
 _FINAL_UNCONFIRMED_CLAUSE = ("unconfirmed events: durability could not be established, so each is "
                              "neither confirmed lost nor confirmed retained")
+_FINAL_NO_WAL_CLAUSE = ("this runner provides no supported quality WAL for replay or recovery; an "
+                        "unpublished .tmp file may remain but is not guaranteed to be complete, "
+                        "recoverable or authoritative")
+
+
+def _final_quality_note(lost: int, unconfirmed: int) -> str:
+    """The final-report note for these two counter values (a pure string builder).
+
+    A lost clause appears only when ``lost`` is non-zero, so an event whose durability
+    was merely unconfirmed is never described as lost; likewise the unconfirmed clause
+    appears only when ``unconfirmed`` is non-zero."""
+    clauses = []
+    if lost:
+        clauses.append(_FINAL_LOST_CLAUSE)
+    if unconfirmed:
+        clauses.append(_FINAL_UNCONFIRMED_CLAUSE)
+    clauses.append(_FINAL_NO_WAL_CLAUSE)
+    return "; ".join(clauses)
 
 #: Longest ``reason`` copied into a loss log line (a log line must stay bounded).
 _LOSS_LOG_REASON_MAX = 200
@@ -307,7 +331,8 @@ def is_bounded_report_point(count: int) -> bool:
 
 
 class DegradedQualityLossReporting:
-    """Operator visibility for a degraded quality channel on a runner with NO quality WAL.
+    """Operator visibility for a degraded quality channel on a runner that provides no
+    supported quality WAL for replay or recovery.
 
     Shared by Binance Spot, OKX and OKX capture-only so the three cannot drift. The
     host class provides ``quality_events_lost``, ``quality_events_unconfirmed``,
@@ -361,7 +386,9 @@ class DegradedQualityLossReporting:
         Called AFTER every writer has been closed, so the counts include anything the
         close path itself reported. It never raises, so a failure here cannot mask an
         existing failure or prevent cleanup. A healthy runner logs nothing, and an
-        unchanged snapshot is not logged twice."""
+        unchanged snapshot is not logged twice. The note names lost events only when
+        ``quality_events_lost`` is non-zero and unconfirmed events only when
+        ``quality_events_unconfirmed`` is non-zero (``_final_quality_note``)."""
         try:
             lost = self.quality_events_lost
             unconfirmed = self.quality_events_unconfirmed
@@ -376,7 +403,7 @@ class DegradedQualityLossReporting:
             logger.error(
                 f"{self.quality_log_prefix}_quality_channel_final", quality_degraded=degraded,
                 quality_events_lost=lost, quality_events_unconfirmed=unconfirmed, quality_wal=False,
-                note=f"{NO_QUALITY_WAL_NOTE}; {_FINAL_UNCONFIRMED_CLAUSE}")
+                note=_final_quality_note(lost, unconfirmed))
         except Exception:  # noqa: BLE001 - a final report must never mask a failure or stop cleanup
             pass
 

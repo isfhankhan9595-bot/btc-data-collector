@@ -135,11 +135,13 @@ class OKXCaptureApp(DegradedQualityLossReporting):
 
     def quality_channel_status(self) -> dict:
         """Operator view of the quality channel. Raw capture is unaffected by a
-        degraded channel. This runner keeps NO durable quality WAL, so every
-        event counted in ``quality_events_lost`` is gone, not retained;
+        degraded channel. ``quality_events_lost`` counts events not durably
+        published through the supported quality-storage path;
         ``quality_events_unconfirmed`` counts the tripping event whose
         durability could not be established (neither lost nor retained).
-        ``quality_wal`` is always ``False``: nothing counted lost can be recovered."""
+        ``quality_wal`` is always ``False``: this runner provides no supported
+        quality WAL for replay or recovery, and an unpublished ``.tmp`` file that
+        may remain is not guaranteed to be complete, recoverable or authoritative."""
         record = self.failure_policy.quality_degraded
         return {"quality_degraded": record is not None,
                 "quality_events_lost": self.quality_events_lost,

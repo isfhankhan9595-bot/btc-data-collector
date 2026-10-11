@@ -22,6 +22,10 @@ Parquet files, markers and ``.tmp`` leftovers (never from the counters alone):
   open_next_segment  never admitted (hour         quality_events_lost
   on rollover        rollover failed first)
 
+An unpublished ``.tmp`` is not a durable record: it may remain, but it is not guaranteed
+to be complete, recoverable or authoritative, so an event whose only copy is there is
+counted lost (not durably published through the supported quality-storage path).
+
 Everything else is unchanged and re-asserted: the quality-failure latch (once,
 one alert, origin ``quality_writer``), no retry (the failed writer is never called
 again), later events only bump ``quality_events_lost``.

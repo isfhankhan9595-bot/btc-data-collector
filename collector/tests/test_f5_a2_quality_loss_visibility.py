@@ -1,9 +1,10 @@
 """F5 A2: operator visibility of quality-channel degradation and event loss.
 
-Binance Spot, OKX and OKX capture-only keep NO quality WAL. Once their quality writer
-has failed (latched once, one alert, never retried: unchanged) every further quality
-event is gone. Before A2 that loss was only a counter that nothing reported; a long
-outage was silent until somebody read ``quality_channel_status()``.
+Binance Spot, OKX and OKX capture-only provide no supported quality WAL. Once their
+quality writer has failed (latched once, one alert, never retried: unchanged) every
+further quality event is counted as lost: not durably published through the supported
+quality-storage path. Before A2 that loss was only a counter that nothing reported; a
+long outage was silent until somebody read ``quality_channel_status()``.
 
 Contract under test
 -------------------
@@ -19,7 +20,9 @@ Contract under test
   that the runner provides no supported quality WAL for replay or recovery, and that an
   unpublished ``.tmp`` file may remain but is not guaranteed to be complete, recoverable
   or authoritative. No report claims an event "cannot be recovered", and an unconfirmed
-  event is never called lost or retained;
+  event is never called lost or retained. The final shutdown note is conditional (A5.2-B):
+  it describes lost events only when ``quality_events_lost`` is non-zero and unconfirmed
+  events only when ``quality_events_unconfirmed`` is non-zero;
 * a quality-only failure never ends otherwise healthy market-data / raw ingestion;
 * the three runners behave identically.
 
@@ -324,6 +327,81 @@ def test_shutdown_reports_the_final_counts_once_and_still_closes_every_writer(ki
         assert len(_records(caplog, FINAL_SUFFIX)) == 1
     finally:
         _cleanup_any(app)
+
+
+#: (A4 fault, events emitted, expected (lost, unconfirmed)): the final note must describe only
+#: what the counters say. ``open_next_segment`` publishes the trigger event, so the channel is
+#: degraded with nothing counted at all.
+FINAL_NOTE_CASES = [
+    pytest.param("dir_fsync", 1, (0, 1), id="unconfirmed-only"),
+    pytest.param("rename", 1 + LATER, (1 + LATER, 0), id="lost-only"),
+    pytest.param("open_next_segment", 1, (0, 0), id="degraded-nothing-counted"),
+]
+_NO_WAL_TMP = ("provides no supported quality WAL for replay or recovery", "unpublished .tmp file may remain "
+               "but is not guaranteed to be complete, recoverable or authoritative")
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("fault, emitted, expected", FINAL_NOTE_CASES)
+def test_final_note_describes_only_what_the_counters_say(kind, fault, emitted, expected, tmp_path, monkeypatch, caplog):
+    """A5.2-B: with ``quality_events_lost == 0`` the final report must not imply any event was
+    counted lost (an unconfirmed event is unconfirmed, not lost); with no unconfirmed events it
+    must not mention unconfirmed ones. The counters themselves are unchanged by the wording."""
+    caplog.set_level(logging.INFO)
+    app = _make(kind, tmp_path, monkeypatch)
+    try:
+        _Faults(monkeypatch).arm(fault, app.quality_writer)
+        for i in range(emitted):
+            _emit(app, "trigger" if i == 0 else f"later-{i}")
+        _shutdown(app)
+
+        (final,) = _records(caplog, FINAL_SUFFIX)
+        lost, unconfirmed = expected
+        assert (final["quality_events_lost"], final["quality_events_unconfirmed"]) == expected
+        assert (app.quality_events_lost, app.quality_events_unconfirmed) == expected
+        assert final["quality_degraded"] is True and final["quality_wal"] is False
+        note = final["note"]
+        for part in _NO_WAL_TMP:
+            assert part in note, (part, note)
+        for claim in ("cannot be recovered", "unrecoverable", "is gone", "can be recovered", "will be replayed"):
+            assert claim not in note.lower(), f"final report must not say {claim!r}: {note!r}"
+        assert len(note) <= 400
+        if lost:
+            assert "lost events: not durably published through the supported quality-storage path" in note
+        else:
+            for claim in ("counted as lost", "not durably published", "lost events"):
+                assert claim not in note.lower(), f"no event was counted lost, yet: {note!r}"
+        if unconfirmed:
+            assert "neither confirmed lost nor confirmed retained" in note
+        else:
+            assert "unconfirmed" not in note.lower() and "neither" not in note.lower()
+        if not (lost or unconfirmed):
+            assert "lost" not in note.lower() and "unconfirmed" not in note.lower()
+        _assert_all_closed(app)
+    finally:
+        _cleanup_any(app)
+
+
+@pytest.mark.parametrize("lost, unconfirmed", [(0, 0), (0, 3), (4, 0), (4, 3)])
+def test_final_quality_note_builder_and_report_leave_the_counters_alone(lost, unconfirmed, caplog):
+    stub = _Stub()
+    stub.quality_events_lost, stub.quality_events_unconfirmed = lost, unconfirmed
+    caplog.set_level(logging.INFO)
+
+    note = sfp._final_quality_note(lost, unconfirmed)
+    assert ("lost events:" in note) is bool(lost) and ("unconfirmed events:" in note) is bool(unconfirmed)
+    assert note.endswith(sfp._FINAL_NO_WAL_CLAUSE) and len(note) <= 400
+
+    stub._report_quality_channel_final()
+    stub._report_quality_channel_final()                     # an unchanged snapshot is reported once
+    records = _records(caplog, FINAL_SUFFIX)
+    assert (stub.quality_events_lost, stub.quality_events_unconfirmed) == (lost, unconfirmed)
+    if lost or unconfirmed:
+        (record,) = records
+        assert record["note"] == note
+        assert (record["quality_events_lost"], record["quality_events_unconfirmed"]) == (lost, unconfirmed)
+    else:
+        assert records == [], "a healthy, never-degraded stub logs nothing"
 
 
 @pytest.mark.parametrize("kind", KINDS)

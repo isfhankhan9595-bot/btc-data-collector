@@ -129,9 +129,13 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
     a match is held and latched once the policy is built; any other typed fatal is re-raised.
     Before this, the typed fatal was caught by the blanket `except Exception`, never latched, and logged once
     per event with no alert and a healthy-looking quality state.
-  * **No WAL on these runners.** Spot, OKX and OKX capture-only keep no durable quality WAL, so a degraded
-    quality channel means the events are *lost*, not retained. Once latched, the failed writer is never called
-    again; every later event (and the one that tripped the latch) only increments `quality_events_lost`.
+  * **No quality WAL on these runners.** Spot, OKX and OKX capture-only provide no supported quality WAL for
+    replay or recovery, so once the channel is degraded an event is not durably published through the supported
+    quality-storage path and is counted *lost* (see "Quality-event wording" below for the exact meaning of lost,
+    unconfirmed and temporary artifacts). Once latched, the failed writer is never called again and every later
+    event only increments `quality_events_lost`. The one event whose own write tripped the latch is counted from
+    the writer's durability evidence (A4), not from the raise: published counts nowhere, unconfirmed counts in
+    `quality_events_unconfirmed`, not durably published counts as lost.
     `quality_degraded` (the latched `FailureRecord`) and `quality_channel_status()` expose this on the runner,
     and OKX capture-only adds it to the status it returns and prints. Raw capture, market-data routes and the
     process exit status are unaffected by a quality-only failure; a later raw-evidence fatal still exits 70.
@@ -140,13 +144,16 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
     * *Bounded logs.* The first lost event is logged, then only at power-of-two counts (1, 2, 4, 8, ...): the
       number of lines grows with log2 of the losses, never with the losses. Events are
       `<spot|okx|okx_capture>_quality_event_lost`, each with the running totals, the stream / event type /
-      (truncated) reason of the event that reached that count, `quality_wal=False` and a note that the runner
-      keeps no quality WAL and the event cannot be recovered. No extra alert: the one-time latch alert is the
-      policy's and is unchanged, and the failed writer is still never retried.
-    * *Distinct counters.* `quality_events_lost` (demonstrably not persisted) and `quality_events_unconfirmed`
-      (the A4 trigger event whose durability could not be established) are counted and logged separately, each on
-      its own cadence (`..._quality_event_unconfirmed`). An unconfirmed event is never labelled lost or retained and
-      its report never says it is unrecoverable. Event disposition (A4) is unchanged.
+      (truncated) reason of the event that reached that count, `quality_wal=False` and a fixed, bounded note
+      stating what "lost" means (not durably published through the supported quality-storage path), that the
+      runner provides no supported quality WAL for replay or recovery, and that an unpublished `.tmp` file may
+      remain but is not guaranteed to be complete, recoverable or authoritative. No extra alert: the one-time
+      latch alert is the policy's and is unchanged, and the failed writer is still never retried.
+    * *Distinct counters.* `quality_events_lost` (demonstrably not durably published) and
+      `quality_events_unconfirmed` (the A4 trigger event whose durability could not be established) are counted and
+      logged separately, each on its own cadence (`..._quality_event_unconfirmed`). An unconfirmed event is never
+      labelled lost or retained, and its report never calls it lost or unrecoverable. Event disposition (A4) is
+      unchanged.
     * *Status.* `quality_channel_status()` gains `quality_wal: False` (always). In-repository consumers: the OKX
       capture-only `run()` result / printed JSON (spreads the status, so it carries the field) and the tests;
       nothing else reads this status.
@@ -154,7 +161,10 @@ route (trades, book, mark, OI, liquidation) can be regenerated from preserved `r
       log `<prefix>_quality_channel_final` with the final counters, only if the channel ever degraded and once
       per distinct snapshot. It never raises, so it cannot mask an existing failure, change the exit status or
       prevent writer cleanup. A process that is killed (`SIGKILL`, crash) never reaches it; the periodic
-      power-of-two lines are then the record.
+      power-of-two lines are then the record. The final note is conditional (A5.2-B, presentation only): it
+      describes lost events only when `quality_events_lost > 0` and unconfirmed events only when
+      `quality_events_unconfirmed > 0`, and always carries the no-supported-WAL / `.tmp` caveat. A report with
+      only unconfirmed events therefore never implies that any event was counted as lost.
   * `StandaloneFailurePolicy._report` lets a *quality* record nest inside another failure's report (it only logs
     and alerts; the runner's reporter is never called for it, so nothing reaches the failed quality writer).
     On a full disk the derived writers of Spot/OKX have no quality sink, so the first write to the quality
@@ -331,7 +341,7 @@ event that reaches the degraded channel including the one whose write tripped th
 |---|---|
 | `quality_events_wal_only` | WAL append returned: the record is established and the next start replays it into Parquet |
 | `quality_events_wal_unconfirmed` | append raised after assigning an id (e.g. fsync failed): a record *may* exist; neither "retained" nor "lost" |
-| `quality_events_lost` | no WAL record and no usable writer: gone. Bounded log (first, then powers of two) + one alert |
+| `quality_events_lost` | no WAL record and no usable writer: not durably recorded, counted as lost. Bounded log (first, then powers of two) + one alert |
 
 Verified against reality, not just against each other: the WAL on disk holds exactly the `wal_only` events,
 none of them is checkpointed, and a restart on a healthy disk publishes each exactly once.
@@ -356,8 +366,13 @@ exceptions from its sink).
 ## Exception handling: what is contained, what propagates (A5.1)
 
 Neither this document nor the code comments promise that a typed fatal is never swallowed, in the
-absolute. The contract is per boundary. This section was re-derived from the code and tests at head `cb84cac`, not
-from comments. "Typed fatal" always means `isinstance(exc, FatalStorageError)` (`DedupStateError` included).
+absolute. The contract is per boundary. This section was re-derived from the code and tests as of commit `cb84cac`
+(the A3 commit, the head when A5.1 was written), not from comments. That commit is recorded as the version
+reviewed; it is not a claim that the tables below were re-derived at the current branch head. Checked by diff
+against `cb84cac`: later commits on this branch (A5.1 documentation, A5.2 wording) changed production code only in
+operator-message text, docstrings and comments, plus a pure string builder for the final shutdown note (and its
+one call site) in `standalone_failure_policy.py`; no exception-handling boundary listed here was changed.
+"Typed fatal" always means `isinstance(exc, FatalStorageError)` (`DedupStateError` included).
 
 **Where typed fatals come from.** The only places in the package that construct one are `ParquetWriter`
 (`_storage_fatal`, `_publication_fatal`; both stamp the writer's *own* `stream_name`) and `DedupStateError`
@@ -445,6 +460,28 @@ Evidence: `test_f5_part2a_quality_channel.py` (USD-M emit, writer sink), `test_f
 `test_f5_final_bybit_quality_containment.py` and `test_f5_final_bybit_ws_callback_fatal.py` (Bybit),
 `test_f5_a3_ordinary_runtime_error.py` (ordinary `RuntimeError`), `test_f5_fatal_storage_topology.py`
 (topology, raw capture).
+
+## Quality-event wording: lost, unconfirmed, temporary artifacts, no quality WAL (A5.2)
+
+These four terms are used the same way in the runner docstrings, the operator log notes and this document.
+
+* **Lost**: not durably published through the supported quality-storage path. It is a statement about that path,
+  not a claim that no byte of the event exists anywhere. Nothing here says a lost event is "physically
+  unrecoverable"; it says no supported path publishes, replays or recovers it.
+* **Unconfirmed**: durability could not be established (for example the segment was renamed into place but the
+  directory fsync failed). Neither loss nor retention is confirmed, so it is counted separately
+  (`quality_events_unconfirmed`) and is never described as lost.
+* **Temporary artifacts**: an unpublished `.tmp` file may remain after a failed publication, but it is not
+  guaranteed to be complete, recoverable or authoritative. It is not a durable record: it has no publication
+  marker, and per `F1_DURABLE_PUBLICATION.md` it is neither trusted nor indexable and a restart's orphan recovery
+  deletes it. An event whose only copy would be in such a file is counted lost. No temporary-file recovery exists
+  or is implied.
+* **No quality WAL**: Spot, OKX and OKX capture-only provide no supported quality WAL for replay or recovery.
+  (Binance USD-M and Bybit do keep one; their counters are described under "Degraded-channel accounting" and
+  "Degraded-channel counters".)
+
+Historical statements about raw evidence being "irrecoverable" (`RAW_CAPTURE.md`, `failure_topology.py`) are about
+raw wire/REST frames and are unrelated to these definitions.
 
 ## Not changed
 
