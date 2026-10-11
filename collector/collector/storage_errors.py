@@ -76,8 +76,14 @@ class FatalStorageError(RuntimeError):
         self.durability = durability
         self.record_accepted: Optional[bool] = None
 
-    def trigger_event_disposition(self) -> str:
+    def trigger_event_disposition(self, *, record_admitted: Optional[bool] = None) -> str:
         """What is PROVEN about the record whose ``write`` raised this.
+
+        ``record_admitted`` is caller-supplied evidence for an exception that did NOT come
+        from ``write`` (so ``record_accepted`` is ``None``): the one real case is
+        ``publish_open_segment()`` called after ``write()`` RETURNED, i.e. the record is
+        already in the segment being published (pass ``True``). It is used only when
+        ``record_accepted`` is ``None``; evidence set by ``write`` itself always wins.
 
         Never claims more than the evidence supports:
 
@@ -93,9 +99,10 @@ class FatalStorageError(RuntimeError):
         * no ``record_accepted`` evidence at all -> ``unconfirmed``: nothing is
           fabricated in either direction.
         """
-        if self.record_accepted is None:
+        accepted = self.record_accepted if self.record_accepted is not None else record_admitted
+        if accepted is None:
             return EVENT_UNCONFIRMED
-        if self.record_accepted is False:
+        if accepted is False:
             return EVENT_LOST
         if self.durability == "published":
             return EVENT_PUBLISHED
