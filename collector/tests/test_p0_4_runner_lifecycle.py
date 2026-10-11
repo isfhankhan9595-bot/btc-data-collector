@@ -378,8 +378,17 @@ def test_sqlite_failure_at_runtime_fails_closed_without_writing_or_admitting(kin
     coord = _coord(kind, app)
     try:
         coord.index._conn.close()                      # the durable state is now unreachable
-        with pytest.raises(DedupStateError):
+        if kind == "usdm":
+            # F5: the Binance USD-M handler boundary classifies a dedup failure
+            # (typed fatal, component "dedup") and ISOLATES the trades route
+            # instead of letting it surface as an ordinary processing error.
             _feed(kind, app, ["61"])
+            record = app.isolated_routes["trades"]
+            assert (record.component, record.stream, record.verdict) == ("dedup", "trades", "isolate_route")
+            assert app.terminal_failure is None, "a derived dedup failure must not kill the process"
+        else:
+            with pytest.raises(DedupStateError):
+                _feed(kind, app, ["61"])
         assert _ids(kind, app) == [], "an unreadable index must not be mapped to 'new'"
         assert coord._admitted == set() and coord._pending_index == {}
     finally:
@@ -413,8 +422,15 @@ def test_publication_hook_failure_cannot_let_a_later_trade_continue_and_restart_
     _feed(kind, app, ["31", "32"])                     # 2nd row closes+publishes the segment; hook fails
     assert writer._publication_failure is not None
     for attempt in ("33", "34"):                       # never continues silently, however often retried
-        with pytest.raises(RuntimeError):
+        if kind == "usdm":
+            # F5: refused by ISOLATION (typed fatal classified at the handler
+            # boundary, then the route is short-circuited), not by an exception.
             _feed(kind, app, [attempt], _now() + 5)
+        else:
+            with pytest.raises(RuntimeError):
+                _feed(kind, app, [attempt], _now() + 5)
+    if kind == "usdm":
+        assert "trades" in app.isolated_routes and app.terminal_failure is None
     assert writer.buffer == [] and coord._admitted == set()
     k33 = dedup_identity_key(m["exchange"], m["market"], m["inst"], m["stream"], "33")
     assert not coord.index.contains(k33) and k33 not in coord._pending_index

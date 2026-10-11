@@ -258,6 +258,7 @@ class OKXPublicCapture:
         url: str = OKX_PUBLIC_WS_URL,
         client_factory: Optional[Callable[..., WebSocketClient]] = None,
         clock: Callable[[], float] = time.time,
+        on_fatal: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.channels = tuple(dict.fromkeys(channels))
         if not self.channels:
@@ -283,7 +284,7 @@ class OKXPublicCapture:
         self._subscribe_message = message
 
         factory = client_factory or WebSocketClient
-        self.client = factory(
+        client_kwargs: dict[str, Any] = dict(
             url=self.url,
             on_message=self._on_message,
             on_reconnect=self._on_reconnect,
@@ -294,6 +295,12 @@ class OKXPublicCapture:
             keepalive=OKX_KEEPALIVE,
             control_frames=frozenset({OKX_PONG_PAYLOAD}),
         )
+        if on_fatal is not None:
+            # F5: the application's classifier for a typed storage fatal. Passed
+            # only when given, so a client factory that predates the hook (the
+            # test fakes) is called exactly as before.
+            client_kwargs["on_fatal"] = on_fatal
+        self.client = factory(**client_kwargs)
 
     # -- lifecycle --------------------------------------------------------
 

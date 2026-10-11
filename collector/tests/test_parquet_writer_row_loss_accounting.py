@@ -36,7 +36,7 @@ import pytest
 from collector.collector import parquet_writer as pw_module
 from collector.collector.parquet_writer import ParquetWriter
 from collector.tests.test_parquet_writer_publication_failure import (
-    SCHEMA, _assert_fails_closed, _fail_dir_fsync, _fail_replace_to, _make, _row, _segs)
+    SCHEMA, _assert_fails_closed, _fail_dir_fsync, _fail_replace_to, _make, _row, _segs, expect_fatal)
 
 TMP_ROWS_REASON = "tmp_rows_not_covered_by_counter_discarded_on_publication_failure"
 RESTART_REASON = "crashed_segment_discarded"
@@ -86,7 +86,7 @@ def test_f2_1_counter_persist_fails_after_write_table_with_no_previous_sidecar(t
     _fill(w, 3)
     _fail_replace_to(monkeypatch, ".count.json")        # write_table succeeds, persisting the counter fails
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.flush()
 
     assert w.record_count == 3, "the rows ARE in the .tmp"
@@ -121,7 +121,7 @@ def test_f2_2_counter_persist_fails_after_a_previous_persisted_count(tmp_path, m
     _fill(w, 200, start=300)
     _fail_replace_to(monkeypatch, ".count.json")        # 200 more rows reach the .tmp; counter stays 300
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.flush()
 
     assert w.record_count == 500
@@ -149,7 +149,7 @@ def test_f2_3_missing_counter_sidecar_is_explicit_unknown_never_a_fabricated_zer
     _sidecar(w).unlink()                                 # the sidecar disappears under the writer
     _fail_replace_to(monkeypatch, ".seg")
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     reason = _of(events, "STORAGE_PUBLICATION_FAILED")[0]["reason"]
@@ -172,7 +172,7 @@ def test_f2_4_stale_counter_sidecar_uses_the_known_boundary(tmp_path, monkeypatc
     _sidecar(w).write_text(json.dumps({"rows": 100}))    # stale: claims 100, the .tmp holds 300
     _fail_replace_to(monkeypatch, ".seg")
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     reason = _of(events, "STORAGE_PUBLICATION_FAILED")[0]["reason"]
@@ -193,7 +193,7 @@ def test_f2_4b_unusable_sidecar_content_is_unknown_not_zero_and_not_negative(tmp
     w.flush()
     _sidecar(w).write_text(content)
     _fail_replace_to(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     assert [d["rows_lost"] for d in _of(events, "DATA_DROP")] == [300], "an unusable sidecar covers NOTHING"
     _shutdown(w)
@@ -211,7 +211,7 @@ def test_f2_4c_sidecar_overstating_the_tmp_is_flagged_and_never_produces_a_negat
     w.flush()
     _sidecar(w).write_text(json.dumps({"rows": 999}))
     _fail_replace_to(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     reason = _of(events, "STORAGE_PUBLICATION_FAILED")[0]["reason"]
     assert "EXCEEDS_ROWS_WRITTEN(10)" in reason and "rows_in_tmp_not_in_counter=0" in reason
@@ -227,7 +227,7 @@ def test_f2_5_buffered_and_persisted_and_uncovered_rows_are_each_reported_exactl
     _fill(w, 200, start=300)
     with monkeypatch.context() as m:
         _fail_replace_to(m, ".count.json")
-        with pytest.raises(OSError):
+        with expect_fatal(OSError):
             w.flush()                                    # 200 more in the .tmp, sidecar stays 300 -> FAILED
     assert w.record_count == 500 and w._storage_failure is not None
     assert [(d["rows_lost"], d["reason"]) for d in _of(events, "DATA_DROP")] == [(200, TMP_ROWS_REASON)]
@@ -245,7 +245,7 @@ def test_f2_5_buffered_and_persisted_and_uncovered_rows_are_each_reported_exactl
     def boom(table):
         raise OSError(28, "No space left on device (injected write_table)")
     monkeypatch.setattr(w2.writer, "write_table", boom)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w2.flush()
     drops = {d["reason"]: d["rows_lost"] for d in _of(events2, "DATA_DROP")}
     assert drops == {"unflushed_rows_discarded_on_publication_failure": 40}, \
@@ -262,7 +262,7 @@ def test_f2_5c_counter_state_does_not_leak_from_a_published_segment_into_the_nex
     w.publish_open_segment()                             # segment 0 durable; its counter had landed (3)
     _fill(w, 2, start=10)                                # segment 1: no counter has EVER landed for it
     _fail_replace_to(monkeypatch, ".count.json")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.flush()
     reason = _of(events, "STORAGE_PUBLICATION_FAILED")[0]["reason"]
     assert "counter_sidecar=none_persisted" in reason, "segment 0's counter must not be mistaken for segment 1's"
@@ -275,7 +275,7 @@ def test_f2_5b_failed_counter_sidecar_leaves_nothing_that_is_published(tmp_path,
     w = _make(tmp_path, events=events, published=published, durable=durable, segment_rows=BIG)
     _fill(w, 5)
     _fail_replace_to(monkeypatch, ".count.json")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     assert _segs(w, "*.seg") == [] and published == [] and durable == []
 
@@ -298,6 +298,7 @@ def attempt(name, fn):
         fn(); out[name] = "ok"
     except BaseException as exc:
         out[name] = type(exc).__name__
+        out[name + "_cause"] = type(exc.__cause__).__name__
 def feed():
     for i in range(3000):
         w.write({"timestamp": i, "value": rng.random()})
@@ -321,9 +322,11 @@ def test_f2_6_partial_write_fault_is_never_published(tmp_path):
     out = json.loads(result.read_text())
     stream_dir = tmp_path / "raw" / "fs"
 
-    assert out["write"] == "OSError", "the real EFBIG surfaced from write_table"
+    assert out["write"] == "FatalStorageError", "the real EFBIG surfaced from write_table as the typed fatal"
+    assert out["write_cause"] == "OSError", "... with the original OSError(EFBIG) chained as its cause"
     assert out["failed"] is True
-    assert out["flush"] == out["publish"] == out["close"] == "RuntimeError", "everything after it fails closed"
+    assert out["flush"] == out["publish"] == out["close"] == "FatalStorageError", \
+        "everything after it fails closed, with the same typed fatal"
     tmps = sorted(stream_dir.glob("*.seg.tmp"))
     assert len(tmps) == 1 and tmps[0].stat().st_size <= 4096, "a truncated .tmp really exists"
     assert sorted(stream_dir.glob("*.seg")) == [], "a partially written segment must NEVER be published"
@@ -360,7 +363,7 @@ def test_f4_7_published_then_open_next_fails_loses_nothing_and_fails_closed(tmp_
     _fill(w, 3)
     _fail_open_next(monkeypatch, leave_header=True)
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()                         # publishes fine, cannot open the next one
 
     segs = _segs(w, "*.seg")
@@ -396,7 +399,7 @@ def test_f4_7b_open_next_failure_through_an_hour_rollover_has_the_same_semantics
     monkeypatch.setattr(w, "_get_current_hour_str", lambda: next_hour)
     _fail_open_next(monkeypatch)
 
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.write(_row(99))                                # publishes the old hour, cannot open the new one
 
     assert w.buffer == [], "the triggering row is not admitted anywhere"
@@ -414,9 +417,9 @@ def test_f4_7c_a_broken_sink_cannot_unlatch_or_change_the_open_next_semantics(tm
     w = ParquetWriter("s", SCHEMA, base_dir=str(tmp_path), quality_event_sink=broken_sink)
     _fill(w, 3)
     _fail_open_next(monkeypatch)
-    with pytest.raises(OSError) as info:
+    with expect_fatal(OSError, stage="open_next_segment", durability="published") as info:
         w.publish_open_segment()
-    assert info.value.errno == 24, "the ORIGINAL error surfaces, not the sink's"
+    assert info.value.__cause__.errno == 24, "the ORIGINAL error surfaces (chained), not the sink's"
     assert w.has_unpublished_rows() is False
     _assert_fails_closed(w)
 
@@ -426,7 +429,7 @@ def test_f4_8_restart_after_open_next_failure_sees_a_normal_published_segment(tm
     w = _make(tmp_path, events=events)
     _fill(w, 3)
     _fail_open_next(monkeypatch, leave_header=True)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     seg = _segs(w, "*.seg")[0]
     before = _sha(seg)
@@ -452,7 +455,7 @@ def test_f4_9_hooks_for_the_published_segment_ran_before_the_failure_and_never_a
     w = _make(tmp_path, events=events, published=published, durable=durable)
     _fill(w, 3)
     _fail_open_next(monkeypatch)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
 
     seg = _segs(w, "*.seg")[0]
@@ -475,7 +478,7 @@ def test_f4_10_a_genuine_next_segment_with_rows_is_still_accounted_as_unpublishe
     _fill(w, 2, start=10)
     w.flush()
     _fail_replace_to(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     assert w.has_unpublished_rows() is True and w._storage_failure_rows == 2
     reason = _of(events, "STORAGE_PUBLICATION_FAILED")[0]["reason"]
@@ -488,7 +491,7 @@ def _scn_a_rename(tmp_path, mp, events, published, durable):
     w = _make(tmp_path, events=events, published=published, durable=durable, segment_rows=BIG)
     _fill(w, 3); w.flush()
     _fail_replace_to(mp, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     return w
 
@@ -497,7 +500,7 @@ def _scn_b_dir_fsync(tmp_path, mp, events, published, durable):
     w = _make(tmp_path, events=events, published=published, durable=durable, segment_rows=BIG)
     _fill(w, 3); w.flush()
     _fail_dir_fsync(mp)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     return w
 
@@ -506,7 +509,7 @@ def _scn_c_open_next(tmp_path, mp, events, published, durable):
     w = _make(tmp_path, events=events, published=published, durable=durable, segment_rows=BIG)
     _fill(w, 3)
     _fail_open_next(mp)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     return w
 
@@ -537,7 +540,7 @@ def _scn_f_flush(tmp_path, mp, events, published, durable):
     def boom(table):
         raise OSError(28, "No space left on device (injected write_table)")
     mp.setattr(w.writer, "write_table", boom)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.publish_open_segment()
     return w
 

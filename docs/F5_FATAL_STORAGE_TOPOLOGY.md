@@ -1,0 +1,498 @@
+# F5 — Fatal storage topology / fail-closed routing
+
+Scope: **every entry point that uses the shared `WebSocketClient`** now has an explicit, supervised
+failure policy: `collector.run_collector` (Binance USD-M, the only runner with a systemd unit),
+`run_binance_spot_collector`, `run_bybit_collector`, `run_okx_collector` and `run_okx_capture`
+(capture-only). They implement the *same contract* with *different mechanisms* (see *Standalone
+runners*). The fail-closed raw-evidence behaviour is therefore **not USD-M-only any more, and it is
+not described as universal either**: it is enumerated per entry point in the table below.
+
+| Entry point | raw writer fatal | derived writer fatal | supervised application task |
+|---|---|---|---|
+| `run_collector` (USD-M) | terminate, exit 70 | isolate route | yes (`_failure_supervisor_loop`) |
+| `run_binance_spot_collector` | terminate, exit 70 | isolate route | yes (`supervise_standalone_runner`) |
+| `run_bybit_collector` | terminate, exit 70 | isolate route | yes (`supervise_standalone_runner`) |
+| `run_okx_collector` | terminate, exit 70 | isolate route | yes (`supervise_standalone_runner`) |
+| `run_okx_capture` (capture-only) | terminate, exit 70 | n/a (no derived writer) | yes (`OKXCaptureApp.run`) |
+
+## The problem F5 closes
+
+A `ParquetWriter` that latches FAILED refuses every later write, but before F5 nothing above it
+treated that as more than an ordinary exception:
+
+* `RawCapture` deliberately **failed open**: a dead `raw_wire` / `raw_rest` writer became a
+  `DATA_DROP` quality event per frame while ingestion carried on with no durable raw evidence.
+* The websocket worker counted any exception as a processing error and reconnected/kept going.
+* `_handle_liquidation` and `_poll_openinterest` swallowed a dead writer with a blanket
+  `except Exception` and kept calling it.
+* A writer that latched while quiet was never noticed (the exception only appears on the *next*
+  write).
+
+## Topology (frozen)
+
+| Failure | Verdict |
+|---|---|
+| `raw_wire` writer, `raw_rest` writer | **TERMINATE** — controlled, non-zero exit |
+| trades (canonical), raw trade anchor (`binance_trades_raw`), dedup SQLite (`DedupStateError`) | isolate **trades** |
+| `orderbook`, `binance_orderbook_raw` | isolate **orderbook** |
+| `markprice` | isolate **markprice** |
+| canonical `openinterest` | isolate **openinterest**; `raw_rest` keeps capturing |
+| `liquidation` | isolate **liquidation** |
+| publication marker / dedup-hook failure | the owning writer's row above |
+| `quality_events` writer | **degrade** the quality channel; process keeps running |
+| ordinary exception (not `FatalStorageError`) | continue — unchanged P0-1 isolation |
+| typed fatal from a stream not in this table | **TERMINATE** (default-deny) |
+
+The table is `failure_topology.STORAGE_STREAM_VERDICTS`; a new writer must be added there on
+purpose.
+
+### Why `raw_rest` is a raw-evidence boundary
+
+A REST answer reflects the exchange *at request time*: its content and availability cannot be
+causally reconstructed later, and replay must never contact the live exchange. A REST response is
+authoritative only if it was durably captured, so a lost `raw_rest` writer terminates, and a
+response that was not captured is never fed to the canonical OI writer. By contrast every derived
+route (trades, book, mark, OI, liquidation) can be regenerated from preserved `raw_wire` /
+`raw_rest`, so losing one only isolates that route.
+
+## Mechanism
+
+* **Typed exception** — `storage_errors.FatalStorageError(RuntimeError)` with `stream`,
+  `component`, `stage`, `durability`. It is a leaf module. It deliberately does **not** inherit
+  `OSError`. `DedupStateError` is a subclass (message-only constructor and name unchanged).
+  Classification is `isinstance(exc, FatalStorageError)` only: never `RuntimeError`, never message
+  text (`"FAILED"`), never a class-name string.
+* **Writer** — `ParquetWriter` raises `FatalStorageError ... from exc` at the existing FAILED /
+  publication-gate boundaries. F1 ordering is untouched (fsync → rename → dir fsync → marker →
+  hook). Refusal after an explicit `close()` stays a plain `RuntimeError`. `failure_snapshot()` is
+  a read-only view of the latch.
+* **Raw capture** — `RawCapture(fail_closed_on_fatal_storage=True)` (set by the USD-M
+  collector and, in this PR, by Spot, Bybit, OKX and OKX capture-only) re-raises a typed fatal from the raw writers *without consulting the quality sink*.
+  Capture still precedes parsing; payload, truncation and "never fabricate" are unchanged.
+* **Websocket client** — `except FatalStorageError` precedes the generic handlers at the raw-frame
+  callback, the worker and the connection loop, and hands the error to an optional `on_fatal`
+  hook. Ordinary exceptions keep the P0-1 behaviour (counted, worker stays alive). A raw-frame
+  fatal is terminal for the client: `enter_discard_mode()` stops ingestion and reconnects while the
+  worker keeps draining and calls `task_done()` exactly once per item, so `queue.join()` completes
+  and a producer never blocks. The worker never calls `shutdown()`/`sys.exit`.
+* **Application** — `CollectorApp` keeps `failed_components`, `isolated_routes`,
+  `terminal_failure`, `quality_degraded` (each `FailureRecord`: stream, component, stage,
+  durability, verdict, route, origin, first-observed ts). The first failure per component wins;
+  repeats are only counted. An isolated route's handler/writer is never invoked again
+  (`route_short_circuits` counts frames; no per-frame event). Reconnects do not touch any latch;
+  only a process restart (F1/P0-4 startup reconciliation) re-opens a stream.
+* **Supervisor** — `_failure_supervisor_loop` (1 s) reads each writer's `failure_snapshot()` so a
+  failure that latched while the writer was quiet is still found; on a terminal failure it starts
+  the existing `_async_shutdown` **from the supervisor task**. It never repairs a writer.
+* **Exit** — `main()` returns `EXIT_FATAL_STORAGE` (70) when a terminal failure latched and the
+  entry point does a single `sys.exit(main())`. No `os._exit`.
+* **Reporting (recursion-safe)** — synchronous structured log → the quality WAL directly (its seq is
+  held in-flight so a later checkpoint cannot cover it; the next start replays it) → one operator
+  alert. It never calls `quality_writer` or `_persist_quality_event`. Once the quality channel is
+  degraded, `_persist_quality_event` stops calling the failed writer. An event is counted in
+  `_quality_events_wal_only` **only when its WAL record is established**; see
+  "Quality-channel failure boundaries" below for the other two outcomes.
+* **Quality-channel failure boundaries (remediation Part 2A)** — the intent is that a failing *quality*
+  writer degrades telemetry, does not terminate healthy market-data processing and is not read as a raw
+  or derived failure. That is enforced at the specific boundaries below, not as a blanket guarantee: see
+  *Exception handling: what is contained, what propagates (A5.1)* for the full list, including the places
+  where a typed fatal is still contained or dropped. Three boundaries are handled differently on purpose:
+  * `_persist_quality_event` **keeps its contract: it raises** when the quality writer fails (the
+    persistence loop, startup replay, overflow and shutdown paths depend on that to hold the
+    checkpoint back). It latches the channel degraded, blocks the checkpoint and reports once.
+  * `_emit_quality_event` is the market-data-path variant (handlers, order-book recovery, drains,
+    OI polling, startup corruption report). It contains **only** a typed fatal that `failure_topology`
+    maps to the quality channel (USD-M checks `classify_stream(exc.stream)` against the default table,
+    i.e. the `quality_events` stream). By then `_persist_quality_event` has latched the channel, blocked
+    the checkpoint and reported once. Whether the *event itself* is in the WAL depends on its WAL append
+    having succeeded; otherwise it is counted as unconfirmed or unrecorded (see *Degraded-channel
+    accounting* below). Ordinary exceptions (P0-1) and a typed fatal of any other stream still propagate
+    out of this method; where they end up is listed under *Exception handling* (A5.1). A quality-channel
+    fatal therefore no longer stops order-book recovery from reaching `controller.succeed()/fail()`, and
+    no longer lets an OI error handler crash the task; an unrelated typed fatal or an ordinary exception
+    still takes the existing paths (recovery classifies a typed fatal with `origin="recovery"` and
+    returns without calling the controller).
+  * `ParquetWriter._deliver_to_sink` stops a quality-channel fatal raised by the *sink* from
+    surfacing as the **emitting writer's** failure (the unguarded migration / crashed-segment
+    `DATA_DROP` paths inside `write()`). Without it, a quality failure carried through a `raw_wire`
+    write was classified at the raw-frame boundary, which is TERMINATE by construction. Its classification
+    uses the **default (USD-M) stream table**, i.e. it recognises `quality_events` only. Venue runners whose
+    quality sink re-raises must contain their own quality stream themselves: Bybit does so in
+    `_writer_quality_sink`, which delegates to `_emit_quality_event` (see "Final fix, Part 2 (Finding B)" below): the
+    runner's own table (`StandaloneFailurePolicy.is_quality_channel_failure`) decides, the degrade is latched once and
+    every other typed fatal is re-raised. Spot, OKX and OKX capture-only do the same
+    inside their own `_persist_quality_event` (final fix, Finding A): a typed fatal that the runner's OWN table
+    maps to its quality stream is latched once through `StandaloneFailurePolicy.on_fatal(origin="quality_writer")`
+    (one structured log + one operator alert) and contained, so a quality-stream fatal does not escape their sinks; any other typed
+    fatal is re-raised; an ordinary exception keeps the log-and-continue path (a log line per event, as on base).
+    Before the policy exists (startup) the test is the narrower `exc.stream == quality_writer.stream_name`:
+    a match is held and latched once the policy is built; any other typed fatal is re-raised.
+    Before this, the typed fatal was caught by the blanket `except Exception`, never latched, and logged once
+    per event with no alert and a healthy-looking quality state.
+  * **No quality WAL on these runners.** Spot, OKX and OKX capture-only provide no supported quality WAL for
+    replay or recovery, so once the channel is degraded an event is not durably published through the supported
+    quality-storage path and is counted *lost* (see "Quality-event wording" below for the exact meaning of lost,
+    unconfirmed and temporary artifacts). Once latched, the failed writer is never called again and every later
+    event only increments `quality_events_lost`. The one event whose own write tripped the latch is counted from
+    the writer's durability evidence (A4), not from the raise: published counts nowhere, unconfirmed counts in
+    `quality_events_unconfirmed`, not durably published counts as lost.
+    `quality_degraded` (the latched `FailureRecord`) and `quality_channel_status()` expose this on the runner,
+    and OKX capture-only adds it to the status it returns and prints. Raw capture, market-data routes and the
+    process exit status are unaffected by a quality-only failure; a later raw-evidence fatal still exits 70.
+  * **Operator visibility of the loss (A2).** The same three runners report the loss through one shared mixin
+    (`DegradedQualityLossReporting` in `standalone_failure_policy.py`), so they cannot drift:
+    * *Bounded logs.* The first lost event is logged, then only at power-of-two counts (1, 2, 4, 8, ...): the
+      number of lines grows with log2 of the losses, never with the losses. Events are
+      `<spot|okx|okx_capture>_quality_event_lost`, each with the running totals, the stream / event type /
+      (truncated) reason of the event that reached that count, `quality_wal=False` and a fixed, bounded note
+      stating what "lost" means (not durably published through the supported quality-storage path), that the
+      runner provides no supported quality WAL for replay or recovery, and that an unpublished `.tmp` file may
+      remain but is not guaranteed to be complete, recoverable or authoritative. No extra alert: the one-time
+      latch alert is the policy's and is unchanged, and the failed writer is still never retried.
+    * *Distinct counters.* `quality_events_lost` (demonstrably not durably published) and
+      `quality_events_unconfirmed` (the A4 trigger event whose durability could not be established) are counted and
+      logged separately, each on its own cadence (`..._quality_event_unconfirmed`). An unconfirmed event is never
+      labelled lost or retained, and its report never calls it lost or unrecoverable. Event disposition (A4) is
+      unchanged.
+    * *Status.* `quality_channel_status()` gains `quality_wal: False` (always). In-repository consumers: the OKX
+      capture-only `run()` result / printed JSON (spreads the status, so it carries the field) and the tests;
+      nothing else reads this status.
+    * *Shutdown.* Once every writer has been closed, `shutdown()` (Spot, OKX) and `close()` (OKX capture-only)
+      log `<prefix>_quality_channel_final` with the final counters, only if the channel ever degraded and once
+      per distinct snapshot. It never raises, so it cannot mask an existing failure, change the exit status or
+      prevent writer cleanup. A process that is killed (`SIGKILL`, crash) never reaches it; the periodic
+      power-of-two lines are then the record. The final note is conditional (A5.2-B, presentation only): it
+      describes lost events only when `quality_events_lost > 0` and unconfirmed events only when
+      `quality_events_unconfirmed > 0`, and always carries the no-supported-WAL / `.tmp` caveat. A report with
+      only unconfirmed events therefore never implies that any event was counted as lost.
+  * `StandaloneFailurePolicy._report` lets a *quality* record nest inside another failure's report (it only logs
+    and alerts; the runner's reporter is never called for it, so nothing reaches the failed quality writer).
+    On a full disk the derived writers of Spot/OKX have no quality sink, so the first write to the quality
+    writer is the one made by the derived failure's own reporter; without this the quality latch made there
+    was recorded silently. A nested non-quality report is still suppressed.
+  * Genuine raw (`raw_wire`/`raw_rest`) fatals still terminate; derived-writer fatals still isolate
+    their route; a failed quality writer is never called again and never resurrected in-process.
+* **Degraded-channel accounting (remediation Parts 2A/2B)** — for each event that reaches the degraded
+  channel, **including the event whose own write tripped the quality writer** (Part 2B: it was
+  previously left out of the count although its WAL record was already durable): `_quality_events_wal_only` = WAL record established (replayed on next start);
+  `_quality_events_wal_unconfirmed` = the append failed *after* assigning an id (a record may exist; its
+  seq pins the checkpoint, but it is not claimed retained); `_quality_events_unrecorded` = no WAL
+  record and no writer: the event is **lost**, reported as such (bounded log: first, then powers of two;
+  one operator alert) and never through the failed writer. No path advances a checkpoint over an event
+  whose durability is unproven. The counters are a lower bound of events whose only durable copy is the
+  WAL: rows already buffered in the failed segment before the trip are held by their in-flight seqs
+  (checkpoint blocked) but are not added to `_quality_events_wal_only`. An ordinary (non-typed) quality
+  writer exception is not degraded-channel accounting. These counters exist in the Binance USD-M
+  `CollectorApp` and (final fix, Part 2) in `BybitCollectorApp`; Spot, OKX and OKX capture-only keep no WAL and
+  expose `quality_events_lost` plus `quality_events_unconfirmed` (A4) and `quality_wal: False` (A2) instead.
+* **Shutdown** — unchanged order. A failed writer's `close()` raising does not stop the other
+  writers from closing (`_close_writer_reporting_failure`).
+
+## Standalone runners (Spot, Bybit, OKX, OKX capture)
+
+**The defect this closes.** These runners share the `WebSocketClient` with USD-M but had no
+supervised path for a typed fatal. A derived trades-writer ENOSPC made the client enter terminal
+discard mode, its task ended with `FatalStorageError`, and `_main` never awaited or observed that
+task: the process stayed alive collecting nothing. On the pre-F5 base the same failure was
+isolated by the ordinary worker-error path and raw capture continued, so this was a regression,
+not a pre-existing gap.
+
+**Decision: all four are brought under the raw-evidence termination contract in this PR.**
+At the previously reviewed head (114e02d) only USD-M built `RawCapture(fail_closed_on_fatal_storage=True)`;
+Spot and OKX capture-only failed open on a raw-writer fatal (reproduced by the review), and Bybit and the
+OKX collector were no different. A capture-only process writes *nothing but* raw frames, so a dead raw
+writer means it captures nothing while looking healthy; Spot's raw REST snapshot is not causally
+reconstructable. All four now set the flag, which is what routes a raw-writer fatal to the termination
+path below instead of the fail-open `DATA_DROP` path.
+
+**Mechanism** (`collector/standalone_failure_policy.py`):
+
+* `build_stream_table(raw=, derived=, quality=, dedup_route=)` builds each runner's
+  stream -> verdict table **from its own live writers' `stream_name`**, so Binance USD-M names are
+  never copied onto `spot_*` / `bybit_*` / `okx_*` streams. A typed fatal from a stream that is not
+  in the runner's table is TERMINATE (default-deny); a USD-M name on a venue that does not write it is
+  *not* silently mapped.
+* `StandaloneFailurePolicy.on_fatal(exc, origin)` classifies by `isinstance(exc, FatalStorageError)`
+  plus the failed writer's own `stream`, latches (`failed_components`, `isolated_routes`,
+  `terminal_failure`, `quality_degraded`) and, for TERMINATE, puts the client in discard mode and sets
+  `terminal_event`. It only **latches**; it never shuts anything down, so it is safe to call from the
+  websocket worker.
+* **Handlers do not catch typed fatals.** This preserves the committed P0-4 contract (a handler
+  raises `DedupStateError` / the writer's fatal; nothing is admitted or indexed). The fatal
+  propagates to the client's worker boundary, which calls `on_fatal(exc, "worker")`. The handler only
+  `tag_route`s the exception (`f5_route`) before re-raising, so a failure naming a generic stream
+  (`DedupStateError` -> `trades`) is still attributed to the right route, including OKX's two trade
+  routes (`trades`, `trades_all`). This differs from USD-M, whose `handle_message` classifies in place.
+* `supervise_standalone_runner(app, stop)` is each runner's `_main`: it **always observes** the
+  application task, waits for a signal, a latched terminal failure, or the task ending, then shuts
+  down *from the main task* (never from a worker), bounds the wait for the cancelled task
+  (`SHUTDOWN_TASK_TIMEOUT_S`), retrieves its outcome so it can never be an unobserved background task,
+  and returns the exit status. A typed fatal that escaped the task unclassified is terminal
+  (origin `run_task`, default-deny).
+* **Exit status:** `70` (`EXIT_FATAL_STORAGE`) when a terminal failure latched; `1`
+  (`EXIT_RUN_TASK_CRASHED`) when the task died of an ordinary exception; `0` for a signalled stop.
+  `__main__` does `raise SystemExit(asyncio.run(_main(...)))`; no `os._exit`.
+* **OKX capture-only** does not use the supervisor; `OKXCaptureApp.run` waits on
+  *task | duration | terminal_event*, so a raw failure no longer runs on silently to the end of
+  `--duration` / `--forever`, and `main()` returns the exit status.
+* Spot recovery (`_run_recovery` / `_capture_rest`) is outside the client worker, so it classifies its
+  own fatals. A response whose raw REST capture was lost is never used to feed the book.
+
+**Isolating a route in a standalone runner** short-circuits later frames of that route before
+`normalize()` (which runs trade dedup), counted in `route_short_circuits`. A message that carries
+several events drops its remaining events when one of them raises, exactly as an uncaught handler error
+did before; for these venues one message feeds one route.
+
+## F-2: exception-safe terminal shutdown (`run_collector`)
+
+Reproduced against the real USD-M lifecycle: raw storage fails terminally, the first quality-writer
+operation during shutdown also fails, `_async_shutdown` raised before `shutdown()`, all ten writers
+stayed unclosed, the health monitor stayed active and the process did not exit 70.
+
+* **Quality reporting is never a precondition of shutdown.** `_async_shutdown` and `start()`'s
+  `finally` run `shutdown()` and the task cancellation in a `finally`; each preceding step is guarded.
+* `_drain_integrity_quality_events_safely()` (used on the shutdown paths only) never raises and one
+  failing event does not forfeit the next. Every event is already WAL-protected before it reaches the
+  writer, so a failed persist only blocks the checkpoint and the next start replays it (F1/WAL ordering
+  is unchanged: drain -> close `quality_writer` -> only then close the WAL).
+* `shutdown()` is exception-safe and **retryable**. `_closed` means "shutdown has begun" (the supervisor
+  loop reads it); cleanup completion is `_shutdown_done`, set only after a full pass. Each writer's close
+  is attempted at most once (`_writer_close_results`; an attempt that was *interrupted* is not recorded
+  and is retried). A failure in one step or one writer never stops the next.
+* `main()` returns `EXIT_FATAL_STORAGE` even if teardown raised after a terminal failure latched; an
+  unrelated crash keeps its traceback.
+* No `os._exit`. The shutdown runs in the supervisor's (or signal handler's) task, never in a worker,
+  so cancelling `self.tasks` cannot cancel the running coroutine.
+
+## Behaviour changes worth knowing
+
+* `CollectorApp.handle_message` now *classifies* a typed fatal instead of letting it propagate:
+  the first failing frame isolates the route and later frames are short-circuited, so six existing
+  runner tests that expected a raise were converted (USD-M only; the standalone runners still raise
+  out of their handlers and are classified at the client's worker boundary). The
+  safety assertions in them (trade not admitted, nothing indexed, buffer empty) are unchanged.
+* Isolating *trades* stops the raw trade anchor too (route-wide), consistent with "trades, anchor
+  or dedup failure ⇒ isolate trades". `raw_wire` still holds every frame.
+* `_poll_openinterest` no longer writes a second, contradictory `ok=False` `raw_rest` row for a
+  response that was already captured `ok=True`.
+* `mark`, `oi`, `liquidation` writers now have the same non-recursive quality sink as the other
+  derived writers. `quality_writer` still has none.
+
+## Replay qualification
+
+F5 requires `RAW EVIDENCE → production replay path → authoritative canonical observation`, without
+contacting the exchange. It does **not** claim, and nothing here verifies, exact reproduction of
+the feature-Parquet outputs.
+
+## Part 2B: client lifecycle and exact queue accounting
+
+* `WebSocketClient.start()` refuses a client that is already latched in discard mode: it connects to nothing,
+  enqueues nothing and runs only the shutdown tail (a latched fatal with no classifier is still raised). A
+  connection that completes *after* the latch landed is dropped before `on_reconnect`, the CONNECT quality
+  event and the subscribe. A fresh client starts exactly as before.
+* The full-queue wait re-checks `running` after its sleep, immediately before the next `put_nowait`. Before, a
+  producer parked on a full queue could enqueue one item after the worker had drained and exited (for discard
+  mode and for an ordinary `stop()`), leaving `join()` to wait out the drain timeout. Such a frame is now counted
+  in `frames_abandoned_at_shutdown` and reported; `task_done()` stays exactly once per queued item.
+* Idle secondary client (observed, not changed): a client blocked in `recv()` on a quiet socket does not see the
+  latch until a frame arrives, on base as well. The terminal contract does not depend on it: the supervisor cancels
+  the client task and the worker exits by itself. Covered by a test.
+
+## Final fix, Part 2 (Finding B): Bybit quality-channel containment
+
+**Defect.** `BybitCollectorApp._apply_orderbook` and `_record_adapter_unhandled` called `_persist_quality_event`
+directly from the market-data path, and `_persist_quality_event` re-raises when the quality writer is FAILED.
+Reproduced on the unfixed head (snapshot, then a delta with a decreasing update id, quality writer failing):
+
+* `_apply_orderbook`: the snapshot's RECOVERING→VALID transition event raised before `ob_writer.write`, so the
+  **canonical order-book row was lost** and the client counted a worker fatal for every book transition; the failed
+  quality writer was called again once per transition (`bybit_quality_checkpoint_blocked` each time).
+* `_record_adapter_unhandled`: the adapter invokes its sink under `except Exception: pass`
+  (`ExchangeAdapter.unhandled`), so the typed quality fatal was **swallowed silently**: never latched, never alerted,
+  the dead writer called again for every duplicate-trade / unrouted frame. (The frame itself was not aborted here.)
+
+**Fix (`run_bybit_collector.py` only).**
+
+* `_emit_quality_event` is the market-data-path variant (same contract as USD-M's). It contains **only** a typed
+  fatal that Bybit's *own* failure policy maps to *its* quality channel. Any other typed fatal, and every ordinary
+  exception, propagates unchanged. Used by `_apply_orderbook`, `_record_adapter_unhandled`, `_on_client_quality_event`
+  and `_writer_quality_sink`. `_persist_quality_event` keeps its raise-on-failure contract (startup replay, shutdown
+  reports and the failure reporter rely on it).
+* `_persist_quality_event` latches the channel once on the first failing write/publish
+  (`StandaloneFailurePolicy.on_fatal(origin="quality_writer")`: one structured log, one operator alert) and, once
+  degraded, **never calls the failed writer again**: the event is WAL-protected first, then only accounted.
+  Only a fatal the runner's own table maps to the quality stream is latched here, so an unrelated typed fatal is
+  neither swallowed nor relabelled.
+* `_record_adapter_unhandled` hands a typed fatal that is *not* the quality channel's to the failure policy
+  (`origin="adapter_unhandled"`) before re-raising, because the adapter's catch-all would otherwise drop it.
+* `_on_client_quality_event` (called UNGUARDED by `WebSocketClient`, so it must not raise) hands a typed fatal that
+  is *not* the quality channel's to the failure policy (`origin="client_quality_event"`) and then **contains** it:
+  raw-evidence / unknown stream → terminate (discard mode, supervisor wake-up, exit 70), derived stream → isolate
+  its own route, never latched as a quality failure. Previously its catch-all logged and swallowed it, so the
+  default-deny rule was bypassed. Repeats are counted by the policy, not logged or alerted per event. An ordinary
+  exception keeps the existing log + checkpoint-block behaviour.
+* While degraded, the per-event `bybit_quality_event_wal_append_failed_in_persist` error log is replaced by the
+  bounded accounting log (a full disk typically breaks the WAL and Parquet together).
+
+**Degraded-channel counters** (`quality_channel_status()`, also `quality_degraded`), disjoint, counted for every
+event that reaches the degraded channel including the one whose write tripped the latch:
+
+| counter | meaning |
+|---|---|
+| `quality_events_wal_only` | WAL append returned: the record is established and the next start replays it into Parquet |
+| `quality_events_wal_unconfirmed` | append raised after assigning an id (e.g. fsync failed): a record *may* exist; neither "retained" nor "lost" |
+| `quality_events_lost` | no WAL record and no usable writer: not durably recorded, counted as lost. Bounded log (first, then powers of two) + one alert |
+
+Verified against reality, not just against each other: the WAL on disk holds exactly the `wal_only` events,
+none of them is checkpointed, and a restart on a healthy disk publishes each exactly once.
+
+**Unchanged by design.** Raw-evidence fatal → exit 70 (also while quality is degraded); real order-book writer
+fatal → isolate the `orderbook` route; unknown typed fatal → terminate; ordinary exception → P0-1 (a plain exception
+from the quality writer on the book path still drops that frame's row; the adapter still swallows ordinary
+exceptions from its sink).
+
+**Remaining limitations.**
+
+* While degraded, every event is still appended to the quality WAL and its seq kept in memory
+  (`_quality_wal_inflight`). WAL size rotation only runs from the segment-published hook, which never fires for a
+  dead writer, so a long degradation with a high event rate grows the WAL until restart. Same as USD-M.
+* Events already buffered in the failed segment before the trip are covered by their in-flight seqs but are not
+  counted in `quality_events_wal_only` (the counter is a lower bound).
+* The counters are in-process: they restart at 0 with the process; replayed events are not re-counted.
+* `quality_channel_status()` is exposed on the runner object; Bybit has no status printout or health endpoint
+  wired to it yet.
+* Not exercised against a real full disk or under systemd (fault injection at `os.replace` / WAL `fsync`).
+
+## Exception handling: what is contained, what propagates (A5.1)
+
+Neither this document nor the code comments promise that a typed fatal is never swallowed, in the
+absolute. The contract is per boundary. This section was re-derived from the code and tests as of commit `cb84cac`
+(the A3 commit, the head when A5.1 was written), not from comments. That commit is recorded as the version
+reviewed; it is not a claim that the tables below were re-derived at the current branch head. Checked by diff
+against `cb84cac`: later commits on this branch (A5.1 documentation, A5.2 wording) changed production code only in
+operator-message text, docstrings and comments, plus a pure string builder for the final shutdown note (and its
+one call site) in `standalone_failure_policy.py`; no exception-handling boundary listed here was changed.
+"Typed fatal" always means `isinstance(exc, FatalStorageError)` (`DedupStateError` included).
+
+**Where typed fatals come from.** The only places in the package that construct one are `ParquetWriter`
+(`_storage_fatal`, `_publication_fatal`; both stamp the writer's *own* `stream_name`) and `DedupStateError`
+(stream `trades` by default). The quality writer has no dedup state and no quality sink, so on the current
+code a quality-writer call raises only the quality stream's own fatal. The "typed fatal of another stream"
+branches below are therefore default-deny guards that the tests exercise by fault injection (they
+monkeypatch `quality_writer.write`); no production source of one was found on the quality path.
+
+### 1. Typed fatals that are intentionally contained
+
+"Contained" means the exception stops there. The verdict is still latched through the failure policy or,
+for the quality channel, as degraded telemetry, so the failure stays visible.
+
+| Boundary | What is contained | Check that permits containment | Anything else |
+|---|---|---|---|
+| USD-M `CollectorApp._emit_quality_event` | typed fatal of the quality channel | `classify_stream(exc.stream)` against the **default table** is `degrade_quality` (stream `quality_events`) | re-raised unchanged |
+| `BybitCollectorApp._emit_quality_event` | typed fatal of Bybit's quality channel | `failure_policy.is_quality_channel_failure(exc)`, the runner's *own* table; with no policy yet nothing is contained | re-raised unchanged |
+| Spot / OKX / OKX capture-only `_persist_quality_event` | typed fatal of the runner's quality channel | `policy.is_quality_channel_failure(exc)`; before the policy exists only `exc.stream == quality_writer.stream_name` (held, latched once the policy is built) | re-raised unchanged |
+| `ParquetWriter._deliver_to_sink` (the *unguarded* `_emit_quality` / `_emit_drop` paths) | typed fatal raised by the writer's quality sink | `classify_stream(exc.stream)` against the **default (USD-M) table** is `degrade_quality`; logged as `storage_quality_channel_failed_in_sink` | re-raised unchanged |
+| `BybitCollectorApp._on_client_quality_event` (called unguarded by the websocket client) | the quality fatal (via `_emit_quality_event`) and, after classification, any other typed fatal | another stream's fatal is first given to `failure_policy.on_fatal(exc, origin="client_quality_event")` (terminate or isolate by its own stream) and only then contained; with no policy it is re-raised | ordinary exceptions: logged, checkpoint blocked |
+| `WebSocketClient._handle_fatal` | every typed fatal at the raw-frame callback, the worker and the connection loop | `except FatalStorageError` precedes the generic handlers; the error goes to `on_fatal`; the client enters discard mode if the origin is `raw_frame`, no hook is set, or the hook raised | none |
+
+### 2. Typed fatals that propagate or are passed to the failure policy
+
+* **A typed fatal of another stream at a quality boundary** (anything the check in the table above rejects) is
+  re-raised unchanged by `_emit_quality_event`, `_persist_quality_event` and `_deliver_to_sink`. It is never
+  latched as a quality failure and never counted as lost or unconfirmed. It is classified *by its own stream*
+  where it lands: raw evidence or an unmapped stream terminates (default-deny), a derived stream isolates its
+  route. Landing points are the client's worker boundary (`on_fatal(exc, "worker")`), USD-M `handle_message`
+  and recovery (`origin="recovery"`).
+* **Bybit's adapter-unhandled path** passes a non-quality typed fatal to the failure policy
+  (`origin="adapter_unhandled"`) *before* re-raising it, because the adapter drops it afterwards (4a).
+* **Standalone-runner handlers** do not catch typed fatals; they `tag_route` and re-raise to the worker boundary.
+* **Raw evidence.** A fail-closed `RawCapture` re-raises any typed fatal from the raw writers without
+  consulting the quality sink, and the origins `raw_frame`, `raw_rest` and `run_task` are TERMINATE whatever
+  stream the exception names.
+
+### 3. Ordinary exceptions
+
+An ordinary exception, a plain `RuntimeError` included (a closed writer's refusal is one), is never
+classified as a storage fatal (A3 tests). It keeps its pre-F5 (P0-1) behaviour, which differs by boundary:
+
+| Boundary | Ordinary exception |
+|---|---|
+| WebSocket worker | counted as a processing error; the worker stays alive |
+| USD-M and Bybit `_persist_quality_event` | checkpoint blocked, then re-raised; `_emit_quality_event` lets it propagate |
+| Spot / OKX / OKX capture-only `_persist_quality_event` | `spot_quality_write_failed` / `okx_quality_write_failed` logged (per event), ingest continues; the writer is *not* latched and is called again |
+| Bybit `_on_client_quality_event` | logged, checkpoint blocked, contained |
+| Fail-open `RawCapture` (ordinary writer error) | `DATA_DROP` quality event, the frame still flows |
+| `ExchangeAdapter.unhandled` sink | dropped silently (4a) |
+
+### 4. Where a typed fatal is still swallowed or dropped, and other limitations
+
+* **a. `ExchangeAdapter.unhandled`** calls its sink under `except Exception: pass` (`adapters/base.py`), so
+  anything the sink raises, a typed fatal included, is dropped by the adapter. Only Bybit compensates
+  (section 2). In USD-M (`_record_adapter_unhandled` -> `_emit_quality_event`), Spot and OKX (-> `_persist_quality_event`)
+  a typed fatal of a non-quality stream raised there would be re-raised by the handler and then dropped by
+  the adapter without reaching the failure policy. No production source of such a fatal was found (see
+  above), so this limits the guard rather than describing a demonstrated live defect. No test was found that
+  covers it for those three runners; the Bybit equivalent is covered.
+* **b. `ParquetWriter` guarded sink calls.** `_emit_quality_guarded` and `_emit_drop(..., guarded=True)` run only
+  after the writer has latched a publication, marker or hook failure. They catch *every* exception from the
+  sink, a typed fatal of another stream included, and only log `storage_quality_event_sink_failed`; the
+  writer's own latch, not the sink, enforces fail-closed. The existing test of this path
+  (`test_sink_failure_cannot_mask_the_storage_error_or_unlatch_the_writer`) uses an ordinary-exception sink,
+  so a typed fatal from the sink on a guarded path rests on the code and a one-off fault-injection check,
+  not on a committed test.
+* **c. `RawCapture` quality-sink calls.** `_fail_open` and `_emit_truncation` swallow any exception from the
+  quality sink (`except Exception`), so a quality-sink failure during raw capture never propagates, a typed
+  fatal from the sink included. A typed fatal from the *raw writer itself* is not affected: it takes the typed
+  branch first (section 2).
+* **d. Default-table classification in the writer.** `ParquetWriter._deliver_to_sink` recognises only the USD-M
+  `quality_events` stream, so a venue sink that re-raised its own venue-prefixed quality fatal would not be
+  contained there. Today that cannot happen: Bybit contains it in `_writer_quality_sink`, and in Spot, OKX and
+  OKX capture-only the raw writers' sink is the runner's own `_persist_quality_event`, which contains the
+  runner's quality fatal itself, so `_deliver_to_sink` never has to classify it. Those runners' derived
+  writers have no sink. A new venue sink must do the same.
+* **e. Websocket quality callback (Spot, OKX).** `_on_client_quality_event` calls `_persist_quality_event`
+  directly, so a re-raised non-quality typed fatal would leave the callback. At the CONNECT call site, which is
+  inside the connection loop's `try`, it reaches `except FatalStorageError` and `_handle_fatal`. Whether every
+  other `on_quality_event` call site does the same was not traced.
+
+Evidence: `test_f5_part2a_quality_channel.py` (USD-M emit, writer sink), `test_f5_final_quality_writer_latch.py`
+(Spot / OKX / OKX capture-only, including an unrelated typed fatal and an ordinary error),
+`test_f5_final_bybit_quality_containment.py` and `test_f5_final_bybit_ws_callback_fatal.py` (Bybit),
+`test_f5_a3_ordinary_runtime_error.py` (ordinary `RuntimeError`), `test_f5_fatal_storage_topology.py`
+(topology, raw capture).
+
+## Quality-event wording: lost, unconfirmed, temporary artifacts, no quality WAL (A5.2)
+
+These four terms are used the same way in the runner docstrings, the operator log notes and this document.
+
+* **Lost**: not durably published through the supported quality-storage path. It is a statement about that path,
+  not a claim that no byte of the event exists anywhere. Nothing here says a lost event is "physically
+  unrecoverable"; it says no supported path publishes, replays or recovers it.
+* **Unconfirmed**: durability could not be established (for example the segment was renamed into place but the
+  directory fsync failed). Neither loss nor retention is confirmed, so it is counted separately
+  (`quality_events_unconfirmed`) and is never described as lost.
+* **Temporary artifacts**: an unpublished `.tmp` file may remain after a failed publication, but it is not
+  guaranteed to be complete, recoverable or authoritative. It is not a durable record: it has no publication
+  marker, and per `F1_DURABLE_PUBLICATION.md` it is neither trusted nor indexable and a restart's orphan recovery
+  deletes it. An event whose only copy would be in such a file is counted lost. No temporary-file recovery exists
+  or is implied.
+* **No quality WAL**: Spot, OKX and OKX capture-only provide no supported quality WAL for replay or recovery.
+  (Binance USD-M and Bybit do keep one; their counters are described under "Degraded-channel accounting" and
+  "Degraded-channel counters".)
+
+Historical statements about raw evidence being "irrecoverable" (`RAW_CAPTURE.md`, `failure_topology.py`) are about
+raw wire/REST frames and are unrelated to these definitions.
+
+## Not changed
+
+F1 publication semantics, the P0-1 queue design, replay and the systemd unit.
+
+## Not verified
+
+* Live behaviour under a real disk-full / EIO condition and under systemd (`Restart=always` with
+  the start limit) is **not tested**; tests inject faults at `os.replace` and check a real
+  subprocess exit status of 70.
+* The 1 s supervisor interval bounds detection latency for a quiet-writer failure; it is not
+  measured under load.
+* If the quality WAL itself is unwritable, a failure report falls back to the log line and the
+  alert only.

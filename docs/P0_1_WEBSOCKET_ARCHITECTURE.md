@@ -49,6 +49,16 @@ per rollover threshold, not once per message), a materially smaller risk
 than the data-loss window it replaces. "Data truth comes before
 performance" is the explicit reason for this choice, not an afterthought.
 
+## F5 note: typed fatal storage errors at the worker boundary
+
+The "an exception here never kills the worker" invariant is unchanged for **ordinary**
+exceptions. A `FatalStorageError` is not ordinary: `except FatalStorageError` precedes the generic
+handlers (raw-frame callback, `_process_queue`, connection loop) and goes to the optional
+`on_fatal` hook; it is never counted as a processing error. A raw-frame fatal puts the client in
+terminal *discard mode* (no ingestion, no reconnect; the worker keeps draining and calls
+`task_done()` once per item so `join()` completes). The worker never shuts anything down; the
+application's supervisor does. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
+
 ## Guarantees
 
 **Raw-data durability.** A frame that has entered `_consume`'s loop body

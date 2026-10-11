@@ -33,15 +33,47 @@ from collector.collector.okx_capture import (
     OKX_PUBLIC_WS_URL,
     OKXPublicCapture,
 )
+from collector.collector.failure_topology import FailureRecord
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RawCapture
+from collector.collector.standalone_failure_policy import (
+    DegradedQualityLossReporting, StandaloneFailurePolicy, build_stream_table)
+from collector.collector.storage_errors import EVENT_LOST, EVENT_UNCONFIRMED, FatalStorageError
 from collector.collector.storage_layout import venue_stream
 from collector.collector.utils import logger
 
 
-class OKXCaptureApp:
+#: Seconds a terminal capture waits for the client to drain and stop before the
+#: task is cancelled. Bounded so a quiet connection cannot hold a terminal exit.
+TERMINAL_STOP_GRACE_S = 10.0
+
+
+class OKXCaptureApp(DegradedQualityLossReporting):
+    quality_log_prefix = "okx_capture"
+
     def __init__(self, channels, inst_id: str, data_dir: str, url: str) -> None:
+        # Quality events NOT persisted because the quality channel is degraded:
+        # every later event (short-circuited without calling the failed writer)
+        # plus the event that tripped the latch IF it is demonstrably not
+        # durable. The tripping event is judged from the writer's evidence
+        # (``_account_trigger_event``): published -> counted nowhere,
+        # unconfirmed -> ``quality_events_unconfirmed``, lost -> here. A counter
+        # reported at a bounded cadence (first, then powers of two), never a log line
+        # per event. Set before any writer exists: a writer may
+        # emit through ``_persist_quality_event`` while it is being constructed.
+        self.quality_events_lost = 0
+        # The tripping event whose durability could not be established either way
+        # (renamed into place, directory fsync unconfirmed). Neither lost nor
+        # retained: it is reported as unconfirmed, never as a definite outcome.
+        self.quality_events_unconfirmed = 0
+        # A typed fatal from THIS runner's own quality writer raised BEFORE
+        # ``failure_policy`` exists (a raw writer's orphan recovery emits a quality
+        # event while it is being constructed). There is no table to classify with
+        # yet, so it is only HELD here and latched exactly once, through the
+        # runner's own policy, the moment that policy is built. Never a fabricated
+        # record and never a retried write: the dead writer is not called again.
+        self._pre_policy_quality_failure = None
         # Own stream directories, not Binance's ``raw_wire``/``quality_events``:
         # segment sequence numbers and .tmp files are scoped to a stream
         # directory, so sharing one with the Binance runner shares both. The
@@ -53,14 +85,111 @@ class OKXCaptureApp:
         self.raw_wire_writer = ParquetWriter(
             venue_stream("OKX", "raw_wire"), RAW_WIRE_SCHEMA, base_dir=data_dir,
             exchange="OKX", quality_event_sink=self._persist_quality_event)
+        # F5 raw-evidence contract. This process writes NOTHING but raw frames,
+        # so a raw-writer fatal means it is capturing nothing: it must not carry
+        # on as a healthy-looking process (the fail-open default did exactly
+        # that). The typed fatal propagates to the shared client's raw-frame
+        # boundary, is classified TERMINATE and ends in a controlled non-zero exit.
         self.raw_capture = RawCapture(
             self.raw_wire_writer, None,
-            quality_event_sink=self._persist_quality_event)
+            quality_event_sink=self._persist_quality_event,
+            fail_closed_on_fatal_storage=True)
+        self.failure_policy = StandaloneFailurePolicy(
+            venue="OKX_CAPTURE",
+            streams=build_stream_table(
+                raw=(self.raw_wire_writer,), derived={}, quality=(self.quality_writer,)),
+            clients=lambda: (self.capture.client,),
+            report=self._report_storage_failure)
+        self._latch_pre_policy_quality_failure()
         self.capture = OKXPublicCapture(
             channels, inst_id=inst_id, raw_capture=self.raw_capture,
-            quality_sink=self._persist_quality_event, url=url)
+            quality_sink=self._persist_quality_event, url=url,
+            on_fatal=self._on_fatal_storage)
+
+    # -- F5 failure topology --------------------------------------------------
+
+    @property
+    def exit_code(self) -> int:
+        return self.failure_policy.exit_code
+
+    def _on_fatal_storage(self, exc, origin: str = "handler", *, route=None) -> str:
+        """Classify and latch one typed storage fatal (see ``failure_policy``).
+        Safe to call from the websocket worker: it only latches."""
+        return self.failure_policy.on_fatal(exc, origin, route=route)
+
+    def _report_storage_failure(self, record: FailureRecord) -> None:
+        """Durable record of a NEW raw failure in this venue's quality stream.
+        Never called for a quality failure (the policy skips it).
+        ``_persist_quality_event`` contains a quality-channel fatal itself; the
+        policy guards this reporter against anything else it raises."""
+        self._persist_quality_event({
+            "exchange": "OKX", "stream": "storage_failure", "event_type": QualityEventType.ERROR.value,
+            "reason": (f"fatal_storage:{record.verdict}:component={record.component}:stream={record.stream}:"
+                       f"stage={record.stage}:durability={record.durability}:origin={record.origin}"),
+            "local_ts": record.first_observed_ts})
+
+    @property
+    def quality_degraded(self):
+        """The latched quality-channel ``FailureRecord`` (or ``None`` while healthy)."""
+        return self.failure_policy.quality_degraded
+
+    def quality_channel_status(self) -> dict:
+        """Operator view of the quality channel. Raw capture is unaffected by a
+        degraded channel. ``quality_events_lost`` counts events not durably
+        published through the supported quality-storage path;
+        ``quality_events_unconfirmed`` counts the tripping event whose
+        durability could not be established (neither lost nor retained).
+        ``quality_wal`` is always ``False``: this runner provides no supported
+        quality WAL for replay or recovery, and an unpublished ``.tmp`` file that
+        may remain is not guaranteed to be complete, recoverable or authoritative."""
+        record = self.failure_policy.quality_degraded
+        return {"quality_degraded": record is not None,
+                "quality_events_lost": self.quality_events_lost,
+                "quality_events_unconfirmed": self.quality_events_unconfirmed,
+                "quality_wal": False,
+                "quality_failure": None if record is None else record.as_dict()}
+
+    def _account_trigger_event(self, exc: FatalStorageError, event: dict | None = None) -> None:
+        """Count the ONE event whose ``quality_writer.write`` raised ``exc``, from
+        the writer's own evidence and never from the fact that it raised. That
+        event may already be durable (a full segment published, then opening the
+        next one failed), may be of unconfirmed durability (renamed, directory
+        fsync failed), or may be demonstrably not durable (rename failed, flush
+        failed, or the call failed before the event was admitted). Only the last
+        is ``quality_events_lost``; a published event is counted nowhere; an
+        unconfirmed one is never given a definite retained/lost outcome."""
+        disposition = exc.trigger_event_disposition()
+        if disposition == EVENT_LOST:
+            self._count_quality_event_lost(event)
+        elif disposition == EVENT_UNCONFIRMED:
+            self._count_quality_event_unconfirmed(event)
+
+    def _latch_pre_policy_quality_failure(self) -> None:
+        """Latch, once, a quality-writer failure held while the policy did not
+        exist. Goes through the real ``on_fatal`` (classified by this runner's own
+        table, one alert, never re-reported); it does not touch the failed writer.
+        The counters already account for the event that tripped it."""
+        pending, self._pre_policy_quality_failure = self._pre_policy_quality_failure, None
+        if pending is not None:
+            self.failure_policy.on_fatal(pending, origin="quality_writer")
 
     def _persist_quality_event(self, event: dict) -> None:
+        """Single choke point for every OKX capture quality event.
+
+        F5: a typed ``FatalStorageError`` from THIS runner's quality writer means
+        that writer is FAILED. It is latched exactly once through
+        ``failure_policy`` (degrade the quality channel; origin
+        ``quality_writer``) and contained -- raw capture keeps running. After the
+        latch the failed writer is never called again and later events only bump
+        ``quality_events_lost``: no alert per event, and a log line only at a bounded
+        cadence (first loss, then powers of two; see ``DegradedQualityLossReporting``). A typed
+        fatal of any OTHER stream is re-raised (never swallowed by the quality
+        handler); an ordinary exception keeps the log-and-continue path."""
+        policy = getattr(self, "failure_policy", None)
+        if (policy is not None and policy.quality_degraded is not None) \
+                or self._pre_policy_quality_failure is not None:
+            self._count_quality_event_lost(event)
+            return
         event_type = event.get("event_type", QualityEventType.ERROR.value)
         if isinstance(event_type, QualityEventType):
             event_type = event_type.value
@@ -79,6 +208,21 @@ class OKXCaptureApp:
                 "local_receive_ts": event.get("local_receive_ts"),
                 "local_ts": local_ts,
             })
+        except FatalStorageError as exc:
+            if policy is None:
+                # Startup, before the policy exists. Only a typed fatal that names
+                # THIS runner's own quality stream is held for the policy; every
+                # other typed fatal (raw evidence, derived, another venue's
+                # stream, unknown) propagates exactly as it did before.
+                if exc.stream != self.quality_writer.stream_name:
+                    raise
+                self._pre_policy_quality_failure = exc
+                self._account_trigger_event(exc, event)
+                return
+            if not policy.is_quality_channel_failure(exc):
+                raise
+            policy.on_fatal(exc, origin="quality_writer")
+            self._account_trigger_event(exc, event)
         except Exception as exc:  # noqa: BLE001 - never break capture
             logger.error("okx_quality_write_failed", error=str(exc))
 
@@ -90,16 +234,35 @@ class OKXCaptureApp:
                 loop.add_signal_handler(sig, self.capture.stop)
             except (NotImplementedError, RuntimeError):
                 pass
+        # The capture ends for one of three reasons: the duration elapsed, the
+        # task ended (signal / crash), or a terminal storage failure latched.
+        # Waiting on all three is what stops a raw-writer failure from being
+        # carried out silently to the end of ``--duration`` / ``--forever``.
+        terminal_wait = asyncio.ensure_future(self.failure_policy.terminal_event.wait())
+        sleeper = asyncio.ensure_future(asyncio.sleep(duration_s)) if duration_s is not None else None
+        helpers = [terminal_wait] + ([sleeper] if sleeper is not None else [])
         try:
-            if duration_s is not None:
-                await asyncio.sleep(duration_s)
-                self.capture.stop()
-            await task
+            await asyncio.wait({task, *helpers}, return_when=asyncio.FIRST_COMPLETED)
+            self.capture.stop()
+            if self.failure_policy.terminal_failure is not None:
+                # Controlled terminal stop, from here (never from the worker).
+                # Bounded: a quiet connection must not hold the exit.
+                done, _ = await asyncio.wait({task}, timeout=TERMINAL_STOP_GRACE_S)
+                if not done:
+                    task.cancel()
+                    await asyncio.wait({task}, timeout=TERMINAL_STOP_GRACE_S)
+                if task.done() and not task.cancelled():
+                    task.exception()            # observe it: never an unretrieved task
+            else:
+                await task
         except asyncio.CancelledError:
             self.capture.stop()
         finally:
+            for helper in helpers:
+                helper.cancel()
+            await asyncio.gather(*helpers, return_exceptions=True)
             self.close()
-        return self.capture.status()
+        return {**self.capture.status(), **self.quality_channel_status()}
 
     def close(self) -> None:
         for writer in (self.raw_wire_writer, self.quality_writer):
@@ -107,6 +270,8 @@ class OKXCaptureApp:
                 writer.close()
             except Exception as exc:  # noqa: BLE001
                 logger.error("okx_writer_close_failed", error=str(exc))
+        # Last, so the counts include anything the closes above reported. Cannot raise.
+        self._report_quality_channel_final()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,8 +300,10 @@ def main(argv=None) -> int:
     app = OKXCaptureApp(channels, args.inst_id, args.data_dir, args.url)
     duration = None if args.forever else args.duration
     status = asyncio.run(app.run(duration))
+    if app.failure_policy.terminal_failure is not None:
+        status = {**status, "terminal_failure": app.failure_policy.terminal_failure.as_dict()}
     print(json.dumps(status, indent=2, default=str))
-    return 0
+    return app.exit_code
 
 
 if __name__ == "__main__":

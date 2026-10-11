@@ -30,6 +30,7 @@ import run_collector
 from collector.collector import parquet_writer as pw
 from collector.collector.config import QUALITY_EVENTS_SCHEMA
 from collector.collector.parquet_writer import ParquetWriter
+from collector.tests.test_parquet_writer_publication_failure import expect_fatal
 from collector.collector.quality_events import QualityEventType
 from collector.collector.quality_wal import CHECKPOINT_FILENAME, QualityEventWAL
 
@@ -196,7 +197,7 @@ def test_durable_hook_not_called_when_rename_fails(tmp_path, monkeypatch):
     w = _writer(tmp_path, on_segment_durable=lambda p, n: calls.append(n))
     w.write(_row(0)); w.write(_row(1))
     _fail_replace_for(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.write(_row(2))
     assert calls == []
     assert list(tmp_path.glob("raw/quality_events/*.seg")) == []
@@ -213,7 +214,7 @@ def test_durable_hook_not_called_when_directory_fsync_fails(tmp_path, monkeypatc
             raise OSError(5, "EIO (injected)")
         return real_fsync(fd)
     monkeypatch.setattr(os, "fsync", fsync)
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         w.write(_row(2))
     assert calls == []
 
@@ -365,7 +366,12 @@ def test_C_publication_failure_leaves_wal_authoritative_and_checkpoint_unmoved(t
     asyncio.run(app._quality_persistence_loop())                           # loop must SURVIVE the failure
     assert app._quality_checkpoint_is_blocked()
     assert _disk_ckpt(tmp_path) == -1
-    assert len(_wal_pending(tmp_path)) == 500                              # every event still in the WAL
+    pending = _wal_pending(tmp_path)
+    # F5 adds exactly ONE failure report straight to the WAL (bypassing the failed
+    # quality writer); every one of the 500 original events is still there too.
+    reports = [r for r in pending if r.get("stream") == "storage_failure"]
+    assert len(reports) == 1 and "degrade_quality" in reports[0]["reason"]
+    assert len(pending) - len(reports) == 500                              # every event still in the WAL
     monkeypatch.setattr(os, "replace", real_replace)
     _crash(app)
 
@@ -420,7 +426,7 @@ def test_persistence_loop_survives_a_failing_event_and_keeps_draining(tmp_path, 
 def test_direct_persist_failure_is_not_swallowed(tmp_path, monkeypatch):
     app = _real_app(tmp_path, monkeypatch)
     monkeypatch.setattr(app.quality_writer, "write", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
-    with pytest.raises(OSError):
+    with pytest.raises(OSError):        # ordinary: the injection replaces write() itself, not a storage seam
         _direct(app, "ev_direct")
     assert app._quality_checkpoint_is_blocked()
     assert any(r["reason"] == "ev_direct" for r in _wal_pending(tmp_path))  # WAL evidence preserved
@@ -471,7 +477,7 @@ def test_D_wal_failure_and_publish_failure_is_loud_and_blocks_the_checkpoint(tmp
     app = _real_app(tmp_path, monkeypatch)
     app._quality_wal.append = lambda e: (_ for _ in ()).throw(OSError(5, "EIO"))
     _fail_replace_for(monkeypatch, ".seg")
-    with pytest.raises(OSError):
+    with expect_fatal(OSError):
         _direct(app, "ev_doomed")
     assert app._quality_checkpoint_is_blocked()
     _crash(app)

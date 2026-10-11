@@ -9,6 +9,7 @@ import websockets
 
 from .backoff import BackoffExhausted, ExponentialBackoff
 from .clock import ReceiveStamp, capture_receive_stamp
+from .storage_errors import FatalStorageError
 from .utils import logger
 
 
@@ -66,7 +67,8 @@ class WebSocketClient:
                  on_open: Optional[Callable[..., Awaitable[None]]] = None,
                  keepalive: Optional[Keepalive] = None,
                  control_frames: FrozenSet[str] = frozenset(),
-                 ingest_queue_maxsize: int = 2000):
+                 ingest_queue_maxsize: int = 2000,
+                 on_fatal: Optional[Callable[[FatalStorageError, str], None]] = None):
         self.url = url
         self.stream_group = stream_group
         self.on_message = on_message
@@ -179,6 +181,77 @@ class WebSocketClient:
         #: is broken fails on every frame, and a per-frame event would flood.
         self.raw_capture_callback_degraded = False
 
+        # --- F5: typed fatal-storage boundary ---------------------------
+        #: ``on_fatal(exc, origin)`` hands a ``FatalStorageError`` to the
+        #: application's own classifier. ``origin`` is ``"raw_frame"`` (the
+        #: on_raw_frame callback: the raw-evidence boundary, always terminal
+        #: for this client), ``"worker"`` (on_message / _process_item) or
+        #: ``"client"`` (the connection loop). It is called synchronously and
+        #: must not block; it must not call back into this client's shutdown.
+        #: With no hook there is nobody to classify the failure, so the client
+        #: defaults to DENY: it stops ingesting and start() re-raises.
+        self.on_fatal = on_fatal
+        #: Typed fatals seen at any boundary of this client.
+        self.fatal_storage_errors = 0
+        #: The first typed fatal this client saw (never cleared, never
+        #: overwritten): the client does not repair itself by reconnecting.
+        self.fatal_error: Optional[FatalStorageError] = None
+        #: Terminal "discard mode": no further ingestion or reconnect, and the
+        #: worker only ``task_done()``s what is already queued, so the queue
+        #: drains and ``join()`` completes without any frame being processed.
+        self._discard_mode = False
+        self.discard_reason: Optional[str] = None
+        #: Queued frames dropped unprocessed in discard mode (their raw copy,
+        #: if the raw boundary still held, already exists: see _consume).
+        self.frames_discarded = 0
+
+    @property
+    def discard_mode(self) -> bool:
+        return self._discard_mode
+
+    def enter_discard_mode(self, reason: str) -> None:
+        """Latch the terminal discard state. Idempotent; never un-latched.
+
+        Stops ingestion and reconnection (``running`` goes False, so the
+        receive loop exits at the next frame and ``start()`` does not
+        reconnect) but deliberately does NOT cancel the worker or touch the
+        queue: the worker keeps draining, counting each item as discarded and
+        calling ``task_done()`` exactly once, so the producer can never block
+        on a full queue and ``join()`` still completes.
+        """
+        if not self._discard_mode:
+            self._discard_mode = True
+            self.discard_reason = reason
+            logger.error("websocket_discard_mode_entered",
+                         stream_group=self.stream_group, reason=reason)
+        self.running = False
+        self.connected = False
+
+    def _handle_fatal(self, exc: FatalStorageError, origin: str) -> None:
+        """Route a typed fatal to the application; never raises.
+
+        Called from ``except FatalStorageError`` branches that are placed
+        BEFORE the generic ``except Exception`` ones, so a typed fatal can
+        never be demoted to an ordinary processing error / reconnect.
+        """
+        self.fatal_storage_errors += 1
+        if self.fatal_error is None:
+            self.fatal_error = exc
+        terminal = origin == "raw_frame"      # the raw-evidence boundary itself
+        if self.on_fatal is None:
+            terminal = True                   # nobody to classify it: default-deny
+        else:
+            try:
+                self.on_fatal(exc, origin)
+            except Exception as hook_exc:  # noqa: BLE001 - a broken classifier must fail CLOSED
+                terminal = True
+                logger.error("websocket_on_fatal_hook_failed", stream_group=self.stream_group,
+                             error=f"{type(hook_exc).__name__}: {hook_exc}")
+        logger.error("websocket_fatal_storage_error", stream_group=self.stream_group,
+                     origin=origin, terminal=terminal, **exc.describe())
+        if terminal:
+            self.enter_discard_mode(f"fatal_storage_error:{origin}")
+
     def _receive_kwargs(self, stamp: ReceiveStamp) -> dict:
         """ns/monotonic kwargs for on_raw_frame, only when it accepts them.
 
@@ -221,8 +294,19 @@ class WebSocketClient:
         return "connection_id" in parameters
 
     async def start(self):
-        self.running = True
-        logger.info("Starting WebSocket client", url=self.url)
+        if self._discard_mode:
+            # Terminal latch (a failed-writer fatal): the client is never
+            # revived by start(). ``running`` stays False so the loop below is
+            # skipped and only the shutdown tail runs (nothing to drain, and
+            # a latched fatal with no classifier is still raised). A fresh,
+            # un-latched client takes the ordinary path.
+            self.running = False
+            self.connected = False
+            logger.error("websocket_start_refused_terminal_latch",
+                         stream_group=self.stream_group, reason=self.discard_reason)
+        else:
+            self.running = True
+            logger.info("Starting WebSocket client", url=self.url)
 
         while self.running:
             try:
@@ -231,6 +315,16 @@ class WebSocketClient:
                     connection = await connection
 
                 async with connection as ws:
+                    if self._discard_mode:
+                        # The terminal latch landed while this connection was
+                        # being established. A latched client is never revived
+                        # by a reconnect: drop the socket before announcing it
+                        # (no CONNECT quality event, no on_reconnect, no
+                        # subscribe) and leave the loop without a backoff.
+                        self.connected = False
+                        logger.error("websocket_connection_dropped_terminal_latch",
+                                     stream_group=self.stream_group, reason=self.discard_reason)
+                        break
                     self.connected = True
                     self._connection_serial += 1
                     self.connection_id = f"{self.stream_group}-{self._connection_serial}"
@@ -292,6 +386,12 @@ class WebSocketClient:
                 logger.warning("WebSocket connection closed", error=str(e))
                 if self.on_quality_event:
                     self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
+            except FatalStorageError as exc:
+                # F5: must precede the generic handler below, which would
+                # otherwise treat a fatal storage failure as a transient
+                # connection error and reconnect around it.
+                self.connected = False
+                self._handle_fatal(exc, "client")
             except Exception as e:
                 self.connected = False
                 logger.error("WebSocket error", error=str(e))
@@ -326,6 +426,10 @@ class WebSocketClient:
         # hanging shutdown forever -- the timeout firing is itself an
         # observable, logged condition, not a silent hang.
         await self._drain_and_stop_worker()
+        if self.fatal_error is not None and self.on_fatal is None:
+            # No application classifier was wired: the failure must not
+            # evaporate into a quietly-finished task.
+            raise self.fatal_error
 
     async def _drain_and_stop_worker(self) -> None:
         """Drain the ingest queue (bounded), then stop the worker.
@@ -448,6 +552,13 @@ class WebSocketClient:
                         control_frame=is_control,
                         **self._receive_kwargs(receive_stamp),
                     )
+                except FatalStorageError as exc:
+                    # F5: the raw-evidence boundary is gone. Placed before the
+                    # fail-open handler on purpose. Raw evidence is
+                    # irrecoverable, so continuing to enqueue frames that were
+                    # NOT durably captured is exactly what this must prevent.
+                    self._handle_fatal(exc, "raw_frame")
+                    return
                 except Exception as exc:  # noqa: BLE001 - fails open, but never silently
                     # Ingestion continues (stopping would lose every frame,
                     # not just the raw copy), but this is a raw-evidence
@@ -510,13 +621,21 @@ class WebSocketClient:
                                 "BACKPRESSURE", f"ingest_queue_full:{self.ingest_queue_maxsize}",
                                 self.connection_id, self.stream_group)
                         first_wait = False
+                    await asyncio.sleep(0.01)
                     if not self.running:
-                        # Shutdown was requested while the queue stayed
-                        # full. The frame's raw evidence already exists
-                        # (on_raw_frame already ran above); only its
-                        # on_message processing in *this* run is being
-                        # abandoned, and that is counted and reported,
-                        # never silent.
+                        # Shutdown (or the terminal discard latch) was
+                        # requested while the queue stayed full. The frame's
+                        # raw evidence already exists (on_raw_frame already
+                        # ran above); only its on_message processing in
+                        # *this* run is being abandoned, and that is counted
+                        # and reported, never silent.
+                        #
+                        # Checked AFTER the wait, immediately before the next
+                        # put_nowait (no await in between): the worker leaves
+                        # its loop once ``running`` is False and the queue is
+                        # empty, so a put that landed after that point would
+                        # strand one item behind a dead worker and make
+                        # join() wait out the whole drain timeout.
                         self.frames_abandoned_at_shutdown += 1
                         logger.error("ingest_enqueue_abandoned_at_shutdown",
                                      stream_group=self.stream_group)
@@ -525,7 +644,6 @@ class WebSocketClient:
                                 "ERROR", "ingest_enqueue_abandoned_at_shutdown",
                                 self.connection_id, self.stream_group)
                         return
-                    await asyncio.sleep(0.01)
             self.frames_enqueued += 1
             depth = self._ingest_queue.qsize()
             if depth > self.queue_high_watermark:
@@ -549,8 +667,18 @@ class WebSocketClient:
             except asyncio.TimeoutError:
                 continue
             try:
-                await self._process_item(item)
-                self.frames_processed += 1
+                if self._discard_mode:
+                    # Terminal: account for the item and fall through to
+                    # task_done() in ``finally``; never process it.
+                    self.frames_discarded += 1
+                else:
+                    await self._process_item(item)
+                    self.frames_processed += 1
+            except FatalStorageError as exc:
+                # F5: placed BEFORE the generic isolate-one-bad-item handler
+                # so a typed fatal is classified by the application and can
+                # never be counted as an ordinary processing error.
+                self._handle_fatal(exc, "worker")
             except Exception as exc:  # noqa: BLE001 - isolate one bad item
                 self.processing_errors += 1
                 logger.error("ingest_item_processing_failed",

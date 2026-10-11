@@ -33,9 +33,16 @@ Design rules
   payloads remain observable rather than vanishing into a log line.
 * **Never fabricate.** Fields the wire did not carry stay ``None``. The
   capture layer does not parse, enrich, or repair.
-* **Capture must not be able to stop ingestion.** A raw-capture failure is
-  surfaced as a durable quality event and the frame still flows. Losing
-  research fidelity is bad; losing the live feed is worse.
+* **Capture failure policy (F5).** An ORDINARY capture failure (a row that
+  cannot be built, a writer that raised something other than a typed fatal) is
+  surfaced as a durable quality event and the frame still flows: losing research
+  fidelity is bad, losing the live feed is worse. A ``FatalStorageError`` from
+  the raw writer is different: raw evidence is irrecoverable, and the durable
+  writer is gone. A ``RawCapture`` built with ``fail_closed_on_fatal_storage=True``
+  (the Binance USD-M collector) re-raises it, WITHOUT consulting the quality
+  sink (which may itself be the failing component), so the application can stop.
+  The default stays fail-open so runners that have no application-level
+  termination path (Bybit / OKX / Binance Spot) are unchanged by F5.
 * **Bounded.** Payloads above ``max_payload_bytes`` are stored truncated
   with ``truncated=True`` and the original byte length recorded, so an
   abnormally large frame cannot exhaust memory or disk silently.
@@ -55,6 +62,7 @@ from .clock import (
     ms_from_ns,
     require_epoch_ns,
 )
+from .storage_errors import FatalStorageError
 
 __all__ = [
     "RawWireRecord",
@@ -311,12 +319,18 @@ class RawRestRecord:
 
 
 class RawCapture:
-    """Persist raw records, failing open into the quality stream.
+    """Persist raw records; ordinary failures fail open into the quality stream.
 
     ``wire_writer`` and ``rest_writer`` are anything exposing ``write(dict)``
     (in production, ``ParquetWriter``). Either may be ``None``, which disables
     that half of capture -- useful in tests and in deployments that only want
     REST lineage.
+
+    ``fail_closed_on_fatal_storage`` (F5): when True, a ``FatalStorageError``
+    from either writer propagates to the caller instead of being absorbed by the
+    fail-open path. The check is ``isinstance(exc, FatalStorageError)`` and is
+    placed BEFORE the generic ``Exception`` handler; no message or class-name
+    matching is involved, and an ordinary ``RuntimeError`` stays ordinary.
     """
 
     def __init__(
@@ -327,19 +341,29 @@ class RawCapture:
         quality_event_sink: Optional[Callable[[dict], None]] = None,
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         enabled: bool = True,
+        fail_closed_on_fatal_storage: bool = False,
     ) -> None:
         self.wire_writer = wire_writer
         self.rest_writer = rest_writer
         self.quality_event_sink = quality_event_sink
         self.max_payload_bytes = max_payload_bytes
         self.enabled = enabled
+        self.fail_closed_on_fatal_storage = fail_closed_on_fatal_storage
         self.wire_captured = 0
         self.rest_captured = 0
         self.capture_failures = 0
         self.truncations = 0
+        #: FatalStorageErrors seen from either writer (counted whether or not
+        #: they were re-raised). Never one-per-frame spam: a fail-closed
+        #: application stops ingesting after the first.
+        self.fatal_capture_failures = 0
 
     def _fail_open(self, kind: str, exc: BaseException) -> None:
-        """Raw capture must never take the ingest path down with it."""
+        """Raw capture must never take the ingest path down with it.
+
+        Counts the failed attempt exactly once: every caller reaches the counter
+        either here (fail-open) or by incrementing itself immediately before it
+        re-raises (fail-closed) -- never both."""
         self.capture_failures += 1
         if self.quality_event_sink is None:
             return
@@ -365,7 +389,20 @@ class RawCapture:
                 self.truncations += 1
                 self._emit_truncation(row)
             self.wire_writer.write(row)
-        except Exception as exc:  # noqa: BLE001 - deliberately fails open
+        except FatalStorageError as exc:
+            # MUST stay ahead of the generic handler. The raw writer is the
+            # irrecoverable-evidence boundary: no quality-sink call here (the
+            # sink may be the very thing that is broken), just count and, when
+            # fail-closed, let the application's fatal boundary decide.
+            self.fatal_capture_failures += 1
+            if self.fail_closed_on_fatal_storage:
+                self.capture_failures += 1
+                raise
+            # Fail-open: _fail_open() is the single place that counts this attempt.
+            # (Counting here as well made every typed fatal count twice.)
+            self._fail_open("wire", exc)
+            return False
+        except Exception as exc:  # noqa: BLE001 - ordinary failures fail open
             self._fail_open("wire", exc)
             return False
         self.wire_captured += 1
@@ -380,7 +417,15 @@ class RawCapture:
                 self.truncations += 1
                 self._emit_truncation(row)
             self.rest_writer.write(row)
-        except Exception as exc:  # noqa: BLE001 - deliberately fails open
+        except FatalStorageError as exc:
+            # See capture_wire: typed branch first, never via the quality sink.
+            self.fatal_capture_failures += 1
+            if self.fail_closed_on_fatal_storage:
+                self.capture_failures += 1
+                raise
+            self._fail_open("rest", exc)         # counts this attempt exactly once
+            return False
+        except Exception as exc:  # noqa: BLE001 - ordinary failures fail open
             self._fail_open("rest", exc)
             return False
         self.rest_captured += 1

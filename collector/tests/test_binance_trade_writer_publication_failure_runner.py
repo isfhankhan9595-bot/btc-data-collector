@@ -14,7 +14,7 @@ from collector.collector import parquet_writer as pw_module
 from collector.collector.segment_dedup import dedup_identity_key
 from collector.tests.test_p0_4_runner_lifecycle import (
     META, _build, _coord, _feed, _now, _publish_all)
-from collector.tests.test_parquet_writer_publication_failure import _fail_replace_to
+from collector.tests.test_parquet_writer_publication_failure import _fail_replace_to, expect_fatal
 
 WRITERS = [("raw_trades_writer", "binance_trades_raw"), ("trades_writer", "trades")]
 
@@ -50,12 +50,13 @@ def test_trade_segment_publication_failure_is_durable_fails_closed_and_restart_r
 
     with monkeypatch.context() as m:                   # fault scoped to the injection only
         _fail_replace_to(m, ".seg")
-        with pytest.raises(OSError):
+        with expect_fatal(OSError):
             writer.publish_open_segment()
 
-    # fail closed through the real handler: the trade is refused, never buffered
-    with pytest.raises(RuntimeError):
-        _feed("usdm", app, ["4"], _now() + 5)
+    # fail closed through the real handler: the trade is refused, never buffered.
+    # F5: refusal is ISOLATION of the trades route (derived failure => route only).
+    _feed("usdm", app, ["4"], _now() + 5)
+    assert "trades" in app.isolated_routes and app.terminal_failure is None
     assert writer.buffer == []
     meta = META["usdm"]
     k4 = dedup_identity_key(meta["exchange"], meta["market"], meta["inst"], meta["stream"], "4")
@@ -63,7 +64,8 @@ def test_trade_segment_publication_failure_is_durable_fails_closed_and_restart_r
     if attr == "raw_trades_writer":
         # The raw writer IS the dedup anchor: a refused trade must leave no identity behind.
         assert k4 not in coord._pending_index
-    # (When only the canonical writer failed the healthy raw anchor legitimately keeps capturing.)
+    # (F5: a canonical-trades failure isolates the whole trades route, so the raw anchor is
+    # no longer invoked either; raw_wire still holds every frame for replay.)
     assert list(writer.stream_dir.glob("*.seg")) == []
 
     rows = _durable_quality_rows(app)                  # DURABLE, not just logged

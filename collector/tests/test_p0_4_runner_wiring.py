@@ -379,9 +379,12 @@ def test_rollover_publication_hook_failure_fails_closed_for_the_triggering_write
         next_hour = writer.current_hour[:-2] + f"{(int(writer.current_hour[-2:]) + 1) % 24:02d}"
         monkeypatch.setattr(writer, "_get_current_hour_str", lambda: next_hour)
 
-        with pytest.raises(RuntimeError):
-            asyncio.run(app.handle_message({"stream": "btcusdt@aggTrade",
-                "data": {"E": T + 1, "a": 2, "p": "100", "q": "1", "m": False}}))
+        # F5: the typed fatal is classified at the handler boundary (trades
+        # route isolated) rather than raised out of handle_message.
+        asyncio.run(app.handle_message({"stream": "btcusdt@aggTrade",
+            "data": {"E": T + 1, "a": 2, "p": "100", "q": "1", "m": False}}))
+        assert app.isolated_routes["trades"].stage == "publication_hook"
+        assert app.terminal_failure is None
 
         # 1. The triggering record itself must NOT have been admitted.
         assert all(row["trade_id"] != "2" for row in writer.buffer), \
