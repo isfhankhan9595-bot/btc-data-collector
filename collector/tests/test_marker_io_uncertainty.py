@@ -45,6 +45,17 @@ def _env(monkeypatch):
     monkeypatch.delenv(sd.DEEP_VERIFY_ENV, raising=False)
 
 
+@pytest.fixture
+def fault_mp():
+    """Dedicated to fault injection. ``fault_mp.undo()`` lifts a fault mid-test WITHOUT also dropping the
+    autouse ``COLLECTOR_ALLOW_UNVERIFIED_FS`` override above (CI filesystems are not 'verified')."""
+    mp = pytest.MonkeyPatch()
+    try:
+        yield mp
+    finally:
+        mp.undo()
+
+
 def key_for(trade_id):
     return dedup_identity_key("BINANCE", "linear_perpetual", INSTR, "trades", trade_id)
 
@@ -149,7 +160,7 @@ def tamper_index(base: Path, sql: str) -> None:
 
 # --------------------------------------------------------------------------------- fault injection
 
-def inject_marker_read_error(monkeypatch, match, exc, *, nth=None):
+def inject_marker_read_error(fault_mp, match, exc, *, nth=None):
     """Make ``Path.read_bytes`` raise ``exc`` for marker files whose path satisfies ``match``.
     ``nth`` (a set of 1-based hit numbers) fails only those reads; None fails every read."""
     real = Path.read_bytes
@@ -161,7 +172,7 @@ def inject_marker_read_error(monkeypatch, match, exc, *, nth=None):
             if nth is None or len(hits) in nth:
                 raise exc
         return real(self)
-    monkeypatch.setattr(Path, "read_bytes", faulty)
+    fault_mp.setattr(Path, "read_bytes", faulty)
     return hits
 
 
@@ -180,9 +191,9 @@ READ_FAULTS = [errno.EIO, errno.EACCES, errno.EPERM, errno.ESTALE, errno.EMFILE]
 class Mutations:
     """Records every call to a function that changes marker / segment / index / directory state."""
 
-    def __init__(self, monkeypatch):
+    def __init__(self, fault_mp):
         self.calls = []
-        self._mp = monkeypatch
+        self._mp = fault_mp
 
     def wrap(self, owner, name, *, counts=lambda *a, **k: True):
         real = getattr(owner, name)
@@ -219,11 +230,11 @@ def test_malformed_bytes_are_invalid_content_not_unknown_io(tmp_path, bad):
 
 
 @pytest.mark.parametrize("code", READ_FAULTS)
-def test_read_errors_are_unknown_io_never_invalid_or_absent(tmp_path, monkeypatch, code):
+def test_read_errors_are_unknown_io_never_invalid_or_absent(tmp_path, fault_mp, code):
     seg = tmp_path / "x.seg"
     seg.write_bytes(b"s")
     marker_path(seg).write_bytes(b"{}")                      # the file EXISTS; only reading it fails
-    inject_marker_read_error(monkeypatch, only(marker_path(seg)), errno_exc(code))
+    inject_marker_read_error(fault_mp, only(marker_path(seg)), errno_exc(code))
     m = read_marker(seg)
     assert m.status is MarkerStatus.UNKNOWN_IO
     assert m.status is not MarkerStatus.INVALID and m.status is not MarkerStatus.ABSENT
@@ -238,13 +249,13 @@ def test_a_directory_in_place_of_the_marker_is_a_real_unreadable_marker(tmp_path
     assert read_marker(seg).status is MarkerStatus.UNKNOWN_IO
 
 
-def test_genuine_missing_marker_is_still_absent(tmp_path, monkeypatch):
+def test_genuine_missing_marker_is_still_absent(tmp_path, fault_mp):
     seg = tmp_path / "x.seg"
     seg.write_bytes(b"s")
     m = read_marker(seg)
     assert m.status is MarkerStatus.ABSENT and not m.v1 and m.reason == "no marker file"
     marker_path(seg).write_bytes(b"{}")
-    inject_marker_read_error(monkeypatch, only(marker_path(seg)), OSError(errno.ENOENT, "gone"))
+    inject_marker_read_error(fault_mp, only(marker_path(seg)), OSError(errno.ENOENT, "gone"))
     assert isinstance(OSError(errno.ENOENT, "gone"), FileNotFoundError)
     assert read_marker(seg).status is MarkerStatus.ABSENT   # ENOENT keeps its absent-marker semantics
 
@@ -283,13 +294,13 @@ def test_classify_segment_other_statuses_are_unchanged(tmp_path):
 # ===================================================================== 4, 6, 7, 8: startup_reconcile
 
 @pytest.mark.parametrize("code", READ_FAULTS)
-def test_one_unreadable_marker_aborts_reconcile_with_zero_mutation(tmp_path, monkeypatch, code):
+def test_one_unreadable_marker_aborts_reconcile_with_zero_mutation(tmp_path, fault_mp, code):
     base = three_published_segments(tmp_path)
     node = Node(base)
     victim = node.segs()[1]
     fs_before, idx_before = fs_state(base), index_state(base)
-    muts = Mutations(monkeypatch).install()
-    hits = inject_marker_read_error(monkeypatch, only(marker_path(victim)), errno_exc(code))
+    muts = Mutations(fault_mp).install()
+    hits = inject_marker_read_error(fault_mp, only(marker_path(victim)), errno_exc(code))
 
     with pytest.raises(DedupStateError, match="could not be read"):
         node.reconcile()
@@ -306,15 +317,15 @@ def test_one_unreadable_marker_aborts_reconcile_with_zero_mutation(tmp_path, mon
 
 
 @pytest.mark.parametrize("invalid_first", [True, False])
-def test_malformed_marker_sorting_around_an_unreadable_one_is_not_renamed(tmp_path, monkeypatch, invalid_first):
+def test_malformed_marker_sorting_around_an_unreadable_one_is_not_renamed(tmp_path, fault_mp, invalid_first):
     base = three_published_segments(tmp_path)
     node = Node(base)
     a, b, _ = node.segs()
     invalid, unreadable = (a, b) if invalid_first else (b, a)
     marker_path(invalid).write_bytes(MALFORMED)
     fs_before, idx_before = fs_state(base), index_state(base)
-    muts = Mutations(monkeypatch).install()
-    inject_marker_read_error(monkeypatch, only(marker_path(unreadable)), errno_exc(errno.EIO))
+    muts = Mutations(fault_mp).install()
+    inject_marker_read_error(fault_mp, only(marker_path(unreadable)), errno_exc(errno.EIO))
 
     with pytest.raises(DedupStateError):
         node.reconcile()
@@ -343,12 +354,12 @@ def _kitchen_sink(tmp_path):
     return base, (s0, s1, s2), dangling
 
 
-def test_mixed_multi_segment_set_changes_nothing_until_every_marker_is_known(tmp_path, monkeypatch):
+def test_mixed_multi_segment_set_changes_nothing_until_every_marker_is_known(tmp_path, fault_mp):
     base, (s0, s1, s2), dangling = _kitchen_sink(tmp_path)
     node = Node(base)
     fs_before, idx_before = fs_state(base), index_state(base)
-    muts = Mutations(monkeypatch).install()
-    hits = inject_marker_read_error(monkeypatch, only(marker_path(s1)), errno_exc(errno.EIO))
+    muts = Mutations(fault_mp).install()
+    hits = inject_marker_read_error(fault_mp, only(marker_path(s1)), errno_exc(errno.EIO))
 
     with pytest.raises(DedupStateError):
         node.reconcile()
@@ -358,7 +369,7 @@ def test_mixed_multi_segment_set_changes_nothing_until_every_marker_is_known(tmp
     assert index_state(base) == idx_before, "the diverged index was NOT rebuilt because of the uncertainty"
     assert marker_path(s0).read_bytes() == MALFORMED and not marker_path(s2).exists() and dangling.exists()
     node.stop()
-    monkeypatch.undo()
+    fault_mp.undo()
 
     # The uncertainty was transient: with the fault gone the SAME directory recovers, and the genuine
     # evidence handling (preserve malformed, orphan dangling, confirm unmarked, rebuild) is intact.
@@ -374,7 +385,7 @@ def test_mixed_multi_segment_set_changes_nothing_until_every_marker_is_known(tmp
     node.stop()
 
 
-def test_transient_error_no_longer_rewrites_a_healthy_marker(tmp_path, monkeypatch):
+def test_transient_error_no_longer_rewrites_a_healthy_marker(tmp_path, fault_mp):
     """The original defect: ONE transient EIO used to rename a healthy marker and write a replacement
     (``confirmed_by`` writer -> startup_refsync) while reconcile returned normally."""
     base = three_published_segments(tmp_path)
@@ -382,7 +393,7 @@ def test_transient_error_no_longer_rewrites_a_healthy_marker(tmp_path, monkeypat
     victim = node.segs()[1]
     original = marker_path(victim).read_bytes()
     assert json.loads(original)["publication"]["confirmed_by"] == "writer"
-    inject_marker_read_error(monkeypatch, only(marker_path(victim)), errno_exc(errno.EIO), nth={1})
+    inject_marker_read_error(fault_mp, only(marker_path(victim)), errno_exc(errno.EIO), nth={1})
 
     with pytest.raises(DedupStateError):
         node.reconcile()
@@ -422,14 +433,14 @@ def test_genuinely_missing_marker_is_still_confirmed_by_refsync(tmp_path):
 
 # ----- a marker that is readable at the gate but not when re-read later in the same reconciliation
 
-def test_audit_reread_of_a_marker_fails_closed_before_any_rebuild(tmp_path, monkeypatch):
+def test_audit_reread_of_a_marker_fails_closed_before_any_rebuild(tmp_path, fault_mp):
     base = three_published_segments(tmp_path)
     tamper_index(base, "DELETE FROM seen WHERE identity_key = (SELECT identity_key FROM seen ORDER BY 1 LIMIT 1)")
     node = Node(base)
     victim = node.segs()[1]
     fs_before, idx_before = fs_state(base), index_state(base)
-    muts = Mutations(monkeypatch).install()
-    hits = inject_marker_read_error(monkeypatch, only(marker_path(victim)), errno_exc(errno.EIO), nth={2})
+    muts = Mutations(fault_mp).install()
+    hits = inject_marker_read_error(fault_mp, only(marker_path(victim)), errno_exc(errno.EIO), nth={2})
 
     with pytest.raises(DedupStateError, match="no longer valid"):
         node.reconcile()
@@ -440,15 +451,15 @@ def test_audit_reread_of_a_marker_fails_closed_before_any_rebuild(tmp_path, monk
     node.stop()
 
 
-def test_late_reread_fault_never_touches_a_marker_and_the_next_start_completes(tmp_path, monkeypatch):
+def test_late_reread_fault_never_touches_a_marker_and_the_next_start_completes(tmp_path, fault_mp):
     base = three_published_segments(tmp_path)
     tamper_index(base, "DELETE FROM reconciled_segments")
     tamper_index(base, "DELETE FROM seen")
     node = Node(base)
     victim = node.segs()[1]
     markers_before = {p.name: marker_path(p).read_bytes() for p in node.segs()}
-    muts = Mutations(monkeypatch).install()
-    hits = inject_marker_read_error(monkeypatch, only(marker_path(victim)), errno_exc(errno.EIO), nth={3})
+    muts = Mutations(fault_mp).install()
+    hits = inject_marker_read_error(fault_mp, only(marker_path(victim)), errno_exc(errno.EIO), nth={3})
 
     with pytest.raises(DedupStateError, match="unknown_io"):
         node.reconcile()
@@ -472,13 +483,13 @@ def test_late_reread_fault_never_touches_a_marker_and_the_next_start_completes(t
 
 # ===================================================================== 8: retroactive confirmation
 
-def test_confirm_unmarked_refuses_unreadable_marker_before_any_write(tmp_path, monkeypatch):
+def test_confirm_unmarked_refuses_unreadable_marker_before_any_write(tmp_path, fault_mp):
     base = three_published_segments(tmp_path)
     node = Node(base)
     s0, s1, _ = node.segs()
     marker_path(s0).unlink()                                         # genuinely absent -> promotable
     fs_before = fs_state(base)
-    muts = Mutations(monkeypatch).install()
+    muts = Mutations(fault_mp).install()
     unmarked = [UnmarkedSegment(s0, read_marker(s0)),
                 UnmarkedSegment(s1, MarkerResult(MarkerStatus.UNKNOWN_IO, reason="unreadable: EIO"))]
 
@@ -492,14 +503,14 @@ def test_confirm_unmarked_refuses_unreadable_marker_before_any_write(tmp_path, m
 
 # ===================================================================== 9: publication hook
 
-def test_publication_hook_fails_closed_when_the_marker_cannot_be_inspected(tmp_path, monkeypatch):
+def test_publication_hook_fails_closed_when_the_marker_cannot_be_inspected(tmp_path, fault_mp):
     node = Node(tmp_path, segment_rows=5000)
     node.reconcile()
     node.offer("A")
     pending_before = node.co.ram_identity_count
     assert pending_before > 0
     idx_before = index_state(tmp_path)
-    inject_marker_read_error(monkeypatch, lambda s: True, errno_exc(errno.EIO))
+    inject_marker_read_error(fault_mp, lambda s: True, errno_exc(errno.EIO))
 
     node.writer.publish_open_segment()
 
@@ -515,7 +526,7 @@ def test_publication_hook_fails_closed_when_the_marker_cannot_be_inspected(tmp_p
         node.writer.write(row("B"))                                  # the writer refuses further rows
     original = raw_bytes(marker_path(seg))
     node.stop()
-    monkeypatch.undo()
+    fault_mp.undo()
 
     node = Node(tmp_path, segment_rows=5000)
     node.reconcile()                                                 # restart indexes the intact segment
@@ -526,14 +537,14 @@ def test_publication_hook_fails_closed_when_the_marker_cannot_be_inspected(tmp_p
 
 
 @pytest.mark.parametrize("code", [errno.EIO, errno.EACCES])
-def test_hook_called_directly_raises_and_commits_nothing(tmp_path, monkeypatch, code):
+def test_hook_called_directly_raises_and_commits_nothing(tmp_path, fault_mp, code):
     node = Node(tmp_path, segment_rows=5000)
     node.reconcile()
     node.writer.write(row("A"))
     node.writer.publish_open_segment()
     seg = node.segs()[0]
     idx_before, fs_before = index_state(tmp_path), fs_state(tmp_path)
-    inject_marker_read_error(monkeypatch, only(marker_path(seg)), errno_exc(code))
+    inject_marker_read_error(fault_mp, only(marker_path(seg)), errno_exc(code))
     with pytest.raises(DedupStateError, match="unknown_io"):
         node.co.on_segment_published((STREAM, 0), seg)
     assert index_state(tmp_path) == idx_before and fs_state(tmp_path) == fs_before
