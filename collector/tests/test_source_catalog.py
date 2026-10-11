@@ -604,3 +604,247 @@ def test_real_writer_output_is_classified_correctly(tmp_path):
     assert ign["raw/example/.writer.lock"] is IgnoredCategory.LOCK_FILE
     assert ign[rec.relative_path + ".meta.json"] is IgnoredCategory.MARKER_FILE
     assert set(ign.values()) <= {IgnoredCategory.LOCK_FILE, IgnoredCategory.MARKER_FILE}
+
+
+# ---------------------------------------------------------------- per-entry metadata failure (Part 2B)
+#
+# ``is_symlink()`` / ``is_dir()`` / ``is_file()`` can each raise OSError. When that happens the
+# file type is NOT established, so a source-like name must stay in the inventory as UNKNOWN
+# (never UNCONFIRMED / LEGACY / INVALID-as-symlink) and must never be dropped.
+
+_META_OPS = ("is_symlink", "is_dir", "is_file")
+_META_FAILED = "ENTRY_METADATA_FAILED"
+_SEG_B = "2026-10-11-13-000000.seg"
+_PROVEN_STATES = {
+    TrustState.CONFIRMED, TrustState.CONFIRMED_RETROACTIVE, TrustState.UNCONFIRMED,
+    TrustState.LEGACY, TrustState.CORRUPT,
+}
+
+
+class _MetaFailsEntry:
+    """Delegates to a real DirEntry, but makes chosen type probes raise OSError for chosen
+    names and records every probe so tests can prove what was (not) called."""
+
+    def __init__(self, entry, failing, calls):
+        self._entry, self._failing, self._calls = entry, failing, calls
+        self.name = entry.name
+
+    def _probe(self, op, follow_symlinks):
+        self._calls.append((self.name, op, follow_symlinks))
+        if op in self._failing.get(self.name, ()):
+            raise OSError(5, f"simulated {op} failure")
+
+    def is_symlink(self):
+        self._probe("is_symlink", None)
+        return self._entry.is_symlink()
+
+    def is_dir(self, *, follow_symlinks=True):
+        self._probe("is_dir", follow_symlinks)
+        return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+    def is_file(self, *, follow_symlinks=True):
+        self._probe("is_file", follow_symlinks)
+        return self._entry.is_file(follow_symlinks=follow_symlinks)
+
+    def stat(self, *, follow_symlinks=True):
+        self._probe("stat", follow_symlinks)
+        return self._entry.stat(follow_symlinks=follow_symlinks)
+
+
+def _fail_ops(monkeypatch, failing):
+    """``failing``: {entry name: {probe names that raise}}. Returns the live probe-call log."""
+    real = os.scandir
+    frozen = {name: frozenset(ops) for name, ops in failing.items()}
+    calls: list = []
+
+    class _Scan:
+        def __init__(self, it):
+            self._it = it
+
+        def __enter__(self):
+            return iter([_MetaFailsEntry(e, frozen, calls) for e in self._it])
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+    monkeypatch.setattr(sc.os, "scandir", lambda path: _Scan(real(path)))
+    return calls
+
+
+def _meta_warnings(result):
+    return [w for w in result.warnings if w.code == _META_FAILED]
+
+
+def _probes(calls, name):
+    return [op for (n, op, _follow) in calls if n == name]
+
+
+@pytest.mark.parametrize("op", _META_OPS)
+def test_type_probe_failure_on_segment_keeps_an_unknown_record(tmp_path, monkeypatch, op):
+    d = _raw(tmp_path, "bybit_trades")
+    _touch(d / SEG, b"payload")
+    _touch(d / _SEG_B, b"neighbour")
+    calls = _fail_ops(monkeypatch, {SEG: {op}})
+    result = discover_sources(tmp_path)
+    by_name = _by_name(result)
+
+    assert len(result.records) == 2, "the uncertain candidate must not be dropped"
+    rec = by_name[SEG]
+    assert rec.relative_path == "raw/bybit_trades/" + SEG
+    assert rec.trust_state is TrustState.UNKNOWN
+    assert rec.reasons == (_META_FAILED,) and rec.warnings == (_META_FAILED,)
+    assert rec.size_bytes is None
+    # filename-derived identity and name-level evidence survive
+    assert (rec.venue, rec.identity_status) == ("BYBIT", IdentityStatus.NAME_PREFIX_REGISTERED)
+    assert (rec.date, rec.hour, rec.sequence, rec.kind) == ("2026-10-11", 12, 3, SegmentKind.SEGMENT)
+    assert rec.file_format == "seg" and rec.marker_file_present is False
+    assert rec.collision_group is None and rec.legacy_kind is None
+    # no false confirmation and no false type claim
+    assert rec.trust_state not in _PROVEN_STATES and rec.trust_state is not TrustState.INVALID
+    assert "SYMLINK_NOT_FOLLOWED" not in rec.reasons and "NOT_A_REGULAR_FILE" not in rec.reasons
+    assert not any(w.code == "SYMLINK_NOT_FOLLOWED" for w in result.warnings)
+    assert "NO_MARKER_FILE" not in rec.reasons
+    # not silently re-filed as an ignored entry; the failure is visible with its cause
+    assert rec.relative_path not in _ignored(result)
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == rec.relative_path and op in warning.detail
+    # the probe sequence stops at the failing call; nothing else was attempted on the entry
+    assert _probes(calls, SEG)[-1] == op and "stat" not in _probes(calls, SEG)
+    # a healthy neighbour is classified exactly as before
+    healthy = by_name[_SEG_B]
+    assert healthy.trust_state is TrustState.UNCONFIRMED and healthy.size_bytes == len(b"neighbour")
+
+
+@pytest.mark.parametrize("op", _META_OPS)
+def test_type_probe_failure_on_legacy_parquet_is_unknown_but_stays_identified_as_legacy(tmp_path, monkeypatch, op):
+    _touch(_raw(tmp_path, "okx_trades") / LEGACY)
+    _fail_ops(monkeypatch, {LEGACY: {op}})
+    result = discover_sources(tmp_path)
+    (rec,) = result.records
+    assert rec.trust_state is TrustState.UNKNOWN
+    assert rec.reasons == (_META_FAILED,) and rec.warnings == (_META_FAILED,)
+    assert "LEGACY_HOURLY_PARQUET" not in rec.reasons
+    assert rec.legacy_kind == "hourly_parquet"                    # filename identity survives
+    assert rec.kind is SegmentKind.LEGACY_HOURLY and rec.sequence is None and rec.file_format == "parquet"
+    assert (rec.date, rec.hour) == ("2026-10-11", 12)
+    assert (rec.venue, rec.identity_status) == ("OKX", IdentityStatus.NAME_PREFIX_REGISTERED)
+    assert rec.size_bytes is None
+    assert len(_meta_warnings(result)) == 1
+
+
+@pytest.mark.parametrize("op", _META_OPS)
+@pytest.mark.parametrize("bad", ["2026-13-45-12-000001.seg", "2026-10-11-24.parquet"])
+def test_metadata_failure_on_impossible_date_hour_keeps_structural_invalidity(tmp_path, monkeypatch, op, bad):
+    _touch(_raw(tmp_path, "trades") / bad)
+    _fail_ops(monkeypatch, {bad: {op}})
+    result = discover_sources(tmp_path)
+    (rec,) = result.records
+    assert rec.trust_state is TrustState.INVALID
+    assert rec.reasons == ("INVALID_DATE_OR_HOUR_IN_NAME", _META_FAILED)
+    assert rec.warnings == (_META_FAILED,)
+    assert (rec.date, rec.hour, rec.sequence, rec.kind, rec.legacy_kind) == (None, None, None, None, None)
+    assert rec.size_bytes is None
+    assert "SYMLINK_NOT_FOLLOWED" not in rec.reasons and "NOT_A_REGULAR_FILE" not in rec.reasons
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == "raw/trades/" + bad and op in warning.detail
+
+
+@pytest.mark.parametrize("op", _META_OPS)
+@pytest.mark.parametrize("failing_side", ["legacy", "segment"])
+def test_metadata_failure_in_a_possible_collision_stays_ambiguous_and_is_not_resolved(
+        tmp_path, monkeypatch, op, failing_side):
+    d = _raw(tmp_path, "trades")
+    seg = "2026-10-11-12-000000.seg"
+    _touch(d / LEGACY, b"L")
+    _touch(d / seg, b"S")
+    failing_name, healthy_name = (LEGACY, seg) if failing_side == "legacy" else (seg, LEGACY)
+    _fail_ops(monkeypatch, {failing_name: {op}})
+    result = discover_sources(tmp_path)
+    by_name = _by_name(result)
+    failed, healthy = by_name[failing_name], by_name[healthy_name]
+
+    assert len(result.records) == 2, "neither collision member may be dropped"
+    # the collision is never resolved in favour of the verifiable member, and nothing is "valid"
+    assert {r.trust_state for r in result.records} == {TrustState.AMBIGUOUS}
+    assert not ({r.trust_state for r in result.records} & _PROVEN_STATES)
+    assert failed.reasons == ("LEGACY_SEGMENT_COLLISION", _META_FAILED)
+    assert failed.warnings == ("COLLISION", _META_FAILED)
+    assert failed.size_bytes is None and healthy.size_bytes == 1
+    assert healthy.reasons == ("LEGACY_SEGMENT_COLLISION",) and healthy.warnings == ("COLLISION",)
+    assert failed.collision_group == healthy.collision_group == "raw/trades/2026-10-11-12"
+    if failing_side == "legacy":
+        assert failed.legacy_kind == "hourly_parquet"
+    collisions = [w for w in result.warnings if w.code == "COLLISION"]
+    assert len(collisions) == 1 and LEGACY in collisions[0].detail and seg in collisions[0].detail
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == failed.relative_path and op in warning.detail
+
+
+@pytest.mark.parametrize("op", _META_OPS)
+@pytest.mark.parametrize("name", [
+    "notes.txt",
+    ".writer.lock",
+    "2026-10-11-12-000004.seg.tmp",
+    "2026-10-11-12-000005.seg.count.json",
+    SEG + ".meta.json",
+])
+def test_unrelated_names_stay_excluded_but_their_inspection_failure_is_visible(tmp_path, monkeypatch, op, name):
+    d = _raw(tmp_path, "trades")
+    _touch(d / name)
+    _touch(d / _SEG_B)
+    _fail_ops(monkeypatch, {name: {op}})
+    result = discover_sources(tmp_path)
+
+    assert _paths(result) == ["raw/trades/" + _SEG_B], "a non-source name must not become a record"
+    rel = "raw/trades/" + name
+    # unverified type: only the generic bucket, never a category that implies a verified file kind
+    assert _ignored(result)[rel] is IgnoredCategory.UNRELATED
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == rel and op in warning.detail
+    # and nothing else is claimed about it (no TEMP_RESIDUE / ORPHAN_MARKER / SYMLINK warnings)
+    assert {w.code for w in result.warnings} == {_META_FAILED}
+
+
+def test_uncertain_entries_are_never_opened_hashed_followed_or_modified(tmp_path, monkeypatch):
+    import io
+    d = _raw(tmp_path, "trades")
+    outside = _touch(tmp_path / "outside.bin", b"outside-secret")
+    (d / SEG).symlink_to(outside)                  # uncertain entry that really IS a symlink
+    legacy = "2026-10-11-14.parquet"               # different hour from SEG: no collision here
+    _touch(d / legacy, b"legacy-bytes")            # uncertain entry that really is a regular file
+    before = _snapshot(tmp_path)
+    guarded = (SEG, legacy, "outside.bin")
+    calls = _fail_ops(monkeypatch, {SEG: {"is_symlink"}, legacy: {"is_file"}})
+
+    def refuse(label):
+        def _raise(*a, **k):
+            raise AssertionError(f"forbidden operation on an uncertain entry: {label}")
+        return _raise
+
+    def guard(label, real):
+        def _wrapped(path, *a, **k):
+            if os.fspath(path).endswith(guarded):
+                raise AssertionError(f"forbidden operation on an uncertain entry: {label}({path!r})")
+            return real(path, *a, **k)
+        return _wrapped
+
+    monkeypatch.setattr(builtins, "open", refuse("builtins.open"))
+    monkeypatch.setattr(io, "open", refuse("io.open"))
+    monkeypatch.setattr(os, "open", refuse("os.open"))
+    monkeypatch.setattr(os, "readlink", refuse("os.readlink"))
+    monkeypatch.setattr(os, "stat", guard("os.stat", os.stat))
+    monkeypatch.setattr(os, "lstat", guard("os.lstat", os.lstat))
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    by_name = _by_name(result)
+    assert set(by_name) == {SEG, legacy}
+    for rec in by_name.values():
+        assert rec.trust_state is TrustState.UNKNOWN and rec.reasons == (_META_FAILED,)
+        assert rec.size_bytes is None
+    # the real symlink is neither claimed as a symlink nor followed
+    assert not any(w.code == "SYMLINK_NOT_FOLLOWED" for w in result.warnings)
+    assert all(follow is not True for (_n, _op, follow) in calls), "a probe followed symlinks"
+    assert not any(op == "stat" for (_n, op, _f) in calls), "an uncertain entry was stat()ed"
+    assert _snapshot(tmp_path) == before
+    assert outside.read_bytes() == b"outside-secret" and (d / legacy).read_bytes() == b"legacy-bytes"

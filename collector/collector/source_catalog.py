@@ -17,6 +17,9 @@ What this module deliberately does NOT do
 * It never resolves a legacy-versus-segment collision. Both members are reported
   as ``AMBIGUOUS``; ``storage_layout.iter_segments`` is intentionally not used
   because it raises mid-iteration or silently drops one side.
+* It never claims a file type it could not establish: if ``is_symlink()`` / ``is_dir()`` /
+  ``is_file()`` raises, a source-like name is kept as ``UNKNOWN`` (``ENTRY_METADATA_FAILED``),
+  with its size unknown, and the entry is not stat()ed, opened or followed.
 * It asserts no completeness, instrument identity, unit or timestamp semantics.
 
 Identity is only what repository naming conventions support
@@ -122,7 +125,7 @@ class SourceRecord:
     sequence: Optional[int]
     kind: Optional[SegmentKind]
     file_format: str                      # "seg" | "parquet"
-    size_bytes: Optional[int]             # lstat size at observation; None if lstat failed
+    size_bytes: Optional[int]             # lstat size at observation; None if lstat failed or the type is unverified
     marker_file_present: bool             # name-level only: the marker's content is NOT read
     trust_state: TrustState
     reasons: tuple[str, ...]
@@ -257,6 +260,8 @@ class _Candidate:
     stat_failed: bool
     symlink: bool
     non_regular: bool
+    #: ``is_symlink()`` / ``is_dir()`` / ``is_file()`` raised, so the file type is NOT established.
+    meta_failed: bool = False
 
 
 def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional[int],
@@ -281,16 +286,26 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         name = entry.name
         if not _in_filter(name, date, hour):
             continue
+        parsed = parse_segment_name(name)          # pure name parsing; no filesystem access
+        probe = "is_symlink"
         try:
             is_symlink = entry.is_symlink()
+            probe = "is_dir"
             is_dir = (not is_symlink) and entry.is_dir(follow_symlinks=False)
+            probe = "is_file"
             is_regular = (not is_symlink) and (not is_dir) and entry.is_file(follow_symlinks=False)
         except OSError as exc:
-            warnings.append(DiscoveryWarning("ENTRY_UNREADABLE", f"{rel_dir}/{name}", f"{type(exc).__name__}: {exc}"))
-            ignore(name, IgnoredCategory.UNRELATED)
+            # The file type could not be established, so the entry is never classified as a
+            # symlink, directory, regular file or unrelated *because of* what it is. It is
+            # not stat()ed, opened, hashed or followed either: nothing more is attempted.
+            warnings.append(DiscoveryWarning(
+                "ENTRY_METADATA_FAILED", f"{rel_dir}/{name}", f"{probe}: {type(exc).__name__}: {exc}"))
+            if parsed is not None:
+                # A source-like name stays in the inventory (UNKNOWN), never silently dropped.
+                candidates.append(_Candidate(name, parsed, None, False, False, False, meta_failed=True))
+            else:
+                ignore(name, IgnoredCategory.UNRELATED)   # unverified type: generic bucket only
             continue
-
-        parsed = parse_segment_name(name)
 
         if is_symlink:
             warnings.append(DiscoveryWarning("SYMLINK_NOT_FOLLOWED", f"{rel_dir}/{name}"))
@@ -342,6 +357,9 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
     by_hour: dict[tuple[str, int], list[_Candidate]] = {}
     for cand in candidates:
         c_date, c_hour, _seq, _kind = cand.parsed
+        # Only entries *proven* to be symlinks / non-regular are kept out of a group. A candidate
+        # whose type could not be established (meta_failed) stays in: a name-level collision is
+        # never resolved in favour of the member that happened to be verifiable.
         if not (cand.symlink or cand.non_regular) and _valid_logical_hour(c_date, c_hour):
             by_hour.setdefault((c_date, c_hour), []).append(cand)
     colliding: dict[str, str] = {}           # candidate name -> collision group id
@@ -373,8 +391,9 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             "hourly_parquet" if valid_name and c_kind is SegmentKind.LEGACY_HOURLY else None)
 
         # Precedence: structural INVALID > name-level AMBIGUOUS > inconclusive UNKNOWN
-        # (STAT_FAILED) > LEGACY / UNCONFIRMED / marker-based UNKNOWN. A failed lstat means
-        # the observation is incomplete, so no state that implies a successful one is assigned.
+        # (STAT_FAILED / ENTRY_METADATA_FAILED) > LEGACY / UNCONFIRMED / marker-based UNKNOWN.
+        # A failed lstat or type probe means the observation is incomplete, so no state that
+        # implies a successful one is assigned, and no file type is claimed.
         if cand.symlink:
             state = TrustState.INVALID
             reasons.append("SYMLINK_NOT_FOLLOWED")
@@ -388,7 +407,7 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             state = TrustState.AMBIGUOUS
             reasons.append("LEGACY_SEGMENT_COLLISION")
             rec_warnings.append("COLLISION")
-        elif cand.stat_failed:
+        elif cand.stat_failed or cand.meta_failed:
             state = TrustState.UNKNOWN
         elif c_kind is SegmentKind.LEGACY_HOURLY:
             state = TrustState.LEGACY
@@ -400,6 +419,10 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             state = TrustState.UNKNOWN
             reasons.append("MARKER_PRESENT_CONTENT_NOT_READ")
 
+        if cand.meta_failed:
+            # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
+            rec_warnings.append("ENTRY_METADATA_FAILED")
+            reasons.append("ENTRY_METADATA_FAILED")
         if cand.stat_failed:
             # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
             rec_warnings.append("STAT_FAILED")
