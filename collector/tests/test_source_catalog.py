@@ -14,6 +14,7 @@ from collector.collector import source_catalog as sc
 from collector.collector.source_catalog import (
     IdentityStatus,
     IgnoredCategory,
+    MarkerPresence,
     SourceRootError,
     TrustState,
     discover_sources,
@@ -137,7 +138,9 @@ def test_legacy_and_unmarked_files_carry_explicit_uncertainty_and_nothing_is_con
     unmarked = by_name["2026-10-11-13-000000.seg"]
     assert unmarked.trust_state is TrustState.UNCONFIRMED and unmarked.reasons == ("NO_MARKER_FILE",)
     marked = by_name["2026-10-11-14-000000.seg"]
-    assert marked.trust_state is TrustState.UNKNOWN and marked.marker_file_present is True
+    assert marked.trust_state is TrustState.UNKNOWN and marked.marker_presence is MarkerPresence.REGULAR_FILE
+    assert legacy.marker_presence is MarkerPresence.NOT_APPLICABLE
+    assert unmarked.marker_presence is MarkerPresence.ABSENT
     assert marked.reasons == ("MARKER_PRESENT_CONTENT_NOT_READ",)
     assert not {r.trust_state for r in by_name.values()} & {
         TrustState.CONFIRMED, TrustState.CONFIRMED_RETROACTIVE, TrustState.CORRUPT}
@@ -270,7 +273,7 @@ def test_symlinks_are_never_followed(tmp_path):
     assert _paths(result) == ["raw/trades/2026-10-11-12-000001.seg"]
     rec = result.records[0]
     assert rec.trust_state is TrustState.INVALID and rec.reasons == ("SYMLINK_NOT_FOLLOWED",)
-    assert rec.size_bytes is None and rec.marker_file_present is False
+    assert rec.size_bytes is None and rec.marker_presence is MarkerPresence.ABSENT
     ign = _ignored(result)
     assert ign["raw/linked_stream"] is IgnoredCategory.SYMLINK
     assert ign["raw/trades/elsewhere"] is IgnoredCategory.SYMLINK
@@ -278,13 +281,15 @@ def test_symlinks_are_never_followed(tmp_path):
     assert sum(w.code == "SYMLINK_NOT_FOLLOWED" for w in result.warnings) >= 3
 
 
-def test_symlinked_marker_does_not_count_as_marker_evidence(tmp_path):
+def test_symlinked_marker_is_neither_marker_evidence_nor_a_confirmed_missing_marker(tmp_path):
     outside = _touch(tmp_path / "outside.json")
     d = _raw(tmp_path / "root", "trades")
     _touch(d / SEG)
     (d / (SEG + ".meta.json")).symlink_to(outside)
     rec = discover_sources(tmp_path / "root").records[0]
-    assert rec.marker_file_present is False and rec.trust_state is TrustState.UNCONFIRMED
+    assert rec.marker_presence is MarkerPresence.NON_REGULAR
+    assert rec.trust_state is TrustState.UNKNOWN and rec.reasons == ("MARKER_NOT_REGULAR",)
+    assert "NO_MARKER_FILE" not in rec.reasons
 
 
 def test_requested_missing_stream_is_a_warning(tmp_path):
@@ -367,7 +372,7 @@ def test_stat_failure_on_unmarked_segment_is_unknown_not_unconfirmed(tmp_path, m
     assert rec.warnings == ("STAT_FAILED",)
     assert rec.size_bytes is None
     # diagnostic and identity evidence is preserved separately
-    assert rec.marker_file_present is False
+    assert rec.marker_presence is MarkerPresence.ABSENT
     assert (rec.venue, rec.identity_status) == ("BYBIT", IdentityStatus.NAME_PREFIX_REGISTERED)
     assert (rec.date, rec.hour, rec.sequence, rec.kind) == ("2026-10-11", 12, 3, SegmentKind.SEGMENT)
     assert rec.relative_path == "raw/bybit_trades/" + SEG
@@ -393,7 +398,7 @@ def test_stat_failure_with_marker_present_keeps_marker_evidence_and_is_unknown(t
     _fail_stat_for(monkeypatch, SEG)
     rec = discover_sources(tmp_path).records[0]
     assert rec.trust_state is TrustState.UNKNOWN and rec.reasons == ("STAT_FAILED",)
-    assert rec.marker_file_present is True
+    assert rec.marker_presence is MarkerPresence.REGULAR_FILE
 
 
 def test_stat_failure_never_yields_confirmed_or_corrupt(tmp_path, monkeypatch):
@@ -598,7 +603,7 @@ def test_real_writer_output_is_classified_correctly(tmp_path):
     assert len(result.records) == 1
     rec = result.records[0]
     assert rec.file_format == "seg" and rec.kind is SegmentKind.SEGMENT and rec.sequence == 0
-    assert rec.marker_file_present is True
+    assert rec.marker_presence is MarkerPresence.REGULAR_FILE
     assert rec.trust_state is TrustState.UNKNOWN
     ign = _ignored(result)
     assert ign["raw/example/.writer.lock"] is IgnoredCategory.LOCK_FILE
@@ -697,7 +702,7 @@ def test_type_probe_failure_on_segment_keeps_an_unknown_record(tmp_path, monkeyp
     # filename-derived identity and name-level evidence survive
     assert (rec.venue, rec.identity_status) == ("BYBIT", IdentityStatus.NAME_PREFIX_REGISTERED)
     assert (rec.date, rec.hour, rec.sequence, rec.kind) == ("2026-10-11", 12, 3, SegmentKind.SEGMENT)
-    assert rec.file_format == "seg" and rec.marker_file_present is False
+    assert rec.file_format == "seg" and rec.marker_presence is MarkerPresence.ABSENT
     assert rec.collision_group is None and rec.legacy_kind is None
     # no false confirmation and no false type claim
     assert rec.trust_state not in _PROVEN_STATES and rec.trust_state is not TrustState.INVALID
@@ -854,8 +859,11 @@ def test_uncertain_entries_are_never_opened_hashed_followed_or_modified(tmp_path
 #
 # 2C-A: a type probe that raises on an entry directly under ``raw/`` must not hide a possible
 #       stream directory (it used to be filed as UNRELATED).
-# 2C-B: ``marker_file_present`` is tri-state; a marker entry whose type probe raised is UNKNOWN
-#       presence, never confirmed absence (it used to become False -> UNCONFIRMED/NO_MARKER_FILE).
+# 2C-B: a marker entry whose type probe raised is UNKNOWN presence, never confirmed absence (it used
+#       to become "absent" -> UNCONFIRMED/NO_MARKER_FILE).
+# 2D:   ``marker_presence`` is a five-state ``MarkerPresence``; only ABSENT is "confirmed missing".
+#       A symlink / directory / other non-regular object at the marker path is NON_REGULAR, and a
+#       legacy hourly Parquet record is NOT_APPLICABLE (see the 2D section at the end of the file).
 
 _ROOT_OPS = ("is_symlink", "is_dir")        # the only probes the root-level loop makes
 _NOT_FOUND = "STREAM_NOT_FOUND"
@@ -1076,8 +1084,8 @@ def test_marker_probe_failure_is_unknown_presence_not_confirmed_absence(tmp_path
     monkeypatch.undo()          # os.walk in _snapshot must see the real scandir
 
     rec = _by_name(result)[SEG]
-    assert rec.marker_file_present is None, "unknown evidence must not be labelled False"
-    assert rec.marker_file_present is not False and rec.marker_file_present is not True
+    assert rec.marker_presence is MarkerPresence.UNKNOWN, "unknown evidence must not be labelled absent"
+    assert rec.marker_presence not in (MarkerPresence.ABSENT, MarkerPresence.REGULAR_FILE)
     assert rec.trust_state is TrustState.UNKNOWN and rec.trust_state is not TrustState.UNCONFIRMED
     assert "NO_MARKER_FILE" not in rec.reasons
     assert rec.reasons == (_MARKER_UNKNOWN,) and rec.warnings == (_MARKER_UNKNOWN,)
@@ -1105,9 +1113,9 @@ def test_marker_presence_distinguishes_present_absent_and_unknown(tmp_path, monk
     _fail_ops(monkeypatch, {unknown + ".meta.json": {"is_file"}})
     by_name = _by_name(discover_sources(tmp_path))
 
-    assert by_name[present].marker_file_present is True
-    assert by_name[absent].marker_file_present is False
-    assert by_name[unknown].marker_file_present is None
+    assert by_name[present].marker_presence is MarkerPresence.REGULAR_FILE
+    assert by_name[absent].marker_presence is MarkerPresence.ABSENT
+    assert by_name[unknown].marker_presence is MarkerPresence.UNKNOWN
     assert (by_name[present].trust_state, by_name[present].reasons) == (
         TrustState.UNKNOWN, ("MARKER_PRESENT_CONTENT_NOT_READ",))
     assert (by_name[absent].trust_state, by_name[absent].reasons) == (
@@ -1135,7 +1143,7 @@ def test_marker_unknown_and_segment_stat_failure_keep_both_diagnostics(tmp_path,
     _fail_ops(monkeypatch, {SEG: {"stat"}, SEG + ".meta.json": {"is_file"}})
     rec = _by_name(discover_sources(tmp_path))[SEG]
     assert rec.trust_state is TrustState.UNKNOWN and rec.size_bytes is None
-    assert rec.marker_file_present is None
+    assert rec.marker_presence is MarkerPresence.UNKNOWN
     assert set(rec.reasons) == {"STAT_FAILED", _MARKER_UNKNOWN}
     assert set(rec.warnings) == {"STAT_FAILED", _MARKER_UNKNOWN}
 
@@ -1152,12 +1160,12 @@ def test_marker_unknown_does_not_override_collision_or_invalid_name(tmp_path, mo
     by_name = _by_name(discover_sources(tmp_path))
 
     seg = by_name[SEG]
-    assert seg.trust_state is TrustState.AMBIGUOUS and seg.marker_file_present is None
+    assert seg.trust_state is TrustState.AMBIGUOUS and seg.marker_presence is MarkerPresence.UNKNOWN
     assert seg.reasons == ("LEGACY_SEGMENT_COLLISION", _MARKER_UNKNOWN)
     assert by_name[LEGACY].trust_state is TrustState.AMBIGUOUS
-    assert by_name[LEGACY].marker_file_present is False             # nothing uncertain about it
+    assert by_name[LEGACY].marker_presence is MarkerPresence.NOT_APPLICABLE   # no marker convention
     invalid = by_name[bad]
-    assert invalid.trust_state is TrustState.INVALID and invalid.marker_file_present is None
+    assert invalid.trust_state is TrustState.INVALID and invalid.marker_presence is MarkerPresence.UNKNOWN
     assert invalid.reasons == ("INVALID_DATE_OR_HOUR_IN_NAME", _MARKER_UNKNOWN)
 
 
@@ -1174,23 +1182,12 @@ def test_unverified_symlink_marker_is_not_followed_read_or_counted(tmp_path, mon
     monkeypatch.undo()
 
     rec = _by_name(result)[SEG]
-    assert rec.marker_file_present is None and rec.trust_state is TrustState.UNKNOWN
+    assert rec.marker_presence is MarkerPresence.UNKNOWN and rec.trust_state is TrustState.UNKNOWN
     assert not any(w.code == "SYMLINK_NOT_FOLLOWED" for w in result.warnings), "type must not be claimed"
+    assert not any(w.code == "MARKER_NOT_REGULAR" for w in result.warnings), "type must not be claimed"
     assert all(follow is not True for (_n, _op, follow) in calls)
     assert not any(op == "stat" and n == marker for (n, op, _f) in calls)
     assert _snapshot(tmp_path) == before and outside.read_bytes() == b"outside-secret"
-
-
-def test_confirmed_marker_evidence_is_unchanged(tmp_path):
-    d = _raw(tmp_path, "trades")
-    outside = _touch(tmp_path / "outside.bin")
-    for seg in ("2026-10-11-10-000000.seg", "2026-10-11-11-000000.seg"):
-        _touch(d / seg)
-    (d / "2026-10-11-10-000000.seg.meta.json").symlink_to(outside)   # confirmed symlink: not evidence
-    (d / "2026-10-11-11-000000.seg.meta.json").mkdir()               # confirmed directory: not a file
-    for rec in discover_sources(tmp_path).records:
-        assert rec.marker_file_present is False
-        assert (rec.trust_state, rec.reasons) == (TrustState.UNCONFIRMED, ("NO_MARKER_FILE",))
 
 
 def test_marker_unknown_results_are_deterministic(tmp_path, monkeypatch):
@@ -1204,4 +1201,463 @@ def test_marker_unknown_results_are_deterministic(tmp_path, monkeypatch):
     assert discover_sources(tmp_path) == first
     _reverse_listing(monkeypatch)
     assert discover_sources(tmp_path) == first
-    assert [r.marker_file_present for r in first.records] == [True, None]
+    assert [r.marker_presence for r in first.records] == [MarkerPresence.REGULAR_FILE, MarkerPresence.UNKNOWN]
+
+
+# ---- 2D: marker-path semantics (MarkerPresence) -------------------------------------------------
+#
+# A marker path can be occupied in five distinguishable ways (see ``MarkerPresence``). Nothing but
+# ABSENT may ever read as "the marker is missing", and no state may read as "published". These tests
+# build every state side by side, then attack the boundaries: precedence, orphans, filtering, symlink
+# following, mutation and determinism. Assertions are on structured fields, never on OS error wording.
+
+_M = MarkerPresence
+_HAS_MKFIFO = hasattr(os, "mkfifo")
+_NON_REGULAR_EXPECTED = (_M.NON_REGULAR, TrustState.UNKNOWN, ("MARKER_NOT_REGULAR",))
+_STATE_EXPECTED = {
+    "absent": (_M.ABSENT, TrustState.UNCONFIRMED, ("NO_MARKER_FILE",)),
+    "regular": (_M.REGULAR_FILE, TrustState.UNKNOWN, ("MARKER_PRESENT_CONTENT_NOT_READ",)),
+    "symlink": _NON_REGULAR_EXPECTED,
+    "dangling": _NON_REGULAR_EXPECTED,
+    "directory": _NON_REGULAR_EXPECTED,
+    "fifo": _NON_REGULAR_EXPECTED,
+    "unknown": (_M.UNKNOWN, TrustState.UNKNOWN, (_MARKER_UNKNOWN,)),
+    "legacy": (_M.NOT_APPLICABLE, TrustState.LEGACY, ("LEGACY_HOURLY_PARQUET",)),
+}
+
+
+def _seg(hour: int, seq: int = 0) -> str:
+    return f"2026-10-11-{hour:02d}-{seq:06d}.seg"
+
+
+def _marker_world(tmp_path):
+    """One stream holding a source file for every way a marker path can be occupied.
+
+    Returns ``{label: file name}`` (a segment for every label but ``legacy``). The ``unknown``
+    segment has an ordinary regular marker; the test makes that marker's type probe fail."""
+    d = _raw(tmp_path, "trades")
+    outside = _touch(tmp_path / "outside.bin", b"outside-secret")
+    names = {"absent": _seg(10), "regular": _seg(11), "symlink": _seg(12), "dangling": _seg(13),
+             "directory": _seg(14), "unknown": _seg(15), "legacy": "2026-10-11-16.parquet"}
+    if _HAS_MKFIFO:
+        names["fifo"] = _seg(17)
+    for name in names.values():
+        _touch(d / name, b"payload")
+    _touch(d / (names["regular"] + ".meta.json"), b"\xff not json \x00")
+    (d / (names["symlink"] + ".meta.json")).symlink_to(outside)
+    (d / (names["dangling"] + ".meta.json")).symlink_to(tmp_path / "does-not-exist")
+    (d / (names["directory"] + ".meta.json")).mkdir()
+    _touch(d / (names["directory"] + ".meta.json") / "inner.txt", b"inner")
+    _touch(d / (names["unknown"] + ".meta.json"), b"{}")
+    if _HAS_MKFIFO:
+        os.mkfifo(d / (names["fifo"] + ".meta.json"))
+    return names
+
+
+def _forbid_mutation(monkeypatch):
+    """Any attempt to create, rename, delete, relink or re-permission something fails the test."""
+    def refuse(label):
+        def _raise(*a, **k):
+            raise AssertionError(f"forbidden filesystem mutation: {label}")
+        return _raise
+
+    for fn in ("rename", "replace", "remove", "unlink", "rmdir", "mkdir", "makedirs", "symlink",
+               "link", "chmod", "utime", "truncate"):
+        monkeypatch.setattr(os, fn, refuse(f"os.{fn}"))
+    for fn in ("rmtree", "move", "copy", "copyfile"):
+        monkeypatch.setattr(shutil, fn, refuse(f"shutil.{fn}"))
+
+
+def test_marker_presence_enum_has_exactly_the_documented_states_and_the_ambiguous_bool_is_gone():
+    assert {m.name for m in MarkerPresence} == {
+        "ABSENT", "REGULAR_FILE", "NON_REGULAR", "UNKNOWN", "NOT_APPLICABLE"}
+    assert "marker_presence" in sc.SourceRecord.__dataclass_fields__
+    assert "marker_file_present" not in sc.SourceRecord.__dataclass_fields__
+
+
+# -- 1, 6: every state is distinguishable; only ABSENT means "missing" ------------------------
+
+def test_every_marker_path_state_is_distinct_and_only_absent_means_missing(tmp_path, monkeypatch):
+    names = _marker_world(tmp_path)
+    _fail_ops(monkeypatch, {names["unknown"] + ".meta.json": {"is_file"}})   # probe error -> UNKNOWN
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+    by_name = _by_name(result)
+
+    for label, name in names.items():
+        rec = by_name[name]
+        assert (rec.marker_presence, rec.trust_state, rec.reasons) == _STATE_EXPECTED[label], label
+    assert {r.marker_presence for r in result.records} == set(MarkerPresence), "all five exercised"
+    assert len(result.records) == len(names), "no source file is dropped because of its marker path"
+    # "confirmed missing" is a conclusion reachable from exactly one state
+    missing = [Path(r.relative_path).name for r in result.records if "NO_MARKER_FILE" in r.reasons]
+    assert missing == [names["absent"]]
+    assert [r.trust_state for r in result.records if r.marker_presence is _M.ABSENT] == [TrustState.UNCONFIRMED]
+    assert not {r.trust_state for r in result.records} & {
+        TrustState.CONFIRMED, TrustState.CONFIRMED_RETROACTIVE, TrustState.CORRUPT}
+
+
+def test_marker_entries_are_filed_under_their_true_category_never_as_markers(tmp_path, monkeypatch):
+    names = _marker_world(tmp_path)
+    _fail_ops(monkeypatch, {names["unknown"] + ".meta.json": {"is_file"}})
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+    ign, base = _ignored(result), "raw/trades/"
+
+    assert ign[base + names["regular"] + ".meta.json"] is IgnoredCategory.MARKER_FILE
+    assert ign[base + names["symlink"] + ".meta.json"] is IgnoredCategory.SYMLINK
+    assert ign[base + names["dangling"] + ".meta.json"] is IgnoredCategory.SYMLINK
+    assert ign[base + names["directory"] + ".meta.json"] is IgnoredCategory.UNRECOGNIZED_DIRECTORY
+    assert ign[base + names["unknown"] + ".meta.json"] is IgnoredCategory.UNRELATED      # type unverified
+    if _HAS_MKFIFO:
+        assert ign[base + names["fifo"] + ".meta.json"] is IgnoredCategory.NON_REGULAR
+    assert not any(c is IgnoredCategory.MARKER_ORPHAN for c in ign.values())
+    assert not any(w.code == "ORPHAN_MARKER" for w in result.warnings)
+
+    flagged = [w for w in result.warnings if w.code == "MARKER_NOT_REGULAR"]
+    assert sorted(w.relative_path for w in flagged) == sorted(
+        base + names[k] + ".meta.json" for k in ("symlink", "dangling", "directory", "fifo") if k in names)
+    # diagnostics are fixed text: no OS exception message and no absolute path can leak through them
+    assert all(str(tmp_path) not in w.detail and w.detail for w in flagged)
+    # the unverifiable marker is reported as a failed probe, not as a (non-)regular file
+    assert [w.relative_path for w in _meta_warnings(result)] == [base + names["unknown"] + ".meta.json"]
+
+
+# -- 2: a regular marker is not publication evidence ------------------------------------------
+
+@pytest.mark.parametrize("content", [b"", b"{not json", b'{"sha256": "00", "rows": 1}', b"\xff\x00" * 64])
+def test_regular_marker_stays_unverified_whatever_it_contains(tmp_path, monkeypatch, content):
+    d = _raw(tmp_path, "trades")
+    marker = SEG + ".meta.json"
+    _touch(d / SEG, b"payload")
+    _touch(d / marker, content)
+    before = _snapshot(tmp_path)
+    _forbid_io(monkeypatch, [marker])                 # opening / stat()ing the marker would fail here
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    rec = _by_name(result)[SEG]
+    assert rec.marker_presence is _M.REGULAR_FILE
+    assert (rec.trust_state, rec.reasons) == (TrustState.UNKNOWN, ("MARKER_PRESENT_CONTENT_NOT_READ",))
+    assert rec.trust_state not in _PROVEN_STATES and rec.warnings == ()
+    assert _ignored(result)["raw/trades/" + marker] is IgnoredCategory.MARKER_FILE
+    assert _snapshot(tmp_path) == before
+
+
+# -- 3, 11: a symlink at the marker path is never followed ------------------------------------
+
+_LINK_TARGETS = {
+    "file": lambda tmp, link: _touch(tmp / "outside" / "target.bin", b"outside-secret"),
+    "directory": lambda tmp, link: _touch(tmp / "outside" / "targetdir" / SEG, b"inside-the-target").parent,
+    "dangling": lambda tmp, link: tmp / "outside" / "missing",
+    "loop": lambda tmp, link: link,                  # a symlink pointing at itself
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_LINK_TARGETS))
+def test_symlink_at_marker_path_is_never_followed_and_is_not_a_missing_marker(tmp_path, monkeypatch, kind):
+    d = _raw(tmp_path, "trades")
+    marker = SEG + ".meta.json"
+    _touch(d / SEG, b"payload")
+    target = _LINK_TARGETS[kind](tmp_path, d / marker)
+    (d / marker).symlink_to(target)
+    before = _snapshot(tmp_path)
+    calls = _fail_ops(monkeypatch, {})                # no failures: only records every probe
+    listed = _log_scandir(monkeypatch)
+    _forbid_io(monkeypatch, [marker, "outside", "target.bin", "targetdir", "missing"])
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    rec = _by_name(result)[SEG]
+    assert rec.marker_presence is _M.NON_REGULAR
+    assert (rec.trust_state, rec.reasons) == (TrustState.UNKNOWN, ("MARKER_NOT_REGULAR",))
+    assert rec.warnings == ("MARKER_NOT_REGULAR",)
+    assert rec.trust_state is not TrustState.UNCONFIRMED and "NO_MARKER_FILE" not in rec.reasons
+    rel = "raw/trades/" + marker
+    assert _ignored(result)[rel] is IgnoredCategory.SYMLINK
+    codes = {w.code: w for w in result.warnings if w.relative_path == rel}
+    assert set(codes) == {"SYMLINK_NOT_FOLLOWED", "MARKER_NOT_REGULAR"}
+    assert "symlink" in codes["MARKER_NOT_REGULAR"].detail
+    assert not any(w.code == "ORPHAN_MARKER" for w in result.warnings)
+    assert _paths(result) == ["raw/trades/" + SEG], "the link target's contents are not inventory"
+    # never followed: the target is not listed, no probe asked to follow, nothing stat()ed
+    assert not any("outside" in p for p in listed)
+    assert all(follow is not True for (_n, _op, follow) in calls)
+    assert not any(op == "stat" for (n, op, _f) in calls if n == marker)
+    assert _snapshot(tmp_path) == before
+    if kind == "file":
+        assert target.read_bytes() == b"outside-secret"
+
+
+# -- 4: a directory at the marker path ---------------------------------------------------------
+
+@pytest.mark.parametrize("populated", [False, True])
+def test_directory_at_marker_path_is_not_a_marker_and_not_a_missing_marker(tmp_path, monkeypatch, populated):
+    d = _raw(tmp_path, "trades")
+    marker = SEG + ".meta.json"
+    _touch(d / SEG, b"payload")
+    (d / marker).mkdir()
+    if populated:
+        _touch(d / marker / "inner.txt", b"inner")
+        _touch(d / marker / (SEG + ".meta.json"), b"{}")             # a nested "marker" must not count
+        _touch(d / marker / "2026-10-11-13-000000.seg", b"nested")   # nor a nested source file
+    before = _snapshot(tmp_path)
+    listed = _log_scandir(monkeypatch)
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    rec = _by_name(result)[SEG]
+    assert rec.marker_presence is _M.NON_REGULAR
+    assert (rec.trust_state, rec.reasons) == (TrustState.UNKNOWN, ("MARKER_NOT_REGULAR",))
+    assert rec.trust_state is not TrustState.UNCONFIRMED
+    rel = "raw/trades/" + marker
+    assert _ignored(result)[rel] is IgnoredCategory.UNRECOGNIZED_DIRECTORY
+    (warning,) = [w for w in result.warnings if w.code == "MARKER_NOT_REGULAR"]
+    assert warning.relative_path == rel and "directory" in warning.detail
+    assert not any(p.endswith(marker) for p in listed), "descended into the directory at the marker path"
+    assert _paths(result) == ["raw/trades/" + SEG]
+    assert not any("inner.txt" in i.relative_path or "nested" in i.relative_path for i in result.ignored)
+    assert _snapshot(tmp_path) == before
+
+
+# -- 5: other non-regular objects, where the platform supports them ---------------------------
+
+@pytest.mark.skipif(not _HAS_MKFIFO, reason="os.mkfifo is not available on this platform")
+def test_fifo_at_marker_path_is_classified_without_ever_being_opened(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    marker = SEG + ".meta.json"
+    _touch(d / SEG, b"payload")
+    os.mkfifo(d / marker)
+    before = _snapshot(tmp_path)
+    _forbid_io(monkeypatch, [marker])      # opening a FIFO can block forever; here any open() raises
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    rec = _by_name(result)[SEG]
+    assert rec.marker_presence is _M.NON_REGULAR
+    assert (rec.trust_state, rec.reasons) == (TrustState.UNKNOWN, ("MARKER_NOT_REGULAR",))
+    rel = "raw/trades/" + marker
+    assert _ignored(result)[rel] is IgnoredCategory.NON_REGULAR
+    (warning,) = [w for w in result.warnings if w.code == "MARKER_NOT_REGULAR"]
+    assert warning.relative_path == rel and "non-regular" in warning.detail
+    assert _snapshot(tmp_path) == before
+
+
+# -- 7: source-file stat() failures keep their uncertainty whatever the marker says ----------
+
+def test_segment_stat_failure_keeps_unknown_uncertainty_for_every_marker_state(tmp_path, monkeypatch):
+    names = _marker_world(tmp_path)
+    _fail_stat_for(monkeypatch, *names.values())
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+    by_name = _by_name(result)
+    expected = {"absent": _M.ABSENT, "regular": _M.REGULAR_FILE, "symlink": _M.NON_REGULAR,
+                "dangling": _M.NON_REGULAR, "directory": _M.NON_REGULAR, "fifo": _M.NON_REGULAR,
+                "unknown": _M.REGULAR_FILE,          # no probe fault injected in this test
+                "legacy": _M.NOT_APPLICABLE}
+
+    for label, name in names.items():
+        rec = by_name[name]
+        extra = ("MARKER_NOT_REGULAR",) if expected[label] is _M.NON_REGULAR else ()
+        assert rec.marker_presence is expected[label], label
+        assert rec.trust_state is TrustState.UNKNOWN and rec.size_bytes is None, label
+        assert rec.reasons == ("STAT_FAILED",) + extra, label
+        assert rec.warnings == tuple(sorted(("STAT_FAILED",) + extra)), label
+    assert not any(r.trust_state is TrustState.UNCONFIRMED for r in result.records)
+    assert by_name[names["legacy"]].legacy_kind == "hourly_parquet"     # identity survives
+
+
+# -- 8: legacy hourly Parquet records marker non-applicability, in every trust state ----------
+
+def _legacy_plain(d, mp):
+    _touch(d / LEGACY)
+    return LEGACY, TrustState.LEGACY
+
+
+def _legacy_with_stray_meta_file(d, mp):
+    _touch(d / LEGACY)
+    _touch(d / (LEGACY + ".meta.json"))                  # not a marker name the writer produces
+    return LEGACY, TrustState.LEGACY
+
+
+def _legacy_invalid_date(d, mp):
+    name = "2026-13-45-12.parquet"
+    _touch(d / name)
+    return name, TrustState.INVALID
+
+
+def _legacy_symlink(d, mp):
+    (d / LEGACY).symlink_to(d.parent.parent / "outside.bin")
+    return LEGACY, TrustState.INVALID
+
+
+def _legacy_collision(d, mp):
+    _touch(d / LEGACY)
+    _touch(d / SEG)                                      # same logical hour
+    return LEGACY, TrustState.AMBIGUOUS
+
+
+def _legacy_stat_failed(d, mp):
+    _touch(d / LEGACY)
+    _fail_stat_for(mp, LEGACY)
+    return LEGACY, TrustState.UNKNOWN
+
+
+def _legacy_probe_failed(d, mp):
+    _touch(d / LEGACY)
+    _fail_ops(mp, {LEGACY: {"is_file"}})
+    return LEGACY, TrustState.UNKNOWN
+
+
+_LEGACY_BUILDERS = {fn.__name__[len("_legacy_"):]: fn for fn in (
+    _legacy_plain, _legacy_with_stray_meta_file, _legacy_invalid_date, _legacy_symlink,
+    _legacy_collision, _legacy_stat_failed, _legacy_probe_failed)}
+
+
+@pytest.mark.parametrize("name", sorted(_LEGACY_BUILDERS))
+def test_legacy_hourly_parquet_never_claims_a_missing_marker(tmp_path, monkeypatch, name):
+    _touch(tmp_path / "outside.bin")
+    d = _raw(tmp_path, "trades")
+    legacy_name, state = _LEGACY_BUILDERS[name](d, monkeypatch)
+    rec = _by_name(discover_sources(tmp_path))[legacy_name]
+    assert rec.marker_presence is _M.NOT_APPLICABLE
+    assert rec.trust_state is state
+    assert "NO_MARKER_FILE" not in rec.reasons
+    assert not any(x.startswith("MARKER_") for x in rec.reasons + rec.warnings)
+
+
+# -- 9: structural precedence survives a marker anomaly ---------------------------------------
+
+def test_marker_anomalies_never_override_collision_invalid_name_or_symlink_precedence(tmp_path):
+    d = _raw(tmp_path, "trades")
+    outside = _touch(tmp_path / "outside.bin")
+    bad, linked = "2026-13-45-12-000001.seg", "2026-10-11-13-000001.seg"
+    _touch(d / LEGACY)
+    _touch(d / SEG)                                                  # same logical hour as LEGACY
+    (d / (SEG + ".meta.json")).mkdir()
+    _touch(d / bad)
+    (d / (bad + ".meta.json")).symlink_to(outside)
+    (d / linked).symlink_to(outside)
+    (d / (linked + ".meta.json")).mkdir()
+    result = discover_sources(tmp_path)
+    by_name = _by_name(result)
+
+    seg = by_name[SEG]
+    assert (seg.trust_state, seg.reasons) == (TrustState.AMBIGUOUS, ("LEGACY_SEGMENT_COLLISION", "MARKER_NOT_REGULAR"))
+    assert seg.warnings == ("COLLISION", "MARKER_NOT_REGULAR")
+    assert seg.collision_group is not None and seg.collision_group == by_name[LEGACY].collision_group
+    assert (by_name[LEGACY].trust_state, by_name[LEGACY].marker_presence) == (
+        TrustState.AMBIGUOUS, _M.NOT_APPLICABLE)
+    invalid = by_name[bad]
+    assert (invalid.trust_state, invalid.reasons) == (
+        TrustState.INVALID, ("INVALID_DATE_OR_HOUR_IN_NAME", "MARKER_NOT_REGULAR"))
+    symlinked = by_name[linked]
+    assert (symlinked.trust_state, symlinked.reasons) == (
+        TrustState.INVALID, ("SYMLINK_NOT_FOLLOWED", "MARKER_NOT_REGULAR"))
+    assert any(w.code == "COLLISION" for w in result.warnings), "the collision warning is not erased"
+    assert not {r.trust_state for r in result.records} & _PROVEN_STATES
+
+
+# -- 10: orphans, matching, filtering and exact-path matching ---------------------------------
+
+def test_non_regular_orphan_markers_are_classified_as_what_they_are_not_as_orphan_markers(tmp_path):
+    d = _raw(tmp_path, "trades")
+    outside = _touch(tmp_path / "outside.bin")
+    base = "raw/trades/"
+    _touch(d / _seg(10))
+    _touch(d / (_seg(10) + ".meta.json"))                           # regular marker, segment listed
+    _touch(d / (_seg(11) + ".meta.json"))                           # regular marker, no segment
+    (d / (_seg(12) + ".meta.json")).symlink_to(outside)             # symlink, no segment
+    (d / (_seg(13) + ".meta.json")).mkdir()                         # directory, no segment
+    flagged = [_seg(12), _seg(13)]
+    if _HAS_MKFIFO:
+        os.mkfifo(d / (_seg(14) + ".meta.json"))                    # FIFO, no segment
+        flagged.append(_seg(14))
+    result = discover_sources(tmp_path)
+    ign = _ignored(result)
+
+    assert ign[base + _seg(10) + ".meta.json"] is IgnoredCategory.MARKER_FILE
+    assert ign[base + _seg(11) + ".meta.json"] is IgnoredCategory.MARKER_ORPHAN
+    assert ign[base + _seg(12) + ".meta.json"] is IgnoredCategory.SYMLINK
+    assert ign[base + _seg(13) + ".meta.json"] is IgnoredCategory.UNRECOGNIZED_DIRECTORY
+    if _HAS_MKFIFO:
+        assert ign[base + _seg(14) + ".meta.json"] is IgnoredCategory.NON_REGULAR
+    # only the genuine regular orphan is reported as an orphan marker file
+    assert [w.relative_path for w in result.warnings if w.code == "ORPHAN_MARKER"] == [
+        base + _seg(11) + ".meta.json"]
+    # the others are explained by their own diagnostic even though no segment refers to them
+    assert sorted(w.relative_path for w in result.warnings if w.code == "MARKER_NOT_REGULAR") == [
+        base + n + ".meta.json" for n in flagged]
+    assert _paths(result) == [base + _seg(10)]
+    assert result.records[0].marker_presence is _M.REGULAR_FILE
+
+
+def test_date_hour_filter_applies_to_non_regular_markers_like_any_other_entry(tmp_path):
+    d = _raw(tmp_path, "trades")
+    for hour in (12, 13):
+        _touch(d / _seg(hour))
+        (d / (_seg(hour) + ".meta.json")).mkdir()
+    only_12 = discover_sources(tmp_path, hour=12)
+    assert _paths(only_12) == ["raw/trades/" + _seg(12)]
+    assert [w.relative_path for w in only_12.warnings if w.code == "MARKER_NOT_REGULAR"] == [
+        "raw/trades/" + _seg(12) + ".meta.json"]
+    assert not any(_seg(13) in i.relative_path for i in only_12.ignored)
+    both = discover_sources(tmp_path)
+    assert [r.marker_presence for r in both.records] == [_M.NON_REGULAR, _M.NON_REGULAR]
+    other_day = discover_sources(tmp_path, date="2026-10-12")
+    assert other_day.records == () and not any(w.code == "MARKER_NOT_REGULAR" for w in other_day.warnings)
+
+
+@pytest.mark.parametrize("suffix", [".tmp", ".invalid.0", ".orphan.20261011T000000Z"])
+def test_only_the_exact_marker_path_decides_marker_presence(tmp_path, suffix):
+    d = _raw(tmp_path, "trades")
+    _touch(d / SEG)
+    (d / (SEG + ".meta.json" + suffix)).mkdir()                      # a sidecar name, not the marker path
+    (d / (_seg(13) + ".meta.json")).mkdir()                          # another segment's marker path
+    rec = _by_name(discover_sources(tmp_path))[SEG]
+    assert rec.marker_presence is _M.ABSENT
+    assert (rec.trust_state, rec.reasons, rec.warnings) == (TrustState.UNCONFIRMED, ("NO_MARKER_FILE",), ())
+
+
+# -- 11: no following, no opening, no mutation, across every state at once --------------------
+
+def test_discovery_never_follows_opens_or_modifies_anything_at_a_marker_path(tmp_path, monkeypatch):
+    names = _marker_world(tmp_path)
+    marker_names = [n + ".meta.json" for n in names.values()]
+    before = _snapshot(tmp_path)
+    calls = _fail_ops(monkeypatch, {names["unknown"] + ".meta.json": {"is_file"}})
+    listed = _log_scandir(monkeypatch)
+    _forbid_io(monkeypatch, marker_names + ["outside.bin", "does-not-exist", "inner.txt"])
+    _forbid_mutation(monkeypatch)
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    assert len(result.records) == len(names)
+    assert all(follow is not True for (_n, _op, follow) in calls), "a probe was asked to follow a link"
+    assert not any(op == "stat" and n.endswith(".meta.json") for (n, op, _f) in calls)
+    root = tmp_path.resolve()
+    assert [Path(p).relative_to(root).as_posix() for p in listed] == ["raw", "raw/trades"], \
+        "only the raw/ and stream directories are listed: no marker directory, no link target"
+    assert (tmp_path / "outside.bin").read_bytes() == b"outside-secret"
+    assert _snapshot(tmp_path) == before
+
+
+# -- 12: repeated scans are equivalent and deterministically ordered --------------------------
+
+def test_repeated_scans_of_an_unchanged_tree_are_equivalent_and_deterministically_ordered(tmp_path, monkeypatch):
+    names = _marker_world(tmp_path)
+    _fail_ops(monkeypatch, {names["unknown"] + ".meta.json": {"is_file"}})
+    first = discover_sources(tmp_path)
+    assert discover_sources(tmp_path) == first
+    _reverse_listing(monkeypatch)                      # same tree, opposite directory-listing order
+    assert discover_sources(tmp_path) == first
+
+    paths = _paths(first)
+    assert paths == sorted(paths, key=os.fsencode)
+    assert list(first.warnings) == sorted(
+        first.warnings, key=lambda w: (w.code, os.fsencode(w.relative_path), w.detail))
+    assert list(first.ignored) == sorted(
+        first.ignored, key=lambda i: (os.fsencode(i.relative_path), i.category.value))
+    assert [r.marker_presence for r in first.records] == [
+        _M.ABSENT, _M.REGULAR_FILE, _M.NON_REGULAR, _M.NON_REGULAR, _M.NON_REGULAR, _M.UNKNOWN,
+        _M.NOT_APPLICABLE] + ([_M.NON_REGULAR] if _HAS_MKFIFO else [])

@@ -24,10 +24,13 @@ What this module deliberately does NOT do
   as ignored/unrelated nor scanned. It is reported as ``ENTRY_METADATA_FAILED`` (and, if it was
   requested by name, as ``STREAM_UNINSPECTABLE`` rather than ``STREAM_NOT_FOUND``) because it
   may be a stream directory.
-* It never turns "could not look" into "is not there": ``marker_file_present`` is ``False`` only
-  when the complete directory listing has no entry of that name (or the entry is confirmed not to
-  be a regular file). If an entry with the marker's name exists but its type probe failed, it is
-  ``None`` (unknown) and the segment is never ``UNCONFIRMED`` / ``NO_MARKER_FILE`` because of it.
+* It never turns "could not look" or "something unusable is there" into "is not there":
+  ``marker_presence`` (:class:`MarkerPresence`) is ``ABSENT`` only when the complete directory
+  listing has no entry at the marker's exact name. An entry that is confirmed not to be a regular
+  file (symlink, directory, FIFO, ...) is ``NON_REGULAR``; an entry whose type probe failed is
+  ``UNKNOWN``. Neither is ever ``UNCONFIRMED`` / ``NO_MARKER_FILE``: only ``ABSENT`` is. A
+  ``REGULAR_FILE`` marker is not publication evidence either (its content is never read). Legacy
+  hourly Parquet files do not use segment markers at all and are ``NOT_APPLICABLE``.
 * It asserts no completeness, instrument identity, unit or timestamp semantics.
 
 Identity is only what repository naming conventions support
@@ -92,6 +95,28 @@ class IdentityStatus(str, Enum):
     SHARED_UNVERIFIED = "SHARED_UNVERIFIED"
 
 
+class MarkerPresence(str, Enum):
+    """What a name-and-``lstat``-level inspection established about a segment's
+    ``<segment>.meta.json`` publication-marker path. The members are not interchangeable:
+    in particular nothing but ``ABSENT`` means "confirmed missing". None of them says anything
+    about the marker's content, which discovery never reads."""
+
+    #: The complete listing of the stream directory was inspected and holds no entry at the
+    #: exact marker path.
+    ABSENT = "ABSENT"
+    #: An entry at the marker path is confirmed to be a regular file. Not validated, not read.
+    REGULAR_FILE = "REGULAR_FILE"
+    #: An entry at the marker path is confirmed to be a symlink (never followed), a directory or
+    #: another non-regular object. It is not a marker and it is not an absent marker.
+    NON_REGULAR = "NON_REGULAR"
+    #: An entry at the marker path exists (it was listed) but its type could not be established
+    #: because a filesystem probe failed.
+    UNKNOWN = "UNKNOWN"
+    #: The source format has no segment marker (legacy hourly ``.parquet``): "no marker" would be
+    #: a misleading description of it.
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
 class IgnoredCategory(str, Enum):
     LOCK_FILE = "LOCK_FILE"
     TEMP_FILE = "TEMP_FILE"
@@ -134,14 +159,9 @@ class SourceRecord:
     kind: Optional[SegmentKind]
     file_format: str                      # "seg" | "parquet"
     size_bytes: Optional[int]             # lstat size at observation; None if lstat failed or the type is unverified
-    #: Name-level only; the marker's content is NOT read. Tri-state, never collapsed to a bool:
-    #: ``True``  - a regular ``<seg>.meta.json`` file was observed;
-    #: ``False`` - confirmed absent (complete listing has no such entry, or the entry is confirmed
-    #:             not to be a regular file, e.g. a symlink);
-    #: ``None``  - UNKNOWN: an entry with the marker's name exists but its type probe failed.
-    #: Callers must test ``is None`` explicitly: ``not rec.marker_file_present`` conflates
-    #: "unknown" with "absent".
-    marker_file_present: Optional[bool]
+    #: Name-level only; the marker's content is NOT read. Five distinct states, deliberately not
+    #: a bool: see :class:`MarkerPresence`. Only ``ABSENT`` means "confirmed missing".
+    marker_presence: MarkerPresence
     trust_state: TrustState
     reasons: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -291,14 +311,29 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         return
 
     candidates: list[_Candidate] = []
-    markers: set[str] = set()              # segment names that have a ``.meta.json`` file
-    #: segment names whose ``.seg.meta.json`` entry EXISTS in the listing but whose type probe
-    #: failed: marker presence is unknown for these, which is not the same as absent.
-    markers_unknown: set[str] = set()
+    #: segment name -> what is established about its ``<seg>.meta.json`` entry, for every entry
+    #: that EXISTS in the listing: ``REGULAR_FILE``, ``NON_REGULAR`` (confirmed symlink / directory /
+    #: other) or ``UNKNOWN`` (type probe failed). A segment with no key here has no entry of that
+    #: name in the complete listing, i.e. ``ABSENT``; that is the only way ``ABSENT`` arises.
+    marker_entries: dict[str, MarkerPresence] = {}
     temp_count = 0
 
     def ignore(name: str, category: IgnoredCategory) -> None:
         ignored.append(IgnoredEntry(f"{rel_dir}/{name}", category))
+
+    def note_marker_entry(name: str, presence: MarkerPresence, what: str = "") -> None:
+        """Record what is known about an entry that sits at some segment's marker path.
+
+        Only the entry's name and the type already observed are used; nothing is opened, followed
+        or stat()ed. A confirmed non-regular entry also gets a diagnostic of its own, whether or not
+        a matching segment is listed, so it is never silently equivalent to an absent marker."""
+        if not name.endswith(".seg.meta.json"):
+            return
+        marker_entries[name[: -len(".meta.json")]] = presence
+        if presence is MarkerPresence.NON_REGULAR:
+            warnings.append(DiscoveryWarning(
+                "MARKER_NOT_REGULAR", f"{rel_dir}/{name}",
+                f"{what} at the marker path; not followed, not read, not a publication marker"))
 
     for entry in entries:
         name = entry.name
@@ -322,10 +357,9 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
                 # A source-like name stays in the inventory (UNKNOWN), never silently dropped.
                 candidates.append(_Candidate(name, parsed, None, False, False, False, meta_failed=True))
             else:
-                if name.endswith(".seg.meta.json"):
-                    # Possibly the marker of ``<seg>.seg``. Whether it is a regular file is
-                    # unknown, so that segment's marker presence is unknown, not absent.
-                    markers_unknown.add(name[: -len(".meta.json")])
+                # Possibly the marker of ``<seg>.seg``. Whether it is a regular file is unknown,
+                # so that segment's marker presence is UNKNOWN, never ABSENT.
+                note_marker_entry(name, MarkerPresence.UNKNOWN)
                 ignore(name, IgnoredCategory.UNRELATED)   # unverified type: generic bucket only
             continue
 
@@ -334,9 +368,11 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             if parsed is not None:
                 candidates.append(_Candidate(name, parsed, None, False, True, False))
             else:
+                note_marker_entry(name, MarkerPresence.NON_REGULAR, "symlink")
                 ignore(name, IgnoredCategory.SYMLINK)
             continue
         if is_dir:
+            note_marker_entry(name, MarkerPresence.NON_REGULAR, "directory")
             ignore(name, IgnoredCategory.QUARANTINE_DIR if name == QUARANTINE_DIRNAME
                    else IgnoredCategory.UNRECOGNIZED_DIRECTORY)
             continue
@@ -344,6 +380,7 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             if parsed is not None:
                 candidates.append(_Candidate(name, parsed, None, False, False, True))
             else:
+                note_marker_entry(name, MarkerPresence.NON_REGULAR, "non-regular object")
                 ignore(name, IgnoredCategory.NON_REGULAR)
             continue
 
@@ -357,7 +394,8 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         elif _MARKER_SIDECAR.search(name):
             ignore(name, IgnoredCategory.MARKER_SIDECAR)
         elif name.endswith(".seg.meta.json"):
-            markers.add(name[: -len(".meta.json")])      # existence only; content is never read
+            # A confirmed regular file at the marker path. Existence only; content is never read.
+            note_marker_entry(name, MarkerPresence.REGULAR_FILE)
         elif name.endswith(".meta.json"):
             ignore(name, IgnoredCategory.MARKER_UNRECOGNIZED)
         elif parsed is not None:
@@ -403,13 +441,14 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         c_date, c_hour, c_seq, c_kind = cand.parsed
         rel = f"{rel_dir}/{cand.name}"
         file_format = "seg" if cand.name.endswith(".seg") else "parquet"
-        marker_present: Optional[bool]
-        if cand.name in markers:
-            marker_present = True
-        elif cand.name in markers_unknown:
-            marker_present = None              # an entry named like the marker exists; type unknown
+        if c_kind is SegmentKind.LEGACY_HOURLY:
+            # Format-level fact, from the filename convention alone: legacy hourly Parquet has no
+            # ``<seg>.meta.json``. This holds whatever the trust state (even a collision or an
+            # invalid date), so "no marker" is never claimed about a file that cannot have one.
+            presence = MarkerPresence.NOT_APPLICABLE
         else:
-            marker_present = False
+            # No entry of that name in the complete listing is the only way to be ABSENT.
+            presence = marker_entries.get(cand.name, MarkerPresence.ABSENT)
         valid_name = _valid_logical_hour(c_date, c_hour)
         reasons: list[str] = []
         rec_warnings: list[str] = []
@@ -419,8 +458,11 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             "hourly_parquet" if valid_name and c_kind is SegmentKind.LEGACY_HOURLY else None)
 
         # Precedence: structural INVALID > name-level AMBIGUOUS > inconclusive UNKNOWN
-        # (STAT_FAILED / ENTRY_METADATA_FAILED) > LEGACY > unknown marker presence (UNKNOWN) >
-        # UNCONFIRMED (marker absence confirmed) / marker-present UNKNOWN.
+        # (STAT_FAILED / ENTRY_METADATA_FAILED) > LEGACY > marker evidence:
+        #   ABSENT         -> UNCONFIRMED / NO_MARKER_FILE (the only route to that state);
+        #   REGULAR_FILE   -> UNKNOWN / MARKER_PRESENT_CONTENT_NOT_READ (content never read);
+        #   NON_REGULAR    -> UNKNOWN / MARKER_NOT_REGULAR (an unusable entry is not an absent one);
+        #   UNKNOWN        -> UNKNOWN / MARKER_PRESENCE_UNKNOWN (type probe failed).
         # A failed lstat or type probe means the observation is incomplete, so no state that
         # implies a successful one is assigned, and no file type is claimed.
         if cand.symlink:
@@ -441,14 +483,16 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         elif c_kind is SegmentKind.LEGACY_HOURLY:
             state = TrustState.LEGACY
             reasons.append("LEGACY_HOURLY_PARQUET")
-        elif marker_present is None:
-            state = TrustState.UNKNOWN          # marker absence was never established
-        elif not marker_present:
+        elif presence is MarkerPresence.ABSENT:
             state = TrustState.UNCONFIRMED
             reasons.append("NO_MARKER_FILE")
-        else:
+        elif presence is MarkerPresence.REGULAR_FILE:
             state = TrustState.UNKNOWN
             reasons.append("MARKER_PRESENT_CONTENT_NOT_READ")
+        else:
+            # NON_REGULAR / UNKNOWN: marker absence was never established, so never UNCONFIRMED and
+            # never NO_MARKER_FILE. The specific reason is recorded below, for every state.
+            state = TrustState.UNKNOWN
 
         if cand.meta_failed:
             # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
@@ -458,21 +502,29 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
             rec_warnings.append("STAT_FAILED")
             reasons.append("STAT_FAILED")
-        if marker_present is None:
+        if presence is MarkerPresence.UNKNOWN:
             # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
             rec_warnings.append("MARKER_PRESENCE_UNKNOWN")
             reasons.append("MARKER_PRESENCE_UNKNOWN")
+        elif presence is MarkerPresence.NON_REGULAR:
+            # Recorded for every state, like the two above.
+            rec_warnings.append("MARKER_NOT_REGULAR")
+            reasons.append("MARKER_NOT_REGULAR")
 
         records.append(SourceRecord(
             relative_path=rel, stream=stream, venue=venue, identity_status=identity_status,
             date=c_date if valid_name else None, hour=c_hour if valid_name else None,
             sequence=c_seq if valid_name else None, kind=c_kind if valid_name else None,
-            file_format=file_format, size_bytes=cand.size, marker_file_present=marker_present,
+            file_format=file_format, size_bytes=cand.size, marker_presence=presence,
             trust_state=state, reasons=tuple(reasons), warnings=tuple(sorted(rec_warnings)),
             collision_group=colliding.get(cand.name), legacy_kind=legacy_kind))
 
     # -- markers: matched ones are listed as ignored; orphans are warned about --
-    for seg_name in sorted(markers, key=_byte_key):
+    # Only confirmed regular files qualify. A non-regular or unverifiable entry at a marker path
+    # was already filed under its true (or unverified) category above and warned about; it is never
+    # promoted to a "marker file" or an "orphan marker file" here.
+    regular_markers = (n for n, p in marker_entries.items() if p is MarkerPresence.REGULAR_FILE)
+    for seg_name in sorted(regular_markers, key=_byte_key):
         marker_name = seg_name + ".meta.json"
         if seg_name in candidate_names:
             ignore(marker_name, IgnoredCategory.MARKER_FILE)
