@@ -205,7 +205,10 @@ def test_ordinary_exception_keeps_the_ordinary_exception_behaviour(tmp_path, mon
         assert seen == [], "an ordinary exception must never be offered to the failure policy"
         assert not policy.failed_components and policy.quality_degraded is None
         assert policy.terminal_failure is None and not policy.isolated_routes
-        assert app.exit_code == 0 and not client.discard_mode and not alerts
+        assert app.exit_code == 0 and not client.discard_mode
+        # An ordinary exception is still never a storage failure: no failure-policy alert. The only
+        # alert is the one-time checkpoint-blocked alert (F5-QA-03) for the latch it set above.
+        assert len(alerts) == 1 and "QUALITY WAL CHECKPOINT BLOCKED" in alerts[0] and "STORAGE FAILURE" not in alerts[0]
     finally:
         _cleanup(app)
 
