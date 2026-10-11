@@ -46,7 +46,8 @@ from collector.collector.gap_detector import GapDetector
 from collector.collector.disk_monitor import DiskMonitor
 from collector.collector.health_monitor import HealthMonitor
 from collector.collector.parquet_writer import ParquetWriter
-from collector.collector.storage_errors import FatalStorageError, WriterFailureSnapshot
+from collector.collector.storage_errors import (
+    EVENT_PUBLISHED, EVENT_UNCONFIRMED, FatalStorageError, WriterFailureSnapshot)
 from collector.collector.failure_topology import (
     EXIT_FATAL_STORAGE, FailureRecord, VERDICT_DEGRADE_QUALITY, VERDICT_ISOLATE, VERDICT_TERMINATE,
     classify_stream,
@@ -945,25 +946,51 @@ class CollectorApp:
             except Exception as exc:
                 self._block_quality_checkpoint("unprotected_event_publish_failed")
                 self._note_quality_writer_failure(exc)
-                self._account_tripping_quality_event(exc, event, wal_protected=wal_protected, wal_seq=wal_seq)
+                self._account_tripping_quality_event(exc, event, wal_protected=wal_protected, wal_seq=wal_seq,
+                                                     record_admitted=True)
                 raise
 
     def _account_tripping_quality_event(self, exc: BaseException, event: dict, *,
-                                        wal_protected: bool, wal_seq) -> None:
-        """Account the event whose own write latched the quality channel degraded.
+                                        wal_protected: bool, wal_seq, record_admitted=None) -> None:
+        """Account the event whose own write/publish latched the quality channel degraded.
 
-        It is counted by exactly the rules that apply to every later event
-        (``_account_degraded_quality_event``): retained only if its WAL record is
-        established, unconfirmed if the append is in doubt, unrecorded if there is
-        no WAL evidence at all. Only a typed fatal that really degraded the channel
-        qualifies: an ordinary exception, or a fatal that was classified
-        otherwise, leaves the counters alone. Never raises, so the caller's
-        ``raise`` of the original exception is never replaced."""
+        What happened to THIS event decides the counters, from the writer's evidence
+        (``exc.trigger_event_disposition``; ``record_admitted=True`` when the failure came from
+        ``publish_open_segment()`` after ``write()`` returned, where the exception carries no
+        admission evidence of its own) and the WAL evidence:
+
+        * published, and no WAL record exists (``wal_seq is None``)  -> nothing: it is in a
+          durable segment and nothing will replay it. No loss alert.
+        * published, WAL seq covered by the durable checkpoint       -> nothing: it will not be
+          replayed, so it is neither "WAL-only" nor lost.
+        * published but NOT checkpoint-covered (checkpoint blocked/failed)  -> by WAL evidence
+          (it will be replayed at next start).
+        * unconfirmed with no WAL evidence                            -> ``wal_unconfirmed``
+          (publication unproven; never claimed lost, no loss alert).
+        * lost (never admitted / unpublished)                         -> by WAL evidence, as before.
+
+        Only a typed fatal that really degraded the channel qualifies; an ordinary exception
+        leaves the counters alone. Never raises, so the caller's ``raise`` is never replaced."""
         try:
             if self._is_quality_channel_failure(exc) and getattr(self, "quality_degraded", None) is not None:
-                self._account_degraded_quality_event(event, wal_protected=wal_protected, wal_seq=wal_seq)
+                disposition = exc.trigger_event_disposition(record_admitted=record_admitted)
+                if disposition == EVENT_PUBLISHED and (
+                        wal_seq is None or self._quality_seq_checkpoint_covered(wal_seq)):
+                    return
+                self._account_degraded_quality_event(
+                    event, wal_protected=wal_protected, wal_seq=wal_seq,
+                    publication_unproven=(disposition == EVENT_UNCONFIRMED))
         except Exception as account_exc:  # noqa: BLE001 - accounting must not mask the original failure
             logger.error("quality_event_accounting_failed", error=f"{type(account_exc).__name__}: {account_exc}")
+
+    def _quality_seq_checkpoint_covered(self, seq) -> bool:
+        """True when the DURABLE WAL checkpoint already covers ``seq``: that event's segment was
+        published and the checkpoint advanced past it, so the next start will NOT replay it."""
+        wal = getattr(self, "_quality_wal", None)
+        try:
+            return wal is not None and seq is not None and wal.checkpointed_seq >= seq
+        except Exception:  # noqa: BLE001 - evidence unavailable == not proven covered
+            return False
 
     def _note_quality_writer_failure(self, exc: BaseException) -> None:
         """Latch the quality channel degraded when ITS writer raised a typed fatal.
@@ -1004,7 +1031,8 @@ class CollectorApp:
             return False
         return True
 
-    def _account_degraded_quality_event(self, event: dict, *, wal_protected: bool, wal_seq) -> None:
+    def _account_degraded_quality_event(self, event: dict, *, wal_protected: bool, wal_seq,
+                                        publication_unproven: bool = False) -> None:
         """Count one event that arrived while the quality channel is degraded.
 
         * ``wal_protected``  -> its WAL record is established: ``_quality_events_wal_only``.
@@ -1019,7 +1047,9 @@ class CollectorApp:
         if wal_protected:
             self._quality_events_wal_only = getattr(self, "_quality_events_wal_only", 0) + 1
             return
-        if wal_seq is not None:
+        if wal_seq is not None or publication_unproven:
+            # ``publication_unproven``: no WAL evidence, but the writer could not establish
+            # whether the event's segment is durable (renamed, directory fsync failed). Not lost.
             self._quality_events_wal_unconfirmed = getattr(self, "_quality_events_wal_unconfirmed", 0) + 1
             return
         count = getattr(self, "_quality_events_unrecorded", 0) + 1
