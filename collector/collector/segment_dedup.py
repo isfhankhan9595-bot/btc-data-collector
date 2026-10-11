@@ -460,6 +460,8 @@ class ReconcileReport:
     rebuild_reasons: List[str] = field(default_factory=list)
     dangling: int = 0
     invalid_markers: int = 0
+    #: markers whose bytes could not be read (UNKNOWN_IO); non-zero only on the aborted attempt
+    unreadable_markers: int = 0
     #: identity-evidence files (re)derived from segment bytes (missing / stale / unreadable / forged)
     evidence_regenerated: int = 0
     #: segments whose identity set was re-derived from bytes by DEDUP_DEEP_VERIFY=1
@@ -625,6 +627,20 @@ class SegmentDedupCoordinator:
             raise DedupStateError(future)
         segs = sorted(stream_dir.glob("*.seg"))
         markers: Dict[Path, MarkerResult] = {p: read_marker(p) for p in segs}
+        # Fail closed on marker I/O uncertainty over the WHOLE segment set, before any mutation below
+        # (preserve_invalid / orphan_marker / confirm_unmarked / rebuild_reset / index commits): a marker
+        # whose bytes could not be read is unknown evidence, not proof of corruption nor of absence, and a
+        # genuinely malformed marker earlier in the sort order must not be renamed by an attempt that is
+        # about to abort.
+        unreadable = [(path, markers[path]) for path in segs if markers[path].status is MarkerStatus.UNKNOWN_IO]
+        if unreadable:
+            report.unreadable_markers = len(unreadable)
+            for path, marker in unreadable:
+                logger.error("publication_marker_unreadable", file=str(marker_path(path)), reason=marker.reason)
+            raise DedupStateError(
+                f"{len(unreadable)} publication marker(s) in {stream_dir} could not be read "
+                f"(first: {marker_path(unreadable[0][0]).name}: {unreadable[0][1].reason}); startup reconciliation "
+                f"aborted before changing any marker, segment or index state")
 
         confirmed: List[Path] = []
         unmarked: List[UnmarkedSegment] = []
@@ -702,7 +718,12 @@ class SegmentDedupCoordinator:
         fingerprint = identity_encoding_fingerprint()
         on_disk: Dict[str, Tuple[Path, MarkerResult]] = {}
         for p in confirmed:
-            on_disk[self._segment_key(p)] = (p, read_marker(p))
+            marker = read_marker(p)
+            if not marker.valid:      # re-read: a marker that was valid moments ago is now unreadable/changed
+                raise DedupStateError(
+                    f"publication marker of {p.name} is no longer valid during the index audit "
+                    f"({marker.status.value}: {marker.reason}); refusing to rebuild or change the index")
+            on_disk[self._segment_key(p)] = (p, marker)
         rows = self.index.reconciled_rows()
         expected: Dict[int, Tuple[int, str]] = {}
         for key, row in sorted(rows.items()):
