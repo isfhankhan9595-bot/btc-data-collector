@@ -95,6 +95,11 @@ def _quality_alerts(alerts) -> list[str]:
     return [m for m in alerts if "degrade_quality" in m and QUALITY_STREAM in m]
 
 
+def _checkpoint_alerts(alerts) -> list[str]:
+    """F5-QA-03: the one-time alert for the first transition into checkpoint-blocked."""
+    return [m for m in alerts if "QUALITY WAL CHECKPOINT BLOCKED" in m]
+
+
 def _cleanup(app) -> None:
     from collector.tests.test_p0_4_runner_lifecycle import _publish_all
     _publish_all(app)
@@ -396,7 +401,8 @@ def test_degraded_channel_never_calls_the_failed_writer_again_and_does_not_flood
         assert len(writes) == 1, f"the FAILED quality writer was called {len(writes)} times"
         assert len(latches) == 1 and policy.failure_repeats == {}, "the latch must not be re-entered per event"
         assert len(policy.failed_components) == 1 and policy.terminal_failure is None
-        assert len(alerts) == 1 and len(_quality_alerts(alerts)) == 1, alerts
+        # one degrade alert + the one-time checkpoint-blocked alert (F5-QA-03); neither repeats per event
+        assert len(_quality_alerts(alerts)) == 1 and len(_checkpoint_alerts(alerts)) == 1 and len(alerts) == 2, alerts
         assert _error_events(caplog) == errors_after_first, "an error log was emitted per later event"
         assert _error_events(caplog).count("storage_failure_latched") == 1
         # every event is accounted, none is lost, and the count agrees with the WAL on disk
@@ -411,7 +417,8 @@ def test_counters_are_zero_and_the_channel_healthy_before_and_after_normal_traff
     app = _app(tmp_path)
     try:
         healthy = {"quality_degraded": False, "quality_events_wal_only": 0, "quality_events_wal_unconfirmed": 0,
-                   "quality_events_lost": 0, "quality_checkpoint_blocked": False, "quality_failure": None}
+                   "quality_events_lost": 0, "quality_checkpoint_blocked": False,
+                   "quality_checkpoint_block_reason": None, "quality_failure": None}
         assert app.quality_channel_status() == healthy
         for i in range(5):
             _emit_ws(app, f"healthy-{i}")
@@ -493,7 +500,8 @@ def test_events_with_no_wal_record_and_no_writer_are_counted_lost_with_one_alert
         assert not _wal_records(tmp_path) and not [r for r in _rows(tmp_path) if r["reason"].startswith("lost-")], \
             "'lost' must mean there is no copy anywhere"
         lost_alerts = [m for m in alerts if "QUALITY EVENTS UNRECORDED" in m]
-        assert len(lost_alerts) == 1 and len(alerts) == 2, alerts          # one degrade alert + one loss alert
+        # one degrade alert + the one-time checkpoint-blocked alert (F5-QA-03) + one loss alert
+        assert len(lost_alerts) == 1 and len(_checkpoint_alerts(alerts)) == 1 and len(alerts) == 3, alerts
         errors = _error_events(caplog)
         assert errors.count("bybit_quality_event_unrecorded") == N_EVENTS.bit_length(), errors
         assert errors.count("bybit_quality_event_wal_append_failed_in_persist") == 1

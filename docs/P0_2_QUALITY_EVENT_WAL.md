@@ -93,6 +93,20 @@ Parquet." Three properties, each independently tested:
    already landed once, the replay writes a second row with the same id.
    Published-row reconciliation is NOT implemented; see section G2.
 
+   **Visibility (F5-QA-03).** The first transition into the blocked state
+   sends ONE operator alert (never one per later event) and is exposed,
+   with its first reason, as `quality_checkpoint_blocked` /
+   `quality_checkpoint_block_reason` in `quality_channel_status()` for the
+   Futures and Bybit runners. That flag is independent of
+   `quality_degraded` (the quality *writer* failed): a blocked checkpoint is
+   not "healthy" merely because rows still publish. Latching, logging and
+   alerting are contained so a failing logger or alert backend can neither
+   undo the latch nor raise. While blocked the WAL only grows: file
+   rotation is not a total-size cap, `maybe_rotate_for_size()` is not
+   reached after the latch, and nothing deletes uncheckpointed records. A
+   size threshold with a controlled operational response is a separate
+   policy decision and is not implemented.
+
 `_delete_fully_checkpointed_files()` never deletes the currently active
 file (verified directly: a test checkpoints exactly up to the active
 file's own max seq and confirms it survives and remains appendable), and

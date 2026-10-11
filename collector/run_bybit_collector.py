@@ -238,6 +238,12 @@ class BybitCollectorApp:
           retained nor as lost.
         * ``quality_events_lost``           -- no WAL record and no usable writer: not
           durably recorded, so counted as lost.
+
+        ``quality_degraded`` (the quality writer itself failed) and ``quality_checkpoint_blocked``
+        (the quality WAL can no longer advance its checkpoint; ``quality_checkpoint_block_reason``
+        says why) are independent: a blocked checkpoint is NOT healthy merely because the writer can
+        still publish rows. While blocked, published events stay uncheckpointed and are replayed at the
+        next start (at-least-once; duplicates carry the same ``quality_event_id``).
         """
         record = self.failure_policy.quality_degraded
         return {"quality_degraded": record is not None,
@@ -245,6 +251,7 @@ class BybitCollectorApp:
                 "quality_events_wal_unconfirmed": self._quality_events_wal_unconfirmed,
                 "quality_events_lost": self._quality_events_unrecorded,
                 "quality_checkpoint_blocked": self._quality_checkpoint_is_blocked(),
+                "quality_checkpoint_block_reason": getattr(self, "_quality_checkpoint_block_reason", None),
                 "quality_failure": None if record is None else record.as_dict()}
 
     def _report_storage_failure(self, record: FailureRecord) -> None:
@@ -309,6 +316,7 @@ class BybitCollectorApp:
     def _init_quality_durability_state(self) -> None:
         self._quality_checkpoint_blocked = False
         self._quality_checkpoint_block_reason = None
+        self._quality_checkpoint_block_alerted = False   # one operator alert per process, set BEFORE sending
         self._quality_wal_inflight = set()
         self._quality_segment_seqs = set()
         self._quality_published_hwm = None
@@ -333,12 +341,46 @@ class BybitCollectorApp:
         set remain uncheckpointed until restart, so the replay can write a
         second row with the same quality_event_id. The collector does not
         reconcile or deduplicate those rows; that is a downstream
-        responsibility. Fail closed."""
+        responsibility. Fail closed.
+
+        The latch and its reason are recorded FIRST and unconditionally; the log
+        line and the one-time operator alert come after and are each contained,
+        so a failing logger or alert backend can neither undo the latch, mask the
+        original reason, nor raise into the caller."""
         self._ensure_quality_state()
-        if not self._quality_checkpoint_blocked:
+        first = not self._quality_checkpoint_blocked
+        if first:
             self._quality_checkpoint_block_reason = why
         self._quality_checkpoint_blocked = True
-        logger.error("bybit_quality_checkpoint_blocked", reason=why)
+        try:
+            logger.error("bybit_quality_checkpoint_blocked", reason=why)
+        except Exception:  # noqa: BLE001 - the latch above is the record; logging is best-effort
+            pass
+        if first:
+            self._alert_quality_checkpoint_blocked(why)
+
+    def _alert_quality_checkpoint_blocked(self, why: str) -> None:
+        """ONE operator alert, on the first transition into the checkpoint-blocked
+        state. Never touches ``quality_writer``, ``_persist_quality_event`` or the
+        WAL (so it cannot re-enter failure reporting), never raises, and marks
+        itself sent BEFORE sending so a failing or re-entrant backend cannot
+        produce a second alert. The state it reports is already latched."""
+        if getattr(self, "_quality_checkpoint_block_alerted", False):
+            return
+        self._quality_checkpoint_block_alerted = True
+        try:
+            send_telegram_alert(
+                f"QUALITY WAL CHECKPOINT BLOCKED [BYBIT]: reason={why}. Checkpointing is blocked for the "
+                "rest of this process. Quality events may keep publishing to Parquet while their WAL records "
+                "stay uncheckpointed, so the quality WAL can keep growing and the next start will replay "
+                "them (duplicate rows with the same quality_event_id are possible). Market data and raw "
+                "capture are unaffected. Inspect the quality WAL directory and restart/recover when safe.")
+        except Exception as exc:  # noqa: BLE001 - alerting fails open; the latch is already set
+            try:
+                logger.error("bybit_quality_checkpoint_blocked_alert_failed",
+                             error=f"{type(exc).__name__}: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_quality_segment_durable(self, path, record_count: int) -> None:
         """Called by quality_writer only after a segment is durably published.
@@ -383,8 +425,7 @@ class BybitCollectorApp:
             # later checkpoint(N) cannot cover its seqs and delete the evidence.
             recovered_events = []
             self._quality_wal_recovery_error = str(exc)
-            self._quality_checkpoint_blocked = True
-            self._quality_checkpoint_block_reason = "wal_corruption_on_startup"
+            self._block_quality_checkpoint("wal_corruption_on_startup")
         self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
         if self._quality_wal_recovery_error is not None:
             self._persist_quality_event({
