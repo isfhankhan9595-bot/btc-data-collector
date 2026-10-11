@@ -206,6 +206,14 @@ class QualityEventWAL:
     def write_failed(self) -> bool:
         return self._write_failed
 
+    @property
+    def checkpointed_seq(self) -> int:
+        """Highest seq covered by the DURABLE checkpoint (-1 if none). In-memory state
+        advances only after the checkpoint file's atomic replace succeeded, so this never
+        claims more than is on disk. Read-only: used by runners to tell whether an event
+        is already covered (and therefore will not be replayed)."""
+        return self._checkpointed_seq
+
     def checkpoint(self, up_to_seq: int) -> None:
         """Record that every event with seq <= up_to_seq is durably in
         Parquet, then delete any WAL file fully covered by that bound."""
