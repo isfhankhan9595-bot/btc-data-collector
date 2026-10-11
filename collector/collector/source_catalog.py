@@ -367,8 +367,14 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         valid_name = _valid_logical_hour(c_date, c_hour)
         reasons: list[str] = []
         rec_warnings: list[str] = []
-        legacy_kind: Optional[str] = None
+        #: Filename-derived identity: kept whatever the trust state, so an inconclusive
+        #: observation (e.g. STAT_FAILED) never erases that this is a legacy hourly file.
+        legacy_kind: Optional[str] = (
+            "hourly_parquet" if valid_name and c_kind is SegmentKind.LEGACY_HOURLY else None)
 
+        # Precedence: structural INVALID > name-level AMBIGUOUS > inconclusive UNKNOWN
+        # (STAT_FAILED) > LEGACY / UNCONFIRMED / marker-based UNKNOWN. A failed lstat means
+        # the observation is incomplete, so no state that implies a successful one is assigned.
         if cand.symlink:
             state = TrustState.INVALID
             reasons.append("SYMLINK_NOT_FOLLOWED")
@@ -382,9 +388,10 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             state = TrustState.AMBIGUOUS
             reasons.append("LEGACY_SEGMENT_COLLISION")
             rec_warnings.append("COLLISION")
+        elif cand.stat_failed:
+            state = TrustState.UNKNOWN
         elif c_kind is SegmentKind.LEGACY_HOURLY:
             state = TrustState.LEGACY
-            legacy_kind = "hourly_parquet"
             reasons.append("LEGACY_HOURLY_PARQUET")
         elif not marker_present:
             state = TrustState.UNCONFIRMED
@@ -394,9 +401,9 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             reasons.append("MARKER_PRESENT_CONTENT_NOT_READ")
 
         if cand.stat_failed:
+            # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
             rec_warnings.append("STAT_FAILED")
-            if state is TrustState.UNKNOWN:
-                reasons.append("STAT_FAILED")
+            reasons.append("STAT_FAILED")
 
         records.append(SourceRecord(
             relative_path=rel, stream=stream, venue=venue, identity_status=identity_status,

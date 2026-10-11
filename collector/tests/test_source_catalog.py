@@ -311,6 +311,143 @@ def test_unreadable_stream_is_reported_as_unknown_not_empty(tmp_path, monkeypatc
     assert any(w.code == "STREAM_UNREADABLE" for w in result.warnings)
 
 
+# ---------------------------------------------------------------- per-file stat failure
+
+class _StatFailsEntry:
+    """Delegates to a real DirEntry but makes ``stat()`` raise for chosen names."""
+
+    def __init__(self, entry, failing):
+        self._entry, self._failing = entry, failing
+        self.name = entry.name
+
+    def is_symlink(self):
+        return self._entry.is_symlink()
+
+    def is_dir(self, *, follow_symlinks=True):
+        return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+    def is_file(self, *, follow_symlinks=True):
+        return self._entry.is_file(follow_symlinks=follow_symlinks)
+
+    def stat(self, *, follow_symlinks=True):
+        if self.name in self._failing:
+            raise OSError(5, "simulated per-file stat failure")
+        return self._entry.stat(follow_symlinks=follow_symlinks)
+
+
+def _fail_stat_for(monkeypatch, *names):
+    real = os.scandir
+    failing = frozenset(names)
+
+    class _Scan:
+        def __init__(self, it):
+            self._it = it
+
+        def __enter__(self):
+            return iter([_StatFailsEntry(e, failing) for e in self._it])
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+    monkeypatch.setattr(sc.os, "scandir", lambda path: _Scan(real(path)))
+
+
+def _by_name(result):
+    return {Path(r.relative_path).name: r for r in result.records}
+
+
+def test_stat_failure_on_unmarked_segment_is_unknown_not_unconfirmed(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "bybit_trades")
+    _touch(d / SEG)
+    _touch(d / "2026-10-11-13-000000.seg")                       # healthy neighbour, also unmarked
+    _fail_stat_for(monkeypatch, SEG)
+    rec = _by_name(discover_sources(tmp_path))[SEG]
+    assert rec.trust_state is TrustState.UNKNOWN
+    assert rec.reasons == ("STAT_FAILED",)
+    assert rec.warnings == ("STAT_FAILED",)
+    assert rec.size_bytes is None
+    # diagnostic and identity evidence is preserved separately
+    assert rec.marker_file_present is False
+    assert (rec.venue, rec.identity_status) == ("BYBIT", IdentityStatus.NAME_PREFIX_REGISTERED)
+    assert (rec.date, rec.hour, rec.sequence, rec.kind) == ("2026-10-11", 12, 3, SegmentKind.SEGMENT)
+    assert rec.relative_path == "raw/bybit_trades/" + SEG
+    healthy = _by_name(discover_sources(tmp_path))["2026-10-11-13-000000.seg"]
+    assert healthy.trust_state is TrustState.UNCONFIRMED and healthy.size_bytes is not None
+
+
+def test_stat_failure_on_legacy_parquet_is_unknown_but_stays_identified_as_legacy(tmp_path, monkeypatch):
+    _touch(_raw(tmp_path, "trades") / LEGACY)
+    _fail_stat_for(monkeypatch, LEGACY)
+    rec = discover_sources(tmp_path).records[0]
+    assert rec.trust_state is TrustState.UNKNOWN
+    assert rec.reasons == ("STAT_FAILED",) and rec.warnings == ("STAT_FAILED",)
+    assert rec.legacy_kind == "hourly_parquet"                   # filename identity survives
+    assert rec.kind is SegmentKind.LEGACY_HOURLY and rec.sequence is None
+    assert rec.size_bytes is None
+
+
+def test_stat_failure_with_marker_present_keeps_marker_evidence_and_is_unknown(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    _touch(d / SEG)
+    _touch(d / (SEG + ".meta.json"))
+    _fail_stat_for(monkeypatch, SEG)
+    rec = discover_sources(tmp_path).records[0]
+    assert rec.trust_state is TrustState.UNKNOWN and rec.reasons == ("STAT_FAILED",)
+    assert rec.marker_file_present is True
+
+
+def test_stat_failure_never_yields_confirmed_or_corrupt(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    names = (LEGACY, "2026-10-11-13-000000.seg", "2026-10-11-14-000000.seg")
+    for name in names:
+        _touch(d / name)
+    _touch(d / "2026-10-11-14-000000.seg.meta.json")
+    _fail_stat_for(monkeypatch, *names)
+    states = {r.trust_state for r in discover_sources(tmp_path).records}
+    assert states == {TrustState.UNKNOWN}
+
+
+def test_collision_outranks_stat_failure_and_keeps_both_diagnostics(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    _touch(d / LEGACY)
+    _touch(d / "2026-10-11-12-000000.seg")
+    _fail_stat_for(monkeypatch, LEGACY)
+    result = discover_sources(tmp_path)
+    by_name = _by_name(result)
+    failed, healthy = by_name[LEGACY], by_name["2026-10-11-12-000000.seg"]
+    # the collision is established from names alone, independent of the failed stat
+    assert failed.trust_state is TrustState.AMBIGUOUS
+    assert failed.reasons == ("LEGACY_SEGMENT_COLLISION", "STAT_FAILED")
+    assert failed.warnings == ("COLLISION", "STAT_FAILED")
+    assert failed.collision_group == "raw/trades/2026-10-11-12" and failed.size_bytes is None
+    assert failed.legacy_kind == "hourly_parquet"
+    assert healthy.trust_state is TrustState.AMBIGUOUS and healthy.reasons == ("LEGACY_SEGMENT_COLLISION",)
+    assert healthy.collision_group == failed.collision_group
+    assert len(result.records) == 2, "a collision member with a failed stat must not be dropped"
+    assert sum(w.code == "COLLISION" for w in result.warnings) == 1
+
+
+def test_structural_invalidity_outranks_stat_failure(tmp_path, monkeypatch):
+    bad = "2026-13-45-12-000001.seg"
+    _touch(_raw(tmp_path, "trades") / bad)
+    _fail_stat_for(monkeypatch, bad)
+    rec = discover_sources(tmp_path).records[0]
+    assert rec.trust_state is TrustState.INVALID
+    assert rec.reasons == ("INVALID_DATE_OR_HOUR_IN_NAME", "STAT_FAILED")
+    assert rec.warnings == ("STAT_FAILED",)
+
+
+def test_stat_failure_does_not_remove_the_file_from_the_inventory_or_touch_it(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    _touch(d / SEG, b"data")
+    before = _snapshot(tmp_path)
+    _fail_stat_for(monkeypatch, SEG)
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+    assert _paths(result) == ["raw/trades/" + SEG]
+    assert _snapshot(tmp_path) == before
+
+
 # ---------------------------------------------------------------- filters
 
 def test_date_and_hour_filters(tmp_path):
