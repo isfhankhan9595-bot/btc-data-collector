@@ -20,6 +20,14 @@ What this module deliberately does NOT do
 * It never claims a file type it could not establish: if ``is_symlink()`` / ``is_dir()`` /
   ``is_file()`` raises, a source-like name is kept as ``UNKNOWN`` (``ENTRY_METADATA_FAILED``),
   with its size unknown, and the entry is not stat()ed, opened or followed.
+* The same holds directly under ``raw/``: an entry whose type probe raises is neither filed
+  as ignored/unrelated nor scanned. It is reported as ``ENTRY_METADATA_FAILED`` (and, if it was
+  requested by name, as ``STREAM_UNINSPECTABLE`` rather than ``STREAM_NOT_FOUND``) because it
+  may be a stream directory.
+* It never turns "could not look" into "is not there": ``marker_file_present`` is ``False`` only
+  when the complete directory listing has no entry of that name (or the entry is confirmed not to
+  be a regular file). If an entry with the marker's name exists but its type probe failed, it is
+  ``None`` (unknown) and the segment is never ``UNCONFIRMED`` / ``NO_MARKER_FILE`` because of it.
 * It asserts no completeness, instrument identity, unit or timestamp semantics.
 
 Identity is only what repository naming conventions support
@@ -126,7 +134,14 @@ class SourceRecord:
     kind: Optional[SegmentKind]
     file_format: str                      # "seg" | "parquet"
     size_bytes: Optional[int]             # lstat size at observation; None if lstat failed or the type is unverified
-    marker_file_present: bool             # name-level only: the marker's content is NOT read
+    #: Name-level only; the marker's content is NOT read. Tri-state, never collapsed to a bool:
+    #: ``True``  - a regular ``<seg>.meta.json`` file was observed;
+    #: ``False`` - confirmed absent (complete listing has no such entry, or the entry is confirmed
+    #:             not to be a regular file, e.g. a symlink);
+    #: ``None``  - UNKNOWN: an entry with the marker's name exists but its type probe failed.
+    #: Callers must test ``is None`` explicitly: ``not rec.marker_file_present`` conflates
+    #: "unknown" with "absent".
+    marker_file_present: Optional[bool]
     trust_state: TrustState
     reasons: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -277,6 +292,9 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
 
     candidates: list[_Candidate] = []
     markers: set[str] = set()              # segment names that have a ``.meta.json`` file
+    #: segment names whose ``.seg.meta.json`` entry EXISTS in the listing but whose type probe
+    #: failed: marker presence is unknown for these, which is not the same as absent.
+    markers_unknown: set[str] = set()
     temp_count = 0
 
     def ignore(name: str, category: IgnoredCategory) -> None:
@@ -304,6 +322,10 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
                 # A source-like name stays in the inventory (UNKNOWN), never silently dropped.
                 candidates.append(_Candidate(name, parsed, None, False, False, False, meta_failed=True))
             else:
+                if name.endswith(".seg.meta.json"):
+                    # Possibly the marker of ``<seg>.seg``. Whether it is a regular file is
+                    # unknown, so that segment's marker presence is unknown, not absent.
+                    markers_unknown.add(name[: -len(".meta.json")])
                 ignore(name, IgnoredCategory.UNRELATED)   # unverified type: generic bucket only
             continue
 
@@ -381,7 +403,13 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         c_date, c_hour, c_seq, c_kind = cand.parsed
         rel = f"{rel_dir}/{cand.name}"
         file_format = "seg" if cand.name.endswith(".seg") else "parquet"
-        marker_present = cand.name in markers
+        marker_present: Optional[bool]
+        if cand.name in markers:
+            marker_present = True
+        elif cand.name in markers_unknown:
+            marker_present = None              # an entry named like the marker exists; type unknown
+        else:
+            marker_present = False
         valid_name = _valid_logical_hour(c_date, c_hour)
         reasons: list[str] = []
         rec_warnings: list[str] = []
@@ -391,7 +419,8 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             "hourly_parquet" if valid_name and c_kind is SegmentKind.LEGACY_HOURLY else None)
 
         # Precedence: structural INVALID > name-level AMBIGUOUS > inconclusive UNKNOWN
-        # (STAT_FAILED / ENTRY_METADATA_FAILED) > LEGACY / UNCONFIRMED / marker-based UNKNOWN.
+        # (STAT_FAILED / ENTRY_METADATA_FAILED) > LEGACY > unknown marker presence (UNKNOWN) >
+        # UNCONFIRMED (marker absence confirmed) / marker-present UNKNOWN.
         # A failed lstat or type probe means the observation is incomplete, so no state that
         # implies a successful one is assigned, and no file type is claimed.
         if cand.symlink:
@@ -412,6 +441,8 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
         elif c_kind is SegmentKind.LEGACY_HOURLY:
             state = TrustState.LEGACY
             reasons.append("LEGACY_HOURLY_PARQUET")
+        elif marker_present is None:
+            state = TrustState.UNKNOWN          # marker absence was never established
         elif not marker_present:
             state = TrustState.UNCONFIRMED
             reasons.append("NO_MARKER_FILE")
@@ -427,6 +458,10 @@ def _scan_stream(raw_dir: Path, stream: str, date: Optional[str], hour: Optional
             # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
             rec_warnings.append("STAT_FAILED")
             reasons.append("STAT_FAILED")
+        if marker_present is None:
+            # Recorded for every state (INVALID / AMBIGUOUS keep their structural reason first).
+            rec_warnings.append("MARKER_PRESENCE_UNKNOWN")
+            reasons.append("MARKER_PRESENCE_UNKNOWN")
 
         records.append(SourceRecord(
             relative_path=rel, stream=stream, venue=venue, identity_status=identity_status,
@@ -492,6 +527,10 @@ def discover_sources(data_root: Union[str, "os.PathLike[str]"], *,
     # Stream directories directly under raw/. Only real directories with a plain
     # stream name are scanned; everything else is reported, never followed.
     present: dict[str, str] = {}             # stream name -> "dir"
+    #: Entries directly under raw/ whose type probe raised. They may be stream directories, so
+    #: they are neither scanned (never traversed with an unknown type) nor filed as unrelated, and
+    #: an explicit request for one of them is not answered with STREAM_NOT_FOUND.
+    uninspectable: set[str] = set()
     try:
         with os.scandir(raw_dir) as it:
             top = sorted(it, key=lambda e: _byte_key(e.name))
@@ -499,11 +538,18 @@ def discover_sources(data_root: Union[str, "os.PathLike[str]"], *,
         raise SourceRootError(f"cannot list {RAW_DIRNAME}/ under data_root: {exc}") from exc
     for entry in top:
         rel = f"{RAW_DIRNAME}/{entry.name}"
+        probe = "is_symlink"
         try:
             is_symlink = entry.is_symlink()
+            probe = "is_dir"
             is_dir = (not is_symlink) and entry.is_dir(follow_symlinks=False)
-        except OSError:
-            ignored.append(IgnoredEntry(rel, IgnoredCategory.UNRELATED))
+        except OSError as exc:
+            # Type not established: not a symlink, directory, regular file or "unrelated" as far
+            # as this module can tell. It is not added to ``ignored`` (that would classify it),
+            # not scanned, not stat()ed and not followed; only the failure is recorded.
+            uninspectable.add(entry.name)
+            warnings.append(DiscoveryWarning(
+                "ENTRY_METADATA_FAILED", rel, f"{probe}: {type(exc).__name__}: {exc}"))
             continue
         if is_symlink:
             ignored.append(IgnoredEntry(rel, IgnoredCategory.SYMLINK))
@@ -522,6 +568,12 @@ def discover_sources(data_root: Union[str, "os.PathLike[str]"], *,
         for name in wanted:
             if name in present:
                 to_scan.append(name)
+            elif name in uninspectable:
+                # Existence is unknown, not disproved: never report this as STREAM_NOT_FOUND.
+                warnings.append(DiscoveryWarning(
+                    "STREAM_UNINSPECTABLE", f"{RAW_DIRNAME}/{name}",
+                    "requested stream entry could not be inspected; whether it is a stream "
+                    "directory is unknown (not scanned)"))
             else:
                 warnings.append(DiscoveryWarning(
                     "STREAM_NOT_FOUND", f"{RAW_DIRNAME}/{name}",

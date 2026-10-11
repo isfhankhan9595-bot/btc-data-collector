@@ -848,3 +848,360 @@ def test_uncertain_entries_are_never_opened_hashed_followed_or_modified(tmp_path
     assert not any(op == "stat" for (_n, op, _f) in calls), "an uncertain entry was stat()ed"
     assert _snapshot(tmp_path) == before
     assert outside.read_bytes() == b"outside-secret" and (d / legacy).read_bytes() == b"legacy-bytes"
+
+
+# ---------------------------------------------------------------- Part 2C: unknown is not absent
+#
+# 2C-A: a type probe that raises on an entry directly under ``raw/`` must not hide a possible
+#       stream directory (it used to be filed as UNRELATED).
+# 2C-B: ``marker_file_present`` is tri-state; a marker entry whose type probe raised is UNKNOWN
+#       presence, never confirmed absence (it used to become False -> UNCONFIRMED/NO_MARKER_FILE).
+
+_ROOT_OPS = ("is_symlink", "is_dir")        # the only probes the root-level loop makes
+_NOT_FOUND = "STREAM_NOT_FOUND"
+_UNINSPECTABLE = "STREAM_UNINSPECTABLE"
+_MARKER_UNKNOWN = "MARKER_PRESENCE_UNKNOWN"
+
+
+def _log_scandir(monkeypatch):
+    """Wrap whichever ``os.scandir`` is installed and return the list of directories listed."""
+    inner = sc.os.scandir
+    listed: list = []
+
+    def logged(path):
+        listed.append(os.fspath(path))
+        return inner(path)
+
+    monkeypatch.setattr(sc.os, "scandir", logged)
+    return listed
+
+
+def _reverse_listing(monkeypatch):
+    """Wrap the installed ``os.scandir`` so every directory is listed in reverse order."""
+    inner = sc.os.scandir
+
+    class _Rev:
+        def __init__(self, cm):
+            self._cm = cm
+
+        def __enter__(self):
+            return iter(list(self._cm.__enter__())[::-1])
+
+        def __exit__(self, *exc):
+            return self._cm.__exit__(*exc)
+
+    monkeypatch.setattr(sc.os, "scandir", lambda path: _Rev(inner(path)))
+
+
+def _forbid_io(monkeypatch, guarded_suffixes):
+    """Make open/read/hash/readlink impossible, and stat/lstat of the guarded paths."""
+    import io
+
+    def refuse(label):
+        def _raise(*a, **k):
+            raise AssertionError(f"forbidden operation on an uncertain entry: {label}")
+        return _raise
+
+    def guard(label, real):
+        def _wrapped(path, *a, **k):
+            if os.fspath(path).endswith(tuple(guarded_suffixes)):
+                raise AssertionError(f"forbidden operation on an uncertain entry: {label}({path!r})")
+            return real(path, *a, **k)
+        return _wrapped
+
+    monkeypatch.setattr(builtins, "open", refuse("builtins.open"))
+    monkeypatch.setattr(io, "open", refuse("io.open"))
+    monkeypatch.setattr(os, "open", refuse("os.open"))
+    monkeypatch.setattr(os, "readlink", refuse("os.readlink"))
+    monkeypatch.setattr(os, "stat", guard("os.stat", os.stat))
+    monkeypatch.setattr(os, "lstat", guard("os.lstat", os.lstat))
+
+
+# ---- 2C-A: root-level probe failure -------------------------------------------------------
+
+@pytest.mark.parametrize("op", _ROOT_OPS)
+def test_root_probe_failure_keeps_a_possible_stream_visible_and_is_not_scanned(tmp_path, monkeypatch, op):
+    _touch(_raw(tmp_path, "trades") / SEG, b"hidden-if-dropped")
+    _touch(_raw(tmp_path, "orderbook") / SEG, b"ok")
+    before = _snapshot(tmp_path)
+    calls = _fail_ops(monkeypatch, {"trades": {op}})
+    listed = _log_scandir(monkeypatch)
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()          # os.walk in _snapshot must see the real scandir
+
+    # not silently filed as anything: not "unrelated", not a directory/symlink/file category
+    assert not any(i.relative_path == "raw/trades" or i.relative_path.startswith("raw/trades/")
+                   for i in result.ignored)
+    # the failure is visible, with the entry's relative path and the probe that failed
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == "raw/trades"
+    assert warning.detail.startswith(f"{op}: OSError") and "simulated" in warning.detail
+    # claimed nothing about its type, and did not misreport it as absent or unlistable
+    assert {w.code for w in result.warnings} == {_META_FAILED}
+    assert result.unreadable_streams == ()
+    # semantic accuracy of streams_scanned: only what was actually listed
+    assert result.streams_scanned == ("orderbook",)
+    assert _paths(result) == ["raw/orderbook/" + SEG]
+    # never traversed, never followed, never stat()ed, and the probe sequence stopped at the failure
+    assert not any(p.endswith(os.path.join("raw", "trades")) for p in listed)
+    assert _probes(calls, "trades")[-1] == op and "is_file" not in _probes(calls, "trades")
+    assert "stat" not in _probes(calls, "trades")
+    assert all(follow is not True for (_n, _op, follow) in calls)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("op", _ROOT_OPS)
+def test_requested_stream_that_cannot_be_inspected_is_not_reported_as_not_found(tmp_path, monkeypatch, op):
+    _touch(_raw(tmp_path, "trades") / SEG)
+    _touch(_raw(tmp_path, "orderbook") / SEG)
+    _fail_ops(monkeypatch, {"trades": {op}})
+    result = discover_sources(tmp_path, streams=["trades", "orderbook", "absent"])
+
+    by_code: dict = {}
+    for w in result.warnings:
+        by_code.setdefault(w.code, []).append(w)
+    # the uninspectable request is "unknown", the genuinely absent one is still "not found"
+    assert [w.relative_path for w in by_code[_UNINSPECTABLE]] == ["raw/trades"]
+    assert [w.relative_path for w in by_code[_NOT_FOUND]] == ["raw/absent"]
+    assert [w.relative_path for w in by_code[_META_FAILED]] == ["raw/trades"]
+    assert set(by_code) == {_UNINSPECTABLE, _NOT_FOUND, _META_FAILED}
+    assert "unknown" in by_code[_UNINSPECTABLE][0].detail
+    assert result.streams_scanned == ("orderbook",) and result.unreadable_streams == ()
+    assert _paths(result) == ["raw/orderbook/" + SEG]
+
+
+def _mk_stream_dir(tmp_path):
+    _touch(_raw(tmp_path, "trades") / SEG)
+    return "trades"
+
+
+def _mk_non_stream_dir(tmp_path):
+    (tmp_path / "raw" / "some-dir").mkdir(parents=True)
+    return "some-dir"
+
+
+def _mk_regular_file(tmp_path):
+    _touch(tmp_path / "raw" / "notes.txt")
+    return "notes.txt"
+
+
+def _mk_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    _touch(outside / SEG, b"outside-secret")
+    (tmp_path / "raw").mkdir(exist_ok=True)
+    (tmp_path / "raw" / "linked").symlink_to(outside, target_is_directory=True)
+    return "linked"
+
+
+# A real symlink answers ``is_symlink() == True`` so ``is_dir`` is never reached for it: injecting
+# an ``is_dir`` fault there cannot fire and the entry is (correctly) a confirmed symlink.
+_ROOT_FAILURE_CASES = [
+    (build, op)
+    for build in (_mk_stream_dir, _mk_non_stream_dir, _mk_regular_file, _mk_symlink)
+    for op in _ROOT_OPS
+    if not (build is _mk_symlink and op == "is_dir")
+]
+
+
+@pytest.mark.parametrize("build,op", _ROOT_FAILURE_CASES)
+def test_root_entry_of_unverified_type_is_never_classified_followed_or_modified(tmp_path, monkeypatch, build, op):
+    _touch(_raw(tmp_path, "orderbook") / SEG)
+    name = build(tmp_path)
+    before = _snapshot(tmp_path)
+    calls = _fail_ops(monkeypatch, {name: {op}})
+    listed = _log_scandir(monkeypatch)
+    _forbid_io(monkeypatch, [os.path.join("raw", name), "outside"])
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    # whatever the entry really is, it is not claimed to be a symlink / directory / file / unrelated
+    assert not any(i.relative_path == f"raw/{name}" or i.relative_path.startswith(f"raw/{name}/")
+                   for i in result.ignored)
+    assert {w.code for w in result.warnings} == {_META_FAILED}, "no SYMLINK_NOT_FOLLOWED etc."
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == f"raw/{name}" and warning.detail.startswith(f"{op}: OSError")
+    assert result.streams_scanned == ("orderbook",) and result.unreadable_streams == ()
+    assert _paths(result) == ["raw/orderbook/" + SEG]
+    assert not any(p.endswith(os.path.join("raw", name)) for p in listed), "traversed an unknown entry"
+    assert all(follow is not True for (_n, _op, follow) in calls) and "stat" not in _probes(calls, name)
+    assert _snapshot(tmp_path) == before
+
+
+def test_confirmed_root_entries_keep_their_existing_classification(tmp_path):
+    _touch(_raw(tmp_path, "orderbook") / SEG)
+    _mk_symlink(tmp_path)                           # confirmed symlink
+    _touch(tmp_path / "raw" / "notes.txt")          # confirmed non-directory
+    (tmp_path / "raw" / "some-dir").mkdir()         # confirmed directory, not a stream name
+    result = discover_sources(tmp_path, streams=["orderbook", "linked", "notes", "absent"])
+
+    ign = _ignored(result)
+    assert ign["raw/linked"] is IgnoredCategory.SYMLINK
+    assert ign["raw/notes.txt"] is IgnoredCategory.UNRELATED
+    assert ign["raw/some-dir"] is IgnoredCategory.UNRECOGNIZED_DIRECTORY
+    assert result.streams_scanned == ("orderbook",)
+    # a confirmed symlink / absent stream is still definitely "not found"
+    not_found = sorted(w.relative_path for w in result.warnings if w.code == _NOT_FOUND)
+    assert not_found == ["raw/absent", "raw/linked", "raw/notes"]
+    assert [w.relative_path for w in result.warnings if w.code == "SYMLINK_NOT_FOLLOWED"] == ["raw/linked"]
+    assert not {w.code for w in result.warnings} & {_META_FAILED, _UNINSPECTABLE}
+
+
+@pytest.mark.parametrize("op", _ROOT_OPS)
+def test_root_probe_failure_results_are_deterministic(tmp_path, monkeypatch, op):
+    for stream in ("trades", "orderbook", "bybit_trades"):
+        _touch(_raw(tmp_path, stream) / SEG)
+    _touch(tmp_path / "raw" / "notes.txt")
+    _fail_ops(monkeypatch, {"trades": {op}, "notes.txt": {op}})
+    kwargs = {"streams": ["trades", "orderbook", "absent"]}
+    first = discover_sources(tmp_path, **kwargs)
+    assert discover_sources(tmp_path, **kwargs) == first
+    _reverse_listing(monkeypatch)
+    assert discover_sources(tmp_path, **kwargs) == first
+    unfiltered = discover_sources(tmp_path)
+    assert [w.relative_path for w in unfiltered.warnings if w.code == _META_FAILED] == [
+        "raw/notes.txt", "raw/trades"]
+
+
+# ---- 2C-B: marker presence is tri-state ---------------------------------------------------
+
+@pytest.mark.parametrize("op", _META_OPS)
+def test_marker_probe_failure_is_unknown_presence_not_confirmed_absence(tmp_path, monkeypatch, op):
+    d = _raw(tmp_path, "trades")
+    marker = SEG + ".meta.json"
+    _touch(d / SEG, b"payload")
+    _touch(d / marker, b"marker-bytes")
+    before = _snapshot(tmp_path)
+    calls = _fail_ops(monkeypatch, {marker: {op}})
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()          # os.walk in _snapshot must see the real scandir
+
+    rec = _by_name(result)[SEG]
+    assert rec.marker_file_present is None, "unknown evidence must not be labelled False"
+    assert rec.marker_file_present is not False and rec.marker_file_present is not True
+    assert rec.trust_state is TrustState.UNKNOWN and rec.trust_state is not TrustState.UNCONFIRMED
+    assert "NO_MARKER_FILE" not in rec.reasons
+    assert rec.reasons == (_MARKER_UNKNOWN,) and rec.warnings == (_MARKER_UNKNOWN,)
+    assert rec.size_bytes == len(b"payload"), "the segment itself was inspected fine"
+    assert rec.trust_state not in _PROVEN_STATES
+    # the marker entry is not classified as a marker (matched or orphan) and its failure is visible
+    assert _ignored(result)["raw/trades/" + marker] is IgnoredCategory.UNRELATED
+    assert not any(w.code == "ORPHAN_MARKER" for w in result.warnings)
+    (warning,) = _meta_warnings(result)
+    assert warning.relative_path == "raw/trades/" + marker and op in warning.detail
+    # its content is never read, it is never stat()ed or followed, and nothing is modified
+    assert _probes(calls, marker)[-1] == op and "stat" not in _probes(calls, marker)
+    assert all(follow is not True for (_n, _op, follow) in calls)
+    assert _snapshot(tmp_path) == before
+
+
+def test_marker_presence_distinguishes_present_absent_and_unknown(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    present, absent, unknown = ("2026-10-11-10-000000.seg", "2026-10-11-11-000000.seg",
+                                "2026-10-11-12-000000.seg")
+    for seg in (present, absent, unknown):
+        _touch(d / seg)
+    _touch(d / (present + ".meta.json"))
+    _touch(d / (unknown + ".meta.json"))
+    _fail_ops(monkeypatch, {unknown + ".meta.json": {"is_file"}})
+    by_name = _by_name(discover_sources(tmp_path))
+
+    assert by_name[present].marker_file_present is True
+    assert by_name[absent].marker_file_present is False
+    assert by_name[unknown].marker_file_present is None
+    assert (by_name[present].trust_state, by_name[present].reasons) == (
+        TrustState.UNKNOWN, ("MARKER_PRESENT_CONTENT_NOT_READ",))
+    assert (by_name[absent].trust_state, by_name[absent].reasons) == (
+        TrustState.UNCONFIRMED, ("NO_MARKER_FILE",))
+    assert (by_name[unknown].trust_state, by_name[unknown].reasons) == (
+        TrustState.UNKNOWN, (_MARKER_UNKNOWN,))
+
+
+def test_marker_failure_does_not_touch_other_segments_or_orphan_logic(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    _touch(d / SEG)
+    _touch(d / (SEG + ".meta.json"))
+    _touch(d / "2026-10-11-14-000001.seg.meta.json")               # genuine orphan marker
+    _fail_ops(monkeypatch, {SEG + ".meta.json": {"is_dir"}})
+    result = discover_sources(tmp_path)
+    orphans = [w.relative_path for w in result.warnings if w.code == "ORPHAN_MARKER"]
+    assert orphans == ["raw/trades/2026-10-11-14-000001.seg.meta.json"]
+    assert _ignored(result)["raw/trades/2026-10-11-14-000001.seg.meta.json"] is IgnoredCategory.MARKER_ORPHAN
+
+
+def test_marker_unknown_and_segment_stat_failure_keep_both_diagnostics(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    _touch(d / SEG)
+    _touch(d / (SEG + ".meta.json"))
+    _fail_ops(monkeypatch, {SEG: {"stat"}, SEG + ".meta.json": {"is_file"}})
+    rec = _by_name(discover_sources(tmp_path))[SEG]
+    assert rec.trust_state is TrustState.UNKNOWN and rec.size_bytes is None
+    assert rec.marker_file_present is None
+    assert set(rec.reasons) == {"STAT_FAILED", _MARKER_UNKNOWN}
+    assert set(rec.warnings) == {"STAT_FAILED", _MARKER_UNKNOWN}
+
+
+def test_marker_unknown_does_not_override_collision_or_invalid_name(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    _touch(d / LEGACY)
+    _touch(d / SEG)                                                  # same logical hour as LEGACY
+    bad = "2026-13-45-12-000001.seg"
+    _touch(d / bad)
+    _fail_ops(monkeypatch, {SEG + ".meta.json": {"is_symlink"}, bad + ".meta.json": {"is_dir"}})
+    _touch(d / (SEG + ".meta.json"))
+    _touch(d / (bad + ".meta.json"))
+    by_name = _by_name(discover_sources(tmp_path))
+
+    seg = by_name[SEG]
+    assert seg.trust_state is TrustState.AMBIGUOUS and seg.marker_file_present is None
+    assert seg.reasons == ("LEGACY_SEGMENT_COLLISION", _MARKER_UNKNOWN)
+    assert by_name[LEGACY].trust_state is TrustState.AMBIGUOUS
+    assert by_name[LEGACY].marker_file_present is False             # nothing uncertain about it
+    invalid = by_name[bad]
+    assert invalid.trust_state is TrustState.INVALID and invalid.marker_file_present is None
+    assert invalid.reasons == ("INVALID_DATE_OR_HOUR_IN_NAME", _MARKER_UNKNOWN)
+
+
+def test_unverified_symlink_marker_is_not_followed_read_or_counted(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    outside = _touch(tmp_path / "outside.bin", b"outside-secret")
+    marker = SEG + ".meta.json"
+    _touch(d / SEG, b"payload")
+    (d / marker).symlink_to(outside)                                 # really a symlink, but unverified
+    before = _snapshot(tmp_path)
+    calls = _fail_ops(monkeypatch, {marker: {"is_symlink"}})
+    _forbid_io(monkeypatch, [marker, "outside.bin"])
+    result = discover_sources(tmp_path)
+    monkeypatch.undo()
+
+    rec = _by_name(result)[SEG]
+    assert rec.marker_file_present is None and rec.trust_state is TrustState.UNKNOWN
+    assert not any(w.code == "SYMLINK_NOT_FOLLOWED" for w in result.warnings), "type must not be claimed"
+    assert all(follow is not True for (_n, _op, follow) in calls)
+    assert not any(op == "stat" and n == marker for (n, op, _f) in calls)
+    assert _snapshot(tmp_path) == before and outside.read_bytes() == b"outside-secret"
+
+
+def test_confirmed_marker_evidence_is_unchanged(tmp_path):
+    d = _raw(tmp_path, "trades")
+    outside = _touch(tmp_path / "outside.bin")
+    for seg in ("2026-10-11-10-000000.seg", "2026-10-11-11-000000.seg"):
+        _touch(d / seg)
+    (d / "2026-10-11-10-000000.seg.meta.json").symlink_to(outside)   # confirmed symlink: not evidence
+    (d / "2026-10-11-11-000000.seg.meta.json").mkdir()               # confirmed directory: not a file
+    for rec in discover_sources(tmp_path).records:
+        assert rec.marker_file_present is False
+        assert (rec.trust_state, rec.reasons) == (TrustState.UNCONFIRMED, ("NO_MARKER_FILE",))
+
+
+def test_marker_unknown_results_are_deterministic(tmp_path, monkeypatch):
+    d = _raw(tmp_path, "trades")
+    for hour in (10, 11):
+        seg = f"2026-10-11-{hour}-000000.seg"
+        _touch(d / seg)
+        _touch(d / (seg + ".meta.json"))
+    _fail_ops(monkeypatch, {"2026-10-11-11-000000.seg.meta.json": {"is_file"}})
+    first = discover_sources(tmp_path)
+    assert discover_sources(tmp_path) == first
+    _reverse_listing(monkeypatch)
+    assert discover_sources(tmp_path) == first
+    assert [r.marker_file_present for r in first.records] == [True, None]
