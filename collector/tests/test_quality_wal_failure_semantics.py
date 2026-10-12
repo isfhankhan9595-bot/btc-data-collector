@@ -343,3 +343,54 @@ def test_events_queued_but_undrained_at_shutdown_are_recovered_by_the_next_start
         got += [r["reason"] for r in pq.read_table(f).to_pylist()]
     assert "never_drained" in got
     app2.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for uncertain storage outcomes.
+# ---------------------------------------------------------------------------
+
+def test_partial_write_failure_latches_wal_before_any_later_append(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="p")
+    real = wal._handle
+
+    class PartialThenFail:
+        def write(self, value):
+            real.write(value[:7])
+            raise OSError(28, "ENOSPC after partial write")
+        def flush(self):
+            return real.flush()
+        def fileno(self):
+            return real.fileno()
+        def close(self):
+            return real.close()
+
+    wal._handle = PartialThenFail()
+    with pytest.raises(OSError, match="partial write"):
+        wal.append(_ev("partial"))
+    assert wal.write_failed is True
+    wal._handle.flush()
+    before = wal._active_path.stat().st_size
+    with pytest.raises(OSError, match="write-failed state"):
+        wal.append(_ev("must-not-follow-partial-tail"))
+    wal.close()
+    assert wal._active_path.stat().st_size == before
+    assert wal._active_path.read_bytes() == b'{"excha'
+
+
+def test_checkpoint_directory_fsync_failure_keeps_in_memory_checkpoint_and_wal(tmp_path, monkeypatch):
+    wal = QualityEventWAL(tmp_path, process_start_marker="p")
+    wal.append(_ev("published-before-checkpoint"))
+    wal_file = wal._active_path
+    monkeypatch.setattr(qw, "_fsync_directory",
+                        lambda path: (_ for _ in ()).throw(OSError(5, "directory fsync EIO")))
+
+    with pytest.raises(OSError, match="directory fsync"):
+        wal.checkpoint(up_to_seq=1)
+
+    assert wal.checkpointed_seq == -1
+    assert wal_file.exists()                      # evidence was not deleted
+    assert wal_file.read_text(encoding="utf-8").count("\\n") == 1
+    monkeypatch.undo()
+    wal.checkpoint(up_to_seq=1)                    # retry must not silently no-op
+    assert wal.checkpointed_seq == 1
+    wal.close()
