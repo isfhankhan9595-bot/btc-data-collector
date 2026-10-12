@@ -287,3 +287,21 @@ def test_startup_recovery_stops_checkpointing_at_first_persist_failure(tmp_path)
     assert pending_reasons == {"r2_fails", "r3"}
     rows = _quality_rows(tmp_path)
     assert {r["reason"] for r in rows} == {"r1"}
+
+
+def test_capacity_rejected_websocket_event_is_force_published_without_fake_wal_id(tmp_path):
+    app = _minimal_app(tmp_path)
+    wal = app._quality_wal
+    wal.max_total_bytes = 1     # event cannot fit; no WAL bytes may be appended
+
+    app._websocket_quality_event(QualityEventType.ERROR, "capacity-fallback")
+    app._websocket_quality_event(QualityEventType.ERROR, "capacity-fallback-again")
+
+    rows = _quality_rows(tmp_path)
+    assert {row["reason"] for row in rows} == {
+        "capacity-fallback", "capacity-fallback-again"}
+    assert all(row["quality_event_id"] is None for row in rows)
+    assert wal.capacity_exhausted is True
+    assert wal._total_wal_bytes() == 0    # rejection is pre-write, not a partial event
+    app.quality_writer.close()
+    wal.close()
