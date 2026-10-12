@@ -46,6 +46,7 @@ The ordering tests wrap each real ``close()`` (they call through) so order is ob
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import stat
 import time as _real_time
@@ -100,12 +101,48 @@ def clock(monkeypatch):
     return c
 
 
+def _pin_quality_hour(a):
+    """Pin the quality writer's DEFAULT hour source to the hour it was constructed in.
+
+    ``ParquetWriter.write()`` rolls the segment over when the wall-clock hour changes. The 500-, 537- and
+    1,000-row tests perform many fsyncs; if the real clock crossed an hour boundary part-way through one,
+    it would roll over mid-burst and its exact segment/checkpoint assertions would fail intermittently.
+    The pin is INSTANCE-level on this one app's writer (no ``datetime`` patch, no class patch), so it
+    cannot leak into another test, and a test that sets its own ``w._get_current_hour_str`` simply
+    replaces it (the dedicated rollover tests do exactly that)."""
+    pinned = a.quality_writer.current_hour
+    a.quality_writer._get_current_hour_str = lambda: pinned
+
+
 @pytest.fixture
 def app(tmp_path, clock):
     """Real app, production batching constants, on the test clock. Torn down like a process exit."""
     a = BybitCollectorApp(data_dir=str(tmp_path))
+    _pin_quality_hour(a)
     yield a
     _crash(a)
+
+
+class _RecordingLogger:
+    """Records ``logger.error(event, **fields)`` calls of ``run_bybit_collector`` and still delegates."""
+
+    def __init__(self, real):
+        self._real = real
+        self.errors: list[tuple[str, dict]] = []
+
+    def error(self, event, *args, **fields):
+        self.errors.append((event, fields))
+        return self._real.error(event, *args, **fields)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def logged(monkeypatch):
+    recorder = _RecordingLogger(rbc.logger)
+    monkeypatch.setattr(rbc, "logger", recorder)
+    return recorder
 
 
 # ----------------------------------------------------------------------------- disk readers
@@ -273,7 +310,8 @@ async def test_the_idle_task_starts_via_run_and_publishes_a_quiet_event_without_
         await asyncio.gather(runner, return_exceptions=True)
 
 
-async def test_shutdown_cancels_and_awaits_the_idle_task(app, clock, tmp_path, monkeypatch):
+async def test_shutdown_requests_idle_task_cancellation_and_the_task_then_finishes_cancelled(
+        app, clock, tmp_path, monkeypatch, logged):
     monkeypatch.setattr(rbc, "QUALITY_IDLE_TICK_SECONDS", 0.01)
     app.client = _StubClient()
     runner = asyncio.create_task(app.run())
@@ -284,8 +322,11 @@ async def test_shutdown_cancels_and_awaits_the_idle_task(app, clock, tmp_path, m
 
         await app.shutdown()
 
-        assert task.done() and task.cancelled()                     # cancelled AND already awaited to completion
         assert app._quality_idle_task is None
+        assert task.cancelling() > 0                                # shutdown REQUESTED cancellation; it does not wait
+        await asyncio.gather(task, return_exceptions=True)          # advance the loop: the request is delivered
+        assert task.done() and task.cancelled()                     # finished cancelled ...
+        assert [e for e, _ in logged.errors if e == "bybit_quality_idle_publisher_failed"] == []   # ... and cleanly
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
@@ -458,6 +499,103 @@ def test_a_failed_idle_publication_is_replayed_once_with_original_ids_after_a_re
         _crash(app2)
 
 
+def _blocked_logs(logged):
+    return [fields for event, fields in logged.errors if event == "bybit_quality_checkpoint_blocked"]
+
+
+def test_idle_ticks_after_a_terminal_writer_failure_neither_re_log_nor_re_alert_nor_re_ask_the_writer(
+        app, clock, faults, tmp_path, _alerts, logged, monkeypatch):
+    _persist(app, 3, "storm-")
+    wal = _wal_records(tmp_path)
+    ids, seqs = {w["quality_event_id"] for w in wal}, {w["seq"] for w in wal}
+    publish_calls = []
+    real_publish = app.quality_writer.publish_if_due
+
+    def counting_publish():
+        publish_calls.append(1)
+        return real_publish()
+    monkeypatch.setattr(app.quality_writer, "publish_if_due", counting_publish)
+
+    faults.fail_segment_rename = True
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()                                           # tick 1: the REAL publication failure
+
+    assert faults.segment_rename_hits == 1 and len(publish_calls) == 1
+    assert app.quality_degraded is not None                                 # the terminal latch the guard keys on
+    assert [f["reason"] for f in _blocked_logs(logged)] == ["idle_publish_failed:FatalStorageError"]
+    assert len([m for m in _alerts if "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]" in m]) == 1
+    errors_after_first, alerts_after_first = list(logged.errors), list(_alerts)
+
+    for _ in range(10):                                                     # ten more one-second idle ticks
+        clock.advance(1.0)
+        app._quality_publish_if_due()
+
+    assert logged.errors == errors_after_first                              # no further error log of any kind
+    assert len(_blocked_logs(logged)) == 1
+    assert _alerts == alerts_after_first                                    # no further operator alert
+    assert len(publish_calls) == 1                                          # the FAILED writer is not asked again
+    # the original failure is neither swallowed nor rewritten
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "idle_publish_failed:FatalStorageError"
+    status = app.quality_channel_status()
+    assert status["quality_degraded"] is True and status["quality_checkpoint_blocked"] is True
+    assert status["quality_failure"]["stage"] == "rename"
+    with pytest.raises(FatalStorageError):                                  # the writer itself still refuses
+        real_publish()
+    # every original WAL record is recoverable and the checkpoint never moved
+    assert _segs(tmp_path) == [] and _rows(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+    assert app._quality_wal_inflight == seqs
+    assert {e["quality_event_id"] for e in _pending(tmp_path)} == ids
+
+
+def test_a_failed_writer_idle_ticked_many_times_still_replays_every_record_once_after_a_restart(
+        app, clock, faults, tmp_path):
+    _persist(app, 3, "storm-replay-")
+    originals = {w["quality_event_id"]: w["reason"] for w in _wal_records(tmp_path)}
+    faults.fail_segment_rename = True
+    clock.set_elapsed(30.0)
+    for _ in range(6):
+        app._quality_publish_if_due()
+        clock.advance(1.0)
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+    _crash(app)
+
+    faults.fail_segment_rename = False
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))
+    try:
+        rows = [r for r in _rows(tmp_path) if r["quality_event_id"] in originals]
+        assert {r["quality_event_id"]: r["reason"] for r in rows} == originals and len(rows) == 3
+        assert [e for e in _pending(tmp_path) if e["quality_event_id"] in originals] == []
+        assert _disk_ckpt(tmp_path) >= max(_seq(i) for i in originals)
+    finally:
+        _crash(app2)
+
+
+def test_a_blocked_checkpoint_does_not_stop_a_healthy_writer_from_publishing_idle_tails(
+        app, clock, tmp_path, _alerts):
+    """The guard keys on the writer's TERMINAL failure, not on a blocked checkpoint: ``quality_channel_status``
+    documents the two as independent, and a blocked checkpoint is not a failed writer."""
+    _persist(app, 3, "healthy-a-")
+    app._block_quality_checkpoint("test_injected_block")                    # the real latch; the WRITER is untouched
+    assert app.quality_degraded is None and app._quality_checkpoint_blocked is True
+
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()
+    assert len(_segs(tmp_path)) == 1
+    assert sorted(r["reason"] for r in _rows(tmp_path)) == [f"healthy-a-{i}" for i in range(3)]
+    assert _disk_ckpt(tmp_path) == -1                                       # published, never checkpointed
+
+    _persist(app, 2, "healthy-b-")                                          # later eligible events keep publishing
+    clock.advance(30.0)
+    app._quality_publish_if_due()
+    assert len(_segs(tmp_path)) == 2
+    assert sorted(r["reason"] for r in _rows(tmp_path)) == sorted(
+        [f"healthy-a-{i}" for i in range(3)] + [f"healthy-b-{i}" for i in range(2)])
+    assert app.quality_degraded is None and _disk_ckpt(tmp_path) == -1
+    assert len(_pending(tmp_path)) == 5                                     # the WAL still holds all five (replayed at restart)
+    assert len([m for m in _alerts if "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]" in m]) == 1
+
+
 def test_a_failed_write_triggered_publication_raises_and_nothing_is_checkpointed(app, faults, tmp_path, _alerts):
     faults.fail_segment_rename = True
     _persist(app, 499)                                                      # buffered; no publication yet
@@ -573,6 +711,26 @@ def test_a_checkpoint_write_failure_on_segment_1_cannot_be_skipped_by_a_later_su
 
 
 # ---------------------------------------------------------------- B. hour rollover attribution
+def test_the_app_fixture_pins_the_quality_writer_hour_so_a_clock_hour_change_cannot_roll_a_burst_over(
+        app, tmp_path, monkeypatch):
+    calls = _spy_durable(app, tmp_path)
+    w = app.quality_writer
+    pinned = w.current_hour
+    assert "_get_current_hour_str" in vars(w)                               # instance-level, not a class/global patch
+    # The wall clock now reports a different hour (class-level, THIS test only; undone by monkeypatch).
+    # The fixture's instance-level pin must win over it.
+    monkeypatch.setattr(pw.ParquetWriter, "_get_current_hour_str", lambda self: "2099-01-01-00")
+    _persist(app, 537)                                                      # the 537-row burst, across the 500 boundary
+    assert w.current_hour == pinned                                         # no hourly rollover happened
+    assert len(calls) == 1 and calls[0]["record_count"] == 500              # only the 500-row boundary published
+    assert len(app._quality_wal_inflight) == 37
+
+    # Control: without the pin, the very same clock WOULD have rolled the writer over (the old flake).
+    del w.__dict__["_get_current_hour_str"]
+    app._persist_quality_event(_ev("after-unpin"))
+    assert w.current_hour == "2099-01-01-00" and len(calls) == 2            # the 37 buffered rows were published by it
+
+
 def test_hour_rollover_binds_each_event_to_the_segment_that_really_contains_it(app, tmp_path):
     calls = _spy_durable(app, tmp_path)
     w = app.quality_writer
@@ -1060,30 +1218,168 @@ async def test_a_directory_fsync_failure_at_shutdown_is_never_checkpointed_and_r
         _crash(app2)
 
 
-async def test_the_idle_task_is_retired_and_awaited_before_the_first_writer_close(
+async def test_the_idle_task_cancellation_is_requested_before_the_first_writer_close(
         app, clock, tmp_path, monkeypatch):
     runner, task = await _start_running(app, monkeypatch)
     try:
         _persist(app, 2, "retire-")
         seqs = {w["seq"] for w in _wal_records(tmp_path)}
-        order = _record_close_order(app, monkeypatch, probe=task.done)
+        order = _record_close_order(app, monkeypatch, probe=lambda: (app.running, task.cancelling() > 0))
 
         await app.shutdown()
 
         assert [name for name, _ in order][-2:] == ["quality_writer", "wal"] and len(order) == 8
-        assert all(idle_done is True for _, idle_done in order)     # already finished at EVERY close
-        assert task.cancelled() and app._quality_idle_task is None
-        assert _seqs_in_segment(_segs(tmp_path)[0]) == seqs and len(_segs(tmp_path)) == 1
+        # the shutdown state was set AND cancellation of the idle task had been requested at EVERY close
+        assert all(state == (False, True) for _, state in order)
+        assert app._quality_idle_task is None
+
+        await asyncio.gather(task, return_exceptions=True)          # deterministic: deliver the request
+        assert task.cancelled()
+        # the idle task published nothing of its own: the one close-time segment, checkpointed once
+        assert len(_segs(tmp_path)) == 1 and _seqs_in_segment(_segs(tmp_path)[0]) == seqs
         assert _disk_ckpt(tmp_path) == max(seqs)
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
 
 
+async def test_shutdown_on_the_synchronous_stop_path_never_suspends_so_cancellation_cannot_skip_a_writer_close(
+        app, clock, tmp_path, monkeypatch):
+    """M1 regression. ``shutdown()`` used to ``await`` the idle publisher's retirement even when ``client.stop()``
+    is synchronous (the production ``WebSocketClient``). A cancellation delivered at that new suspension
+    point skipped every writer close. Now the idle publisher is retired by a NON-suspending cancellation
+    request, so on this path ``shutdown()`` runs to completion without ever yielding to the event loop."""
+    runner, task = await _start_running(app, monkeypatch)
+    ticks = []
+    real_tick = app._quality_publish_if_due
+    monkeypatch.setattr(app, "_quality_publish_if_due", lambda: (ticks.append(1), real_tick())[1])
+    try:
+        _persist(app, 3, "nosuspend-")
+        seqs = {w["seq"] for w in _wal_records(tmp_path)}
+
+        coroutine = app.shutdown()
+        try:
+            coroutine.send(None)                # drive shutdown() to its FIRST suspension point, if it has one
+        except StopIteration:
+            pass                                # it completed without suspending
+        else:
+            coroutine.close()
+            pytest.fail("shutdown() suspended on the synchronous client.stop() path: a cancellation delivered "
+                        "at that suspension would skip every writer close")
+
+        assert app.running is False
+        for name in (*_SIX_OTHER_WRITERS, "quality_writer"):
+            assert getattr(app, name)._closed is True, name
+        assert app._quality_wal._closed is True
+        assert len(_segs(tmp_path)) == 1 and _seqs_in_segment(_segs(tmp_path)[0]) == seqs
+        assert _disk_ckpt(tmp_path) == max(seqs) and app._quality_wal_inflight == set()
+        # cancellation was REQUESTED (not awaited): the loop has not yet delivered it
+        assert app._quality_idle_task is None and task.cancelling() > 0 and not task.done()
+        ticks_at_exit = len(ticks)
+
+        await asyncio.gather(task, return_exceptions=True)          # advance the event loop deterministically
+        await asyncio.sleep(0.05)                                   # several would-be ticks (0.01 s each)
+        assert task.cancelled()
+        assert len(ticks) == ticks_at_exit                          # no idle tick ran after shutdown began
+        assert len(_segs(tmp_path)) == 1 and _disk_ckpt(tmp_path) == max(seqs)   # nothing published after closure
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+async def test_a_cancellation_requested_while_the_idle_wakeup_is_already_queued_runs_no_further_tick(
+        app, clock, tmp_path, monkeypatch):
+    """The same-event-loop argument, executed. ``QUALITY_IDLE_TICK_SECONDS = 0`` turns the loop's sleep into a
+    bare yield, so whenever this test runs the idle task is ALREADY re-queued to run its next tick body.
+    Requesting cancellation at that moment must still prevent that tick: asyncio throws ``CancelledError``
+    into the task instead of resuming it, so no statement after the sleep executes."""
+    monkeypatch.setattr(rbc, "QUALITY_IDLE_TICK_SECONDS", 0)
+    ticks = []
+    real_tick = app._quality_publish_if_due
+    monkeypatch.setattr(app, "_quality_publish_if_due", lambda: (ticks.append(1), real_tick())[1])
+    app.client = _StubClient()
+    runner = asyncio.create_task(app.run())
+    try:
+        await _until(lambda: len(ticks) >= 3)                       # the idle loop is spinning
+        task = app._quality_idle_task
+        _persist(app, 3, "queued-")
+        seqs = {w["seq"] for w in _wal_records(tmp_path)}
+        ticks_before = len(ticks)
+
+        app._request_quality_idle_publisher_stop()                  # synchronous: no await, no loop turn
+        clock.set_elapsed(30.0)                                     # the tail is now DUE: any further tick publishes it
+
+        await asyncio.gather(task, return_exceptions=True)          # let the loop deliver the cancellation
+        assert task.cancelled() and len(ticks) == ticks_before
+        assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1 and app._quality_wal_inflight == seqs
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+async def _capture_loop_problems():
+    """Collect what the event loop's exception handler is given (e.g. 'Task exception was never retrieved')."""
+    problems = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: problems.append(context))
+    return problems
+
+
+async def test_an_idle_task_that_had_already_failed_is_reported_and_its_exception_is_retrieved(
+        app, tmp_path, logged):
+    problems = await _capture_loop_problems()
+    try:
+        async def idle_loop_that_died():
+            raise RuntimeError("idle publisher exploded")
+        task = asyncio.create_task(idle_loop_that_died())
+        app._quality_idle_task = task
+        await asyncio.wait({task})                                  # finished; nobody has retrieved the failure yet
+        assert task.done() and not task.cancelled()
+
+        await app.shutdown()                                        # contained: reported, and shutdown completes
+
+        failed = [fields for event, fields in logged.errors if event == "bybit_quality_idle_publisher_failed"]
+        assert len(failed) == 1 and "RuntimeError: idle publisher exploded" in failed[0]["error"]
+        assert app._quality_idle_task is None
+        assert app.quality_writer._closed is True and app._quality_wal._closed is True
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        assert problems == []                                       # no "Task exception was never retrieved"
+    finally:
+        asyncio.get_running_loop().set_exception_handler(None)
+
+
+async def test_an_idle_task_that_fails_while_being_cancelled_is_observed_not_leaked(app, tmp_path, logged):
+    problems = await _capture_loop_problems()
+    try:
+        async def fails_when_cancelled():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise RuntimeError("failed while being cancelled")
+        task = asyncio.create_task(fails_when_cancelled())
+        await asyncio.sleep(0)                                      # started and suspended in its sleep
+        app._quality_idle_task = task
+
+        await app.shutdown()                                        # requests cancellation; does not wait for it
+        await asyncio.wait({task})                                  # the loop delivers it; the task FAILS instead
+        await asyncio.sleep(0)                                      # let the done-callback run
+
+        failed = [fields for event, fields in logged.errors if event == "bybit_quality_idle_publisher_failed"]
+        assert len(failed) == 1 and "RuntimeError: failed while being cancelled" in failed[0]["error"]
+        assert app._quality_idle_task is None
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        assert problems == []
+    finally:
+        asyncio.get_running_loop().set_exception_handler(None)
+
+
 async def test_cancelling_shutdown_while_client_stop_is_suspended_propagates_cancellation_and_closes_nothing(
         app, tmp_path, monkeypatch):
     client = _GatedStopClient()
-    runner, _ = await _start_running(app, monkeypatch, client)
+    runner, idle = await _start_running(app, monkeypatch, client)
     try:
         _persist(app, 3, "cancel-")
         ids = {w["quality_event_id"] for w in _wal_records(tmp_path)}
@@ -1094,6 +1390,7 @@ async def test_cancelling_shutdown_while_client_stop_is_suspended_propagates_can
         with pytest.raises(asyncio.CancelledError):                 # cancellation propagates; it is not swallowed
             await shutdown_task
         assert shutdown_task.cancelled()
+        assert idle.cancelling() > 0 and app._quality_idle_task is None    # requested before shutdown could suspend
 
         for name in (*_SIX_OTHER_WRITERS, "quality_writer"):        # nothing was closed prematurely
             assert getattr(app, name)._closed is False, name
@@ -1102,26 +1399,24 @@ async def test_cancelling_shutdown_while_client_stop_is_suspended_propagates_can
         assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
     finally:
         client.release.set()
-        idle = getattr(app, "_quality_idle_task", None)             # never leak the background task out of a test
-        if idle is not None:
-            idle.cancel()
-            await asyncio.gather(idle, return_exceptions=True)
+        idle.cancel()                                               # never leak the background task out of a test
+        await asyncio.gather(idle, return_exceptions=True)
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
 
 
-async def test_cancelling_shutdown_during_an_async_client_stop_retires_the_idle_publisher_before_it_propagates(
+async def test_cancelling_shutdown_during_an_async_client_stop_leaves_no_idle_publisher_able_to_publish(
         app, clock, tmp_path, monkeypatch):
     """Regression: ``shutdown()`` cancelled while awaiting an asynchronous ``client.stop()``.
 
-    ``CancelledError`` is not an ``Exception``, so it used to skip ``_stop_quality_idle_publisher()``. The
-    idle task then outlived ``shutdown()``: ``shutdown()`` has set ``running = False``, but the loop still
-    runs one more tick body after its sleep, so it published the due tail and moved the WAL checkpoint AFTER
-    shutdown had already raised, with the writers and the WAL still open.
+    The idle publisher must not outlive that cancelled shutdown and publish or checkpoint after it raised,
+    with the writers and the WAL still open. Its cancellation is requested synchronously at the START of
+    ``shutdown()`` (before the first suspension point), so it is already in force when the client stop is
+    suspended and cannot be skipped by the ``CancelledError`` that is not an ``Exception``.
 
     Made deterministic (no race on the real tick): the tick is 0.2 s and the test synchronises to just after
-    a tick, marks the batch due, and cancels shutdown within microseconds -- the idle task is therefore
-    mid-sleep, and would wake and publish ~0.2 s later if it were still alive."""
+    a tick, marks the batch due, and cancels shutdown within microseconds -- the idle task would wake and
+    publish ~0.2 s later if it were still alive."""
     monkeypatch.setattr(rbc, "QUALITY_IDLE_TICK_SECONDS", 0.2)
     ticks = []
     real_tick = app._quality_publish_if_due
@@ -1142,15 +1437,15 @@ async def test_cancelling_shutdown_during_an_async_client_stop_retires_the_idle_
         clock.set_elapsed(30.0)                                      # the age threshold is reached: the next tick WOULD publish
         shutdown_task = asyncio.create_task(app.shutdown())
         await asyncio.wait_for(client.entered.wait(), 5.0)           # suspended inside the ASYNCHRONOUS client.stop()
-        assert not idle.done() and app.running is False
+        assert app.running is False and idle.cancelling() > 0        # cancellation was requested before the suspension
 
         shutdown_task.cancel()
         with pytest.raises(asyncio.CancelledError):                  # cancellation still propagates
             await shutdown_task
         assert shutdown_task.cancelled()
 
-        # the idle publisher was retired AND awaited before the cancellation propagated
-        assert idle.done() and idle.cancelled() and app._quality_idle_task is None
+        await asyncio.gather(idle, return_exceptions=True)           # deliver the request deterministically
+        assert idle.cancelled() and app._quality_idle_task is None
         # nothing was closed prematurely
         for name in (*_SIX_OTHER_WRITERS, "quality_writer"):
             assert getattr(app, name)._closed is False, name
