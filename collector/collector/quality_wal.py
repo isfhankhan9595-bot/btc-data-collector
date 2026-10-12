@@ -542,7 +542,7 @@ def _safe_max_seq_in_file(wal_file: Path) -> Optional[int]:
         text = raw.decode("utf-8", errors="strict")
     except (OSError, UnicodeDecodeError):
         return None
-    if not text.endswith("\\n"):
+    if not text.endswith("\n"):
         return None
     highest = -1
     for line in text.splitlines():
