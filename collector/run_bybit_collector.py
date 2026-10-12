@@ -1153,9 +1153,16 @@ class BybitCollectorApp:
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("bybit_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
-        # Ingestion has stopped. Retire the idle publisher before any writer is closed:
-        # the quality_writer close below publishes the final partial batch itself.
-        await self._stop_quality_idle_publisher()
+        finally:
+            # Ingestion has stopped. Retire the idle publisher before any writer is closed:
+            # the quality_writer close below publishes the final partial batch itself.
+            # This is a ``finally`` because ``CancelledError`` is not an ``Exception``: if
+            # shutdown() is cancelled while awaiting an asynchronous ``client.stop()`` it
+            # skips the ``except`` above, and without this the idle task would outlive
+            # shutdown() and could publish and checkpoint after shutdown() had raised.
+            # The cancellation still propagates (the writers and the WAL are then left
+            # open, and the WAL stays the recovery source).
+            await self._stop_quality_idle_publisher()
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")

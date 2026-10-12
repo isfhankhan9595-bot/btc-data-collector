@@ -1110,6 +1110,69 @@ async def test_cancelling_shutdown_while_client_stop_is_suspended_propagates_can
         await asyncio.gather(runner, return_exceptions=True)
 
 
+async def test_cancelling_shutdown_during_an_async_client_stop_retires_the_idle_publisher_before_it_propagates(
+        app, clock, tmp_path, monkeypatch):
+    """Regression: ``shutdown()`` cancelled while awaiting an asynchronous ``client.stop()``.
+
+    ``CancelledError`` is not an ``Exception``, so it used to skip ``_stop_quality_idle_publisher()``. The
+    idle task then outlived ``shutdown()``: ``shutdown()`` has set ``running = False``, but the loop still
+    runs one more tick body after its sleep, so it published the due tail and moved the WAL checkpoint AFTER
+    shutdown had already raised, with the writers and the WAL still open.
+
+    Made deterministic (no race on the real tick): the tick is 0.2 s and the test synchronises to just after
+    a tick, marks the batch due, and cancels shutdown within microseconds -- the idle task is therefore
+    mid-sleep, and would wake and publish ~0.2 s later if it were still alive."""
+    monkeypatch.setattr(rbc, "QUALITY_IDLE_TICK_SECONDS", 0.2)
+    ticks = []
+    real_tick = app._quality_publish_if_due
+
+    def counting_tick():
+        ticks.append(1)
+        real_tick()
+    monkeypatch.setattr(app, "_quality_publish_if_due", counting_tick)
+    client = _GatedStopClient()
+    app.client = client
+    runner = asyncio.create_task(app.run())
+    try:
+        await _until(lambda: len(ticks) >= 1)                        # the idle task has just ticked; it is now asleep
+        idle = app._quality_idle_task
+        _persist(app, 3, "regress-")
+        wal = _wal_records(tmp_path)
+        ids, seqs = {w["quality_event_id"] for w in wal}, {w["seq"] for w in wal}
+        clock.set_elapsed(30.0)                                      # the age threshold is reached: the next tick WOULD publish
+        shutdown_task = asyncio.create_task(app.shutdown())
+        await asyncio.wait_for(client.entered.wait(), 5.0)           # suspended inside the ASYNCHRONOUS client.stop()
+        assert not idle.done() and app.running is False
+
+        shutdown_task.cancel()
+        with pytest.raises(asyncio.CancelledError):                  # cancellation still propagates
+            await shutdown_task
+        assert shutdown_task.cancelled()
+
+        # the idle publisher was retired AND awaited before the cancellation propagated
+        assert idle.done() and idle.cancelled() and app._quality_idle_task is None
+        # nothing was closed prematurely
+        for name in (*_SIX_OTHER_WRITERS, "quality_writer"):
+            assert getattr(app, name)._closed is False, name
+        assert app._quality_wal._closed is False
+
+        # no background task advances the checkpoint after shutdown has exited: outwait several ticks
+        await asyncio.sleep(0.6)
+        assert len(ticks) == 1                                       # the idle loop never ticked again
+        assert _segs(tmp_path) == [] and _rows(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+        # unresolved WAL data is untouched and recoverable; the tail is still in flight, not lost or published
+        assert {e["quality_event_id"] for e in _pending(tmp_path)} == ids
+        assert app._quality_wal_inflight == seqs
+    finally:
+        client.release.set()
+        leaked = getattr(app, "_quality_idle_task", None)            # never leak a background task out of a test
+        if leaked is not None:
+            leaked.cancel()
+            await asyncio.gather(leaked, return_exceptions=True)
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
 async def test_shutdown_closes_the_other_writers_first_then_the_quality_writer_and_only_then_the_wal(
         app, tmp_path, monkeypatch):
     app.client = _StubClient()
