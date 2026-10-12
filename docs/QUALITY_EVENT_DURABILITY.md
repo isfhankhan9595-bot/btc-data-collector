@@ -20,8 +20,11 @@ For each append, the WAL calculates the UTF-8 JSONL record size including its ne
 the current aggregate `.wal` bytes before writing. WAL-owned `seq` and `quality_event_id` fields
 cannot be overridden by event data. If the candidate would cross the limit, or the aggregate size
 cannot be safely measured, that record is refused **before bytes are written**, no WAL ID is issued,
-and admission is latched closed until process restart. Startup with an already-at/over-budget WAL
-also keeps admission closed; evidence is never deleted, truncated, rewritten or silently skipped.
+and admission is latched closed until process restart. After a successful full recovery pass, runners
+may remove files that are strictly validated and already covered by the durable checkpoint. If the
+remaining WAL is at/over budget, cannot be measured, or recovery fails, unverified files are preserved
+and admission remains fail-closed when the cap condition is detected. Uncheckpointed, corrupt or
+unterminated records are never deleted to meet the limit.
 
 When the cap is latched, runners route new quality events through the existing synchronous
 `ParquetWriter.write()` plus immediate `publish_open_segment()` fallback. Those rows have no
