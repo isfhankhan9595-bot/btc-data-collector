@@ -389,7 +389,7 @@ def test_checkpoint_directory_fsync_failure_keeps_in_memory_checkpoint_and_wal(t
 
     assert wal.checkpointed_seq == -1
     assert wal_file.exists()                      # evidence was not deleted
-    assert wal_file.read_text(encoding="utf-8").count("\\n") == 1
+    assert wal_file.read_text(encoding="utf-8").count("\n") == 1
     monkeypatch.undo()
     wal.checkpoint(up_to_seq=1)                    # retry must not silently no-op
     assert wal.checkpointed_seq == 1
