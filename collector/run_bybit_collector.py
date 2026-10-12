@@ -111,6 +111,19 @@ def _topics() -> list[str]:
     ]
 
 
+#: P0-3 quality-event batching for the Bybit quality writer. These deliberately
+#: equal ``run_collector.QUALITY_SEGMENT_ROWS`` / ``QUALITY_SEGMENT_SECONDS`` (the
+#: Futures reference; a test pins the equality) but are defined here so this runner
+#: does not import the Futures runner. Was segment_rows=1 / segment_seconds=1 = one
+#: Parquet file per quality event.
+QUALITY_SEGMENT_ROWS = 500
+QUALITY_SEGMENT_SECONDS = 30.0
+#: How often the idle publisher looks for a due batch. ``segment_seconds`` is only
+#: evaluated inside ``ParquetWriter.write()``, so a quiet stream needs this tick.
+#: Worst-case publication delay of a buffered event = SECONDS + this tick.
+QUALITY_IDLE_TICK_SECONDS = 1.0
+
+
 class BybitCollectorApp:
     def __init__(self, data_dir: str = "data", url: str = BYBIT_PUBLIC_WS_URL,
                 enable_segment_dedup: bool = True) -> None:
@@ -120,14 +133,22 @@ class BybitCollectorApp:
         # checkpoint advances only from on_segment_durable, i.e. after the
         # segment holding the event is published (fsync + rename + directory
         # fsync). The state is set up BEFORE the writer exists because the
-        # writer's hook references it. Segmenting is deliberately UNCHANGED
-        # (segment_rows=1 / segment_seconds=1): P0-3 batching is not part of
-        # this change, so each write() still publishes its own segment.
+        # writer's hook references it.
+        #
+        # P0-3: batched (was segment_rows=1 / segment_seconds=1 = one Parquet
+        # file per event). Batching means write() no longer implies "durable",
+        # which is safe ONLY because every WAL-protected event is appended to the
+        # WAL before it is buffered and the checkpoint advances solely from
+        # on_segment_durable. ``age_from_first_row`` makes the time threshold run
+        # from the first buffered row, and ``_quality_idle_task`` (started in
+        # run()) publishes a quiet tail via ``publish_if_due()``.
         self._init_quality_durability_state()
+        self._quality_idle_task = None
         self.quality_writer = ParquetWriter(
             "bybit_quality_events", QUALITY_EVENTS_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", segment_rows=1, segment_seconds=1,
-            on_segment_durable=self._on_quality_segment_durable)
+            exchange="BYBIT", segment_rows=QUALITY_SEGMENT_ROWS,
+            segment_seconds=QUALITY_SEGMENT_SECONDS,
+            on_segment_durable=self._on_quality_segment_durable, age_from_first_row=True)
         # Replays anything a previous process left un-checkpointed. Needs only
         # quality_writer, which exists now. It must run before the other writers
         # are built: their constructors can report orphan recovery through
@@ -717,6 +738,53 @@ class BybitCollectorApp:
                                                      record_admitted=True)
                 raise
 
+    def _quality_publish_if_due(self) -> None:
+        """Idle tick (parity with run_collector.CollectorApp._quality_publish_if_due).
+
+        ``segment_seconds`` is only evaluated inside ``write()``, so a stream that goes
+        quiet would otherwise keep its tail in RAM. A publish failure is never turned
+        into success: the checkpoint is latched closed (the buffered events stay in the
+        WAL, uncheckpointed, for the next start to replay) and a typed fatal of this
+        runner's quality channel degrades it, exactly as a failing write() does."""
+        try:
+            self.quality_writer.publish_if_due()
+        except Exception as exc:  # noqa: BLE001
+            self._block_quality_checkpoint(f"idle_publish_failed:{type(exc).__name__}")
+            self._note_quality_writer_failure(exc)
+
+    async def _quality_idle_publish_loop(self) -> None:
+        """Background tick: call ``_quality_publish_if_due`` every
+        ``QUALITY_IDLE_TICK_SECONDS`` while the app runs. Everything the tick does is
+        synchronous (no await between reading and publishing), so it cannot interleave
+        with ``_persist_quality_event``. A failure never ends the loop; cancellation does."""
+        while self.running:
+            await asyncio.sleep(QUALITY_IDLE_TICK_SECONDS)
+            try:
+                self._quality_publish_if_due()
+            except Exception as exc:  # noqa: BLE001 - the tick must outlive any single failure
+                logger.error("bybit_quality_idle_publish_tick_failed",
+                             error=f"{type(exc).__name__}: {exc}")
+
+    def _start_quality_idle_publisher(self) -> None:
+        task = getattr(self, "_quality_idle_task", None)
+        if task is None or task.done():
+            self._quality_idle_task = asyncio.create_task(self._quality_idle_publish_loop())
+
+    async def _stop_quality_idle_publisher(self) -> None:
+        """Cancel and AWAIT the idle publisher so no background task outlives shutdown
+        unobserved. Never raises (an error in the task is logged); if shutdown itself is
+        cancelled the cancellation propagates."""
+        task = getattr(self, "_quality_idle_task", None)
+        self._quality_idle_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        result = (await asyncio.gather(task, return_exceptions=True))[0]
+        if isinstance(result, Exception):
+            logger.error("bybit_quality_idle_publisher_failed",
+                         error=f"{type(result).__name__}: {result}")
+
     def _note_quality_writer_failure(self, exc: BaseException) -> None:
         """Latch the quality channel degraded when ITS writer raised a typed fatal.
 
@@ -1066,6 +1134,7 @@ class BybitCollectorApp:
     async def run(self) -> None:
         self.running = True
         self._disk_task = asyncio.create_task(self._storage_pressure_loop())
+        self._start_quality_idle_publisher()
         await self.client.start()
 
     async def shutdown(self) -> None:
@@ -1084,6 +1153,9 @@ class BybitCollectorApp:
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("bybit_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
+        # Ingestion has stopped. Retire the idle publisher before any writer is closed:
+        # the quality_writer close below publishes the final partial batch itself.
+        await self._stop_quality_idle_publisher()
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")

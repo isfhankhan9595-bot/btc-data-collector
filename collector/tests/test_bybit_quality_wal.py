@@ -76,7 +76,15 @@ def _ms(dt) -> int:
 
 
 def _app(root):
-    return BybitCollectorApp(data_dir=str(root))
+    """Real constructor + real recovery, with the quality writer pinned to one-row segments.
+
+    Bybit batches quality rows in production (P0-3: 500 rows / 30 s, like Futures). The tests
+    in this module exercise WAL/checkpoint/failure semantics at the publication boundary, which
+    fires at write() time with one-row segments (the same idiom run_collector's tests use).
+    Batched behaviour itself is covered by tests/test_bybit_quality_batching.py."""
+    app = BybitCollectorApp(data_dir=str(root))
+    app.quality_writer.segment_rows = 1
+    return app
 
 
 def _crash(app):

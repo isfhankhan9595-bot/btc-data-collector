@@ -68,7 +68,9 @@ def alerts():
 
 # --------------------------------------------------------------------------- helpers
 def _app(tmp_path) -> BybitCollectorApp:
-    return BybitCollectorApp(data_dir=str(tmp_path))
+    app = BybitCollectorApp(data_dir=str(tmp_path))
+    app.quality_writer.segment_rows = 1   # P0-3: Bybit batches in production; see test_bybit_quality_batching.py
+    return app
 
 
 def _ob_frame(typ: str, update_id: int, seq: int, *, bid: str = "1.0", ts: int | None = None) -> str:

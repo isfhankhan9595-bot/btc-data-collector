@@ -31,7 +31,9 @@ from collector.run_bybit_collector import BybitCollectorApp, _topics
 
 
 def _app(tmp_path):
-    return BybitCollectorApp(data_dir=str(tmp_path))
+    app = BybitCollectorApp(data_dir=str(tmp_path))
+    app.quality_writer.segment_rows = 1   # P0-3: Bybit batches in production; see test_bybit_quality_batching.py
+    return app
 
 
 class _FakeSocket:

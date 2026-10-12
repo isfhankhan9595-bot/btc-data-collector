@@ -74,15 +74,15 @@ def alerts():
 def _make(kind, tmp_path, monkeypatch):
     tmp_path.mkdir(parents=True, exist_ok=True)
     app = _build(kind, tmp_path, monkeypatch)
-    if kind == "usdm":
-        # Futures batches quality rows (500/segment). One-row segments reproduce the Bybit shape,
-        # where write() itself publishes the segment and then opens the next one.
-        app.quality_writer.segment_rows = 1
+    # Both venues batch quality rows (500/segment, P0-3). These tests' subject is accounting at the
+    # publication boundary, which fires at write() time with one-row segments, so both venues are
+    # pinned to that shape. Batched behaviour: _make_batched here and test_bybit_quality_batching.py.
+    app.quality_writer.segment_rows = 1
     return app
 
 
 def _make_batched(kind, tmp_path, monkeypatch):
-    """Futures as shipped (batched): an unprotected event reaches disk via publish_open_segment()."""
+    """Venue as shipped (batched): an unprotected event reaches disk via publish_open_segment()."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     return _build(kind, tmp_path, monkeypatch)
 

@@ -86,6 +86,7 @@ class Rig:
     def _new_app(self):
         if self.kind == "bybit":
             app = BybitCollectorApp(data_dir=str(self.root))      # real constructor + real recovery
+            app.quality_writer.segment_rows = 1   # P0-3: Bybit batches in production; see test_bybit_quality_batching.py
         else:
             app = _minimal_app(self.root)
         self._apps.append(app)

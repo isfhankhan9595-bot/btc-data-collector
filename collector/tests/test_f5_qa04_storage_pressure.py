@@ -608,6 +608,7 @@ class _StubBybitClient:
 
 def _real_bybit(tmp_path):
     app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
+    app.quality_writer.segment_rows = 1   # P0-3: Bybit batches in production; see test_bybit_quality_batching.py
     app.client = _StubBybitClient()
     return app
 
@@ -755,6 +756,7 @@ class Harness:
             _stub_futures_network(self.app, self.events)
         else:
             self.app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
+            self.app.quality_writer.segment_rows = 1   # P0-3: Bybit batches in production; see test_bybit_quality_batching.py
             self.app.client = _StubBybitClient(self.events)
         self.app.storage_pressure._usage = self.disk
         self.app.storage_pressure._clock = self.clock
