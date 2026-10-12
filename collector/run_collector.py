@@ -868,16 +868,6 @@ class CollectorApp:
         wal = getattr(self, "_quality_wal", None)
         if wal is not None:
             try:
-                # Once the cap is latched, publish directly through the durable
-                # Parquet path; no unbounded queue and no false WAL-backed ID.
-                if getattr(wal, "capacity_exhausted", False):
-                    event["_wal_capacity_exhausted"] = True
-                    self._note_quality_wal_capacity_exhausted(
-                        reason=wal.capacity_reason,
-                        current_bytes=getattr(wal, "_capacity_current_bytes", None),
-                        limit_bytes=wal.max_total_bytes)
-                    self._persist_quality_event(event)
-                    return
                 event_type_value = event_type.value if isinstance(event_type, QualityEventType) else event_type
                 event_id = wal.append({**event, "event_type": event_type_value})
             except QualityWALCapacityExceeded as wal_exc:
