@@ -26,20 +26,30 @@ test waits for 30 real seconds. The proxy is installed BEFORE the app is constru
 segment-open timestamp is on the same clock.
 
 This file is a reconstruction of work lost from a previous workspace; it is not byte-identical to it.
+
+Stage 2A (failure durability and checkpoint ordering) is appended below the Stage 1 tests. It injects
+faults at the two real filesystem boundaries -- ``os.replace`` of a segment (publication) and of
+``checkpoint.json.tmp`` (checkpoint write) -- and uses the real ``_on_quality_segment_durable`` callback
+and the real ``QualityEventWAL.checkpoint``. Nothing mocks a checkpoint value or the publish method.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _real_time
 
+import pyarrow.parquet as pq
 import pytest
 
 import collector.collector.parquet_writer as pw
 import collector.run_bybit_collector as rbc
 import collector.run_collector as rc
+from collector.collector import notifications
+from collector.collector.storage_errors import FatalStorageError
 from collector.run_bybit_collector import BybitCollectorApp
 from collector.tests.test_bybit_quality_wal import (
     _crash, _disk_ckpt, _ev, _pending, _qdir, _rows, _wal_records)
+from collector.tests.test_parquet_writer_publication_failure import expect_fatal
 
 
 # ----------------------------------------------------------------------------- deterministic clock
@@ -291,3 +301,314 @@ def test_idle_ticks_with_no_pending_rows_create_no_empty_segments_and_do_not_mov
     assert _segs(tmp_path) == [seg]                                 # no second (empty) segment
     assert _disk_ckpt(tmp_path) == ckpt
     assert len(_rows(tmp_path)) == 1
+
+
+# =========================================================================================== STAGE 2A
+# Failure durability and checkpoint ordering. Segment boundaries are the real ones: the 500th buffered
+# row publishes a segment from inside write(); the idle tick publishes a due tail; an hour change
+# publishes the old segment before the next row is bound. Faults are injected where the filesystem
+# would fail, so the real callback / WAL / latch code runs.
+@pytest.fixture(autouse=True)
+def _alerts():
+    """Capture operator alerts (no real notification backend in tests) so they can be asserted."""
+    sent: list[str] = []
+    notifications.set_notifier(notifications.CallableNotifier(lambda message: sent.append(message) or True))
+    yield sent
+    notifications.set_notifier(None)
+
+
+class _Faults:
+    """Deterministic, switchable faults at the real publication / checkpoint-write boundaries.
+
+    ``os.replace`` is wrapped (restored by monkeypatch teardown). Only a ``*.seg.tmp`` source (segment
+    publication) or ``checkpoint.json.tmp`` (WAL checkpoint write) can fail, and only while armed, so a
+    test can let segment 1 publish and fail segment 2. ``*_hits`` prove the fault really fired."""
+
+    def __init__(self, monkeypatch):
+        self.fail_segment_rename = False
+        self.fail_checkpoint_replace = False
+        self.segment_rename_hits = 0
+        self.checkpoint_replace_hits = 0
+        real = os.replace
+
+        def replace(src, dst, *a, **kw):
+            name = str(src)
+            if self.fail_segment_rename and name.endswith(".seg.tmp"):
+                self.segment_rename_hits += 1
+                raise OSError(28, "No space left on device (injected segment rename)")
+            if self.fail_checkpoint_replace and name.endswith("checkpoint.json.tmp"):
+                self.checkpoint_replace_hits += 1
+                raise OSError(5, "I/O error (injected checkpoint replace)")
+            return real(src, dst, *a, **kw)
+        monkeypatch.setattr(os, "replace", replace)
+
+
+@pytest.fixture
+def faults(monkeypatch):
+    return _Faults(monkeypatch)
+
+
+def _spy_durable(app, root):
+    """Wrap (do not replace) the real durable callback: record what it was handed, then run it.
+
+    The production wiring is asserted FIRST: wrapping would otherwise mask a missing or wrong callback
+    in the constructor, which is exactly what these ordering tests must be able to detect."""
+    assert app.quality_writer.on_segment_durable == app._on_quality_segment_durable, \
+        "quality_writer must be wired to the real durable callback in production"
+    calls = []
+    real = app._on_quality_segment_durable
+
+    def spy(path, record_count):
+        call = {"path": path, "record_count": record_count,
+                "bound": set(app._quality_segment_seqs),          # seqs attributed to THIS segment
+                "inflight_before": set(app._quality_wal_inflight),
+                "ckpt_before": _disk_ckpt(root)}
+        calls.append(call)
+        real(path, record_count)
+        call["ckpt_after"] = _disk_ckpt(root)
+    app.quality_writer.on_segment_durable = spy
+    return calls
+
+
+def _seqs_in_segment(path):
+    return {_seq(r["quality_event_id"]) for r in pq.read_table(path).to_pylist()}
+
+
+def _tmps(root):
+    return sorted(_qdir(root).glob("*.seg.tmp"))
+
+
+def _seq_range(wal, lo, hi):
+    """Seqs of the WAL records at append positions lo..hi-1 (0-based positions, not seq values)."""
+    return {w["seq"] for w in wal[lo:hi]}
+
+
+# ---------------------------------------------------------------- A. actual publication failure
+def test_a_failed_idle_publication_is_not_success_and_leaves_every_record_recoverable(
+        app, clock, faults, tmp_path, _alerts):
+    _persist(app, 3, "idle-")
+    wal = _wal_records(tmp_path)
+    ids = {w["quality_event_id"] for w in wal}
+    seqs = {w["seq"] for w in wal}
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1             # buffered, WAL-appended, in flight
+
+    faults.fail_segment_rename = True
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()                                           # the real idle-tick body
+
+    assert faults.segment_rename_hits == 1                                  # the publication really failed
+    # not reported as published or durable
+    assert _segs(tmp_path) == [] and _rows(tmp_path) == []
+    assert len(_tmps(tmp_path)) == 1                                        # writer contract: .tmp left for orphan recovery
+    assert not list(_qdir(tmp_path).glob("*.meta.json"))                    # no publication marker for an unpublished segment
+    # not checkpointed; still in flight and attributed to the segment that failed
+    assert _disk_ckpt(tmp_path) == -1
+    assert app._quality_wal_inflight == seqs and app._quality_segment_seqs == seqs
+    assert {e["quality_event_id"] for e in _pending(tmp_path)} == ids       # every record recoverable, original ids
+    # the existing latch / observability behaviour
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "idle_publish_failed:FatalStorageError"
+    status = app.quality_channel_status()
+    assert status["quality_degraded"] is True and status["quality_checkpoint_blocked"] is True
+    assert status["quality_checkpoint_block_reason"] == "idle_publish_failed:FatalStorageError"
+    assert status["quality_failure"]["stage"] == "rename"
+    assert len([m for m in _alerts if "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]" in m]) == 1
+    # the FAILED writer can never look like a healthy idle stream
+    with pytest.raises(FatalStorageError):
+        app.quality_writer.publish_if_due()
+    app._quality_publish_if_due()                                           # tick is observed, not raised, not a success
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+    assert len([m for m in _alerts if "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]" in m]) == 1   # alerted once
+
+
+def test_a_failed_idle_publication_is_replayed_once_with_original_ids_after_a_restart(
+        app, clock, faults, tmp_path):
+    _persist(app, 3, "replay-")
+    originals = {w["quality_event_id"]: w["reason"] for w in _wal_records(tmp_path)}
+    faults.fail_segment_rename = True
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+    _crash(app)
+
+    faults.fail_segment_rename = False
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))          # real startup recovery, production batching
+    try:
+        rows = [r for r in _rows(tmp_path) if r["quality_event_id"] in originals]
+        assert {r["quality_event_id"]: r["reason"] for r in rows} == originals     # once each, same ids
+        assert len(rows) == 3
+        assert [e for e in _pending(tmp_path) if e["quality_event_id"] in originals] == []   # now checkpointed
+        assert _disk_ckpt(tmp_path) >= max(_seq(i) for i in originals)
+        assert app2._quality_checkpoint_blocked is False
+    finally:
+        _crash(app2)
+
+
+def test_a_failed_write_triggered_publication_raises_and_nothing_is_checkpointed(app, faults, tmp_path, _alerts):
+    faults.fail_segment_rename = True
+    _persist(app, 499)                                                      # buffered; no publication yet
+    assert faults.segment_rename_hits == 0 and _disk_ckpt(tmp_path) == -1
+
+    with expect_fatal(OSError, stage="rename") as info:
+        app._persist_quality_event(_ev("the-500th"))                        # this row fills the segment
+    assert "No space left" in str(info.value.__cause__)                     # the original error is chained
+    assert faults.segment_rename_hits == 1
+
+    wal = _wal_records(tmp_path)
+    assert len(wal) == 500                                                  # the tripping event is WAL-backed too
+    assert _segs(tmp_path) == [] and _rows(tmp_path) == [] and len(_tmps(tmp_path)) == 1
+    assert _disk_ckpt(tmp_path) == -1
+    assert {e["seq"] for e in _pending(tmp_path)} == {w["seq"] for w in wal}
+    assert app._quality_wal_inflight == {w["seq"] for w in wal}
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "quality_writer_write_failed"
+    assert app.quality_degraded is not None
+    assert len([m for m in _alerts if "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]" in m]) == 1
+
+
+# ---------------------------------------------------------------- B. rollover ordering
+def test_rollover_first_segment_checkpoints_only_its_own_sequences_and_the_next_stays_in_flight(
+        app, clock, tmp_path):
+    calls = _spy_durable(app, tmp_path)
+    _persist(app, 537)                                                      # 500 + 37 across the real 500-row boundary
+    wal = _wal_records(tmp_path)
+    first, second = _seq_range(wal, 0, 500), _seq_range(wal, 500, 537)
+    assert len(first) == 500 and len(second) == 37 and not first & second
+
+    # the first segment's callback: attributed to exactly its own 500 sequences
+    (call,) = calls
+    assert call["record_count"] == 500
+    assert call["bound"] == first == _seqs_in_segment(call["path"])         # callback attribution == file contents
+    assert call["inflight_before"] == first                                 # the 501st did not exist yet
+    assert call["ckpt_before"] == -1 and call["ckpt_after"] == wal[499]["seq"]
+    # ...and nothing beyond it
+    assert _disk_ckpt(tmp_path) == wal[499]["seq"] < wal[500]["seq"]
+    assert app._quality_wal_inflight == second == app._quality_segment_seqs
+    assert [e["seq"] for e in _pending(tmp_path)] == [w["seq"] for w in wal[500:]]
+    assert len(_segs(tmp_path)) == 1
+
+    # the next segment resolves only through its own durable publication
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()
+    assert len(calls) == 2 and len(_segs(tmp_path)) == 2
+    assert calls[1]["bound"] == second == _seqs_in_segment(calls[1]["path"])
+    assert calls[1]["ckpt_before"] == wal[499]["seq"] and calls[1]["ckpt_after"] == wal[536]["seq"]
+    assert _seqs_in_segment(calls[0]["path"]).isdisjoint(_seqs_in_segment(calls[1]["path"]))
+    assert app._quality_wal_inflight == set() and _pending(tmp_path) == []
+
+
+def test_second_segment_publication_failure_keeps_the_checkpoint_at_the_first_segments_boundary(
+        app, faults, tmp_path):
+    calls = _spy_durable(app, tmp_path)
+    _persist(app, 500, "s1-")                                               # segment 1 publishes cleanly
+    (first_call,) = calls
+    wal = _wal_records(tmp_path)
+    seg1_last = wal[499]["seq"]
+    assert _disk_ckpt(tmp_path) == seg1_last
+
+    faults.fail_segment_rename = True                                       # segment 2 cannot be published
+    _persist(app, 499, "s2-")
+    assert faults.segment_rename_hits == 0 and _disk_ckpt(tmp_path) == seg1_last   # buffered: no movement
+    with expect_fatal(OSError, stage="rename"):
+        app._persist_quality_event(_ev("s2-499"))                           # the 1000th row trips the publish
+    assert faults.segment_rename_hits == 1
+
+    wal = _wal_records(tmp_path)
+    seg2 = _seq_range(wal, 500, 1000)
+    assert len(wal) == 1000 and len(seg2) == 500
+    assert len(calls) == 1                                                  # the durable callback never ran for segment 2
+    # published evidence: only segment 1 is on disk, and it is intact
+    assert _segs(tmp_path) == [first_call["path"]]
+    assert _seqs_in_segment(first_call["path"]) == _seq_range(wal, 0, 500)
+    assert len(_tmps(tmp_path)) == 1
+    # the checkpoint stays exactly at the first unresolved sequence minus one -- not -1, not further
+    assert _disk_ckpt(tmp_path) == seg1_last == min(seg2) - 1
+    assert app._quality_wal_inflight == seg2 and app._quality_segment_seqs == seg2
+    assert {e["seq"] for e in _pending(tmp_path)} == seg2
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "quality_writer_write_failed"
+
+    # nothing afterwards can publish or advance past it: the writer is FAILED
+    with pytest.raises(FatalStorageError):
+        app.quality_writer.publish_open_segment()
+    app._persist_quality_event(_ev("after-failure"))                        # latched channel: WAL copy only
+    assert _disk_ckpt(tmp_path) == seg1_last and len(_segs(tmp_path)) == 1
+    assert max(e["seq"] for e in _pending(tmp_path)) > max(seg2)            # WAL-retained, still uncheckpointed
+
+
+def test_a_checkpoint_write_failure_on_segment_1_cannot_be_skipped_by_a_later_successful_segment(
+        app, faults, tmp_path):
+    calls = _spy_durable(app, tmp_path)
+    faults.fail_checkpoint_replace = True
+    _persist(app, 500, "c1-")                                               # segment 1 publishes; its checkpoint write fails
+    assert faults.checkpoint_replace_hits == 1 and len(_segs(tmp_path)) == 1
+    assert _disk_ckpt(tmp_path) == -1
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "checkpoint_write_failed:OSError"
+    assert app._quality_wal_inflight == set()                               # published => resolved in memory...
+
+    faults.fail_checkpoint_replace = False                                  # ...and the disk is healthy again
+    _persist(app, 500, "c2-")                                               # segment 2 publishes successfully
+    assert len(calls) == 2 and len(_segs(tmp_path)) == 2
+    assert faults.checkpoint_replace_hits == 1                              # the latch stopped any second attempt
+    # a later successful callback did NOT checkpoint over the earlier, unresolved prefix
+    assert _disk_ckpt(tmp_path) == -1 and calls[1]["ckpt_after"] == -1
+    wal = _wal_records(tmp_path)
+    assert {e["seq"] for e in _pending(tmp_path)} == {w["seq"] for w in wal}   # all 1000 replay (at-least-once)
+    assert len(_rows(tmp_path)) == 1000
+
+
+# ---------------------------------------------------------------- B. hour rollover attribution
+def test_hour_rollover_binds_each_event_to_the_segment_that_really_contains_it(app, tmp_path):
+    calls = _spy_durable(app, tmp_path)
+    w = app.quality_writer
+    hour = {"now": w.current_hour}
+    w._get_current_hour_str = lambda: hour["now"]                           # instance-level, scoped to this app
+    _persist(app, 3, "h1-")
+    assert _segs(tmp_path) == [] and len(calls) == 0
+
+    hour["now"] = "2099-01-01-00"                                           # the writer rolls over on the next write
+    app._persist_quality_event(_ev("h2-0"))
+
+    wal = _wal_records(tmp_path)
+    old, new = _seq_range(wal, 0, 3), _seq_range(wal, 3, 4)
+    (call,) = calls                                                         # the old segment was published by the rollover
+    # the event that triggered the rollover was WAL-appended and in flight when the old segment
+    # published, but it is NOT in that segment
+    assert call["inflight_before"] == old | new
+    assert call["bound"] == old == _seqs_in_segment(call["path"])
+    assert call["ckpt_after"] == wal[2]["seq"] < wal[3]["seq"]
+    assert app._quality_segment_seqs == new == app._quality_wal_inflight
+    assert [e["quality_event_id"] for e in _pending(tmp_path)] == [wal[3]["quality_event_id"]]
+
+    w.publish_open_segment()                                                # the new segment contains exactly the new event
+    assert len(calls) == 2 and calls[1]["bound"] == new == _seqs_in_segment(calls[1]["path"])
+    assert _disk_ckpt(tmp_path) == wal[3]["seq"] and app._quality_wal_inflight == set()
+
+
+# ---------------------------------------------------------------- B. defence in depth (seeded, NOT reachable)
+def test_defence_in_depth_callback_never_checkpoints_past_an_earlier_in_flight_sequence(app, tmp_path):
+    """Seeded state -- by design NOT reachable through single-writer operation.
+
+    ``_on_quality_segment_durable`` computes ``min(inflight) - 1``. For a lower, unresolved seq to
+    coexist with a later published one, a later event would have to be written and published while an
+    earlier one is WAL-appended-but-never-written. ``_persist_quality_event`` is synchronous and every
+    failure path latches the writer FAILED, so that cannot happen; the real mechanisms that withhold the
+    checkpoint are the latch (see the checkpoint-write test above) and the FAILED writer. This test pins
+    the formula itself: a REAL WAL record is appended and held in flight, then the real writer publishes
+    later events through the real callback."""
+    app._persist_quality_event(_ev("before"))                               # seq a
+    stuck = app._quality_wal.append({**_ev("stuck"), "event_type": "ERROR",
+                                     "local_ts": 1, "local_process_ts": 1})  # seq a+1: WAL-appended, never written
+    stuck_seq = _seq(stuck)
+    app._quality_wal_inflight.add(stuck_seq)
+    app._persist_quality_event(_ev("after"))                                # seq a+2
+    wal = _wal_records(tmp_path)
+    assert [w["reason"] for w in wal] == ["before", "stuck", "after"]
+
+    app.quality_writer.publish_open_segment()                               # real publication; real callback
+
+    assert [r["reason"] for r in _rows(tmp_path)] == ["before", "after"]    # both published...
+    assert app._quality_wal_inflight == {stuck_seq}
+    assert _disk_ckpt(tmp_path) == wal[0]["seq"]                            # ...but the checkpoint stops BEFORE `stuck`
+    assert [e["reason"] for e in _pending(tmp_path)] == ["stuck", "after"]  # `after` replays (at-least-once); `stuck` is kept
