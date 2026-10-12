@@ -496,6 +496,8 @@ def test_startup_cleanup_removes_only_fully_checkpointed_valid_wal_files(tmp_pat
     previous.close()
     old_active = previous._active_path
     assert old_active.exists()
+    assert QualityEventWAL.recover(tmp_path) == []   # full recovery validation succeeded
+    QualityEventWAL.cleanup_fully_checkpointed_files(tmp_path)
 
     restarted = QualityEventWAL(
         tmp_path, process_start_marker="restarted", max_total_bytes=256)
@@ -514,8 +516,8 @@ def test_startup_cleanup_preserves_any_corrupt_or_unterminated_wal_file(tmp_path
     with old_active.open("ab") as handle:
         handle.write(b"{corrupt-tail}\n")
 
+    with pytest.raises(QualityWALCorruption):
+        QualityEventWAL.recover(tmp_path)       # failed recovery forbids cleanup
     restarted = QualityEventWAL(tmp_path, process_start_marker="restarted")
     assert old_active.exists()
-    with pytest.raises(QualityWALCorruption):
-        QualityEventWAL.recover(tmp_path)
     restarted.close()
