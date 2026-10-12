@@ -31,12 +31,18 @@ Stage 2A (failure durability and checkpoint ordering) is appended below the Stag
 faults at the two real filesystem boundaries -- ``os.replace`` of a segment (publication) and of
 ``checkpoint.json.tmp`` (checkpoint write) -- and uses the real ``_on_quality_segment_durable`` callback
 and the real ``QualityEventWAL.checkpoint``. Nothing mocks a checkpoint value or the publish method.
+
+Stage 2B-1 (WAL-cap fallback under batching) is appended after Stage 2A. The WAL's aggregate cap is
+closed through its real admission arithmetic (``QualityEventWAL.append`` refuses the record itself, or
+the startup check latches from the on-disk size), and the app's real capacity-fallback branch, writer,
+durable callback and checkpoint then run unmodified.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import time as _real_time
+from collections import Counter
 
 import pyarrow.parquet as pq
 import pytest
@@ -45,10 +51,11 @@ import collector.collector.parquet_writer as pw
 import collector.run_bybit_collector as rbc
 import collector.run_collector as rc
 from collector.collector import notifications
+from collector.collector.quality_wal import ENV_MAX_TOTAL_BYTES
 from collector.collector.storage_errors import FatalStorageError
 from collector.run_bybit_collector import BybitCollectorApp
 from collector.tests.test_bybit_quality_wal import (
-    _crash, _disk_ckpt, _ev, _pending, _qdir, _rows, _wal_records)
+    _crash, _disk_ckpt, _ev, _pending, _qdir, _rows, _wal_for, _wal_records)
 from collector.tests.test_parquet_writer_publication_failure import expect_fatal
 
 
@@ -612,3 +619,264 @@ def test_defence_in_depth_callback_never_checkpoints_past_an_earlier_in_flight_s
     assert app._quality_wal_inflight == {stuck_seq}
     assert _disk_ckpt(tmp_path) == wal[0]["seq"]                            # ...but the checkpoint stops BEFORE `stuck`
     assert [e["reason"] for e in _pending(tmp_path)] == ["stuck", "after"]  # `after` replays (at-least-once); `stuck` is kept
+
+
+# =========================================================================================== STAGE 2B-1
+# WAL-cap fallback under batching. A quality event the WAL cap refuses has no WAL record, id or sequence;
+# ``_persist_quality_event`` writes it into the CURRENT open segment (next to any buffered WAL-backed
+# rows) and force-publishes that segment at once. Because the segment's WAL seqs are bound at write time
+# and the fallback row binds none, the durable callback checkpoints exactly the WAL-backed rows that
+# really were published -- and, as for any publication, only up to min(in-flight) - 1.
+def _cap_wal_at_current_size(app):
+    """Close WAL admission through the real admission arithmetic: the cap equals the bytes already on
+    disk, so the next record cannot fit (``current + size > max``) and ``QualityEventWAL.append`` itself
+    refuses it and latches. No flag is set and ``append`` is not replaced."""
+    wal = app._quality_wal
+    wal.max_total_bytes = wal._total_wal_bytes()
+    assert wal.capacity_exhausted is False          # nothing has latched yet: the next append must do it
+    return wal
+
+
+def _backed_seqs(path):
+    """WAL seqs of a published segment's rows; a cap-fallback row carries no WAL id and has none."""
+    return {_seq(r["quality_event_id"]) for r in pq.read_table(path).to_pylist()
+            if r["quality_event_id"] is not None}
+
+
+def _alert_count(alerts, marker):
+    return len([m for m in alerts if marker in m])
+
+
+def test_a_cap_refused_event_joins_the_open_batch_and_publishes_it_without_a_fabricated_wal_id(
+        app, tmp_path, _alerts):
+    calls = _spy_durable(app, tmp_path)
+    _persist(app, 3, "wal-")                                                # buffered, WAL-appended, in flight
+    wal_before = _wal_records(tmp_path)
+    seqs = {w["seq"] for w in wal_before}
+    wal = _cap_wal_at_current_size(app)
+    bytes_before, counter_before = wal._total_wal_bytes(), wal._seq
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+
+    app._persist_quality_event(_ev("fallback"))
+
+    # the real admission refused it: no WAL record, id or sequence exists for the event
+    assert wal.capacity_exhausted is True and wal.capacity_reason == "aggregate_budget_exhausted"
+    assert _wal_records(tmp_path) == wal_before and wal._total_wal_bytes() == bytes_before
+    assert wal._seq == counter_before == max(seqs)
+    assert _wal_for(tmp_path, "fallback") == []
+    # the fallback published at once (4 rows, far below 500 rows / 30 s): the event is neither dropped nor deferred
+    (seg,) = _segs(tmp_path)
+    rows = pq.read_table(seg).to_pylist()
+    assert [r["reason"] for r in rows] == ["wal-0", "wal-1", "wal-2", "fallback"]       # once each, in order
+    assert [r["quality_event_id"] for r in rows[:3]] == [w["quality_event_id"] for w in wal_before]
+    assert rows[3]["quality_event_id"] is None
+    # attribution and ordering: the callback bound exactly the WAL-backed rows, then the checkpoint covered them
+    (call,) = calls
+    assert call["record_count"] == 4
+    assert call["bound"] == seqs == _backed_seqs(seg)
+    assert call["inflight_before"] == seqs
+    assert call["ckpt_before"] == -1 and call["ckpt_after"] == max(seqs) == _disk_ckpt(tmp_path)
+    assert app._quality_wal_inflight == set() and app._quality_segment_seqs == set()
+    assert _pending(tmp_path) == []                                         # nothing for a restart to replay or duplicate
+    # observability: capacity exhaustion is reported, and it is NOT a storage failure or a loss
+    status = app.quality_channel_status()
+    assert status["quality_wal_capacity_exhausted"] is True
+    assert status["quality_wal_capacity_reason"] == "aggregate_budget_exhausted"
+    assert status["quality_degraded"] is False and status["quality_checkpoint_blocked"] is False
+    assert (status["quality_events_lost"], status["quality_events_wal_only"],
+            status["quality_events_wal_unconfirmed"]) == (0, 0, 0)
+    assert _alert_count(_alerts, "QUALITY WAL CAPACITY EXHAUSTED [BYBIT]") == 1
+    assert _alert_count(_alerts, "CHECKPOINT BLOCKED") == 0
+
+
+def test_each_later_cap_refused_event_publishes_alone_exactly_once_and_never_moves_the_checkpoint(
+        app, tmp_path, _alerts):
+    calls = _spy_durable(app, tmp_path)
+    _persist(app, 2, "wal-")
+    wal = _cap_wal_at_current_size(app)
+    app._persist_quality_event(_ev("fb-0"))                                 # the first refusal latches the cap
+    last_backed = max(w["seq"] for w in _wal_records(tmp_path))
+    assert len(calls) == 1 and _disk_ckpt(tmp_path) == last_backed
+    wal_records, wal_bytes = _wal_records(tmp_path), wal._total_wal_bytes()
+
+    for i in (1, 2, 3):                                                     # latched: refused before any append
+        app._persist_quality_event(_ev(f"fb-{i}"))
+
+    assert [c["record_count"] for c in calls] == [3, 1, 1, 1] and len(_segs(tmp_path)) == 4
+    assert all(c["bound"] == set() for c in calls[1:])                      # nothing is attributed to a fallback row
+    assert all(c["ckpt_before"] == c["ckpt_after"] == last_backed for c in calls[1:])
+    rows = _rows(tmp_path)
+    assert [r["reason"] for r in rows] == ["wal-0", "wal-1", "fb-0", "fb-1", "fb-2", "fb-3"]   # each exactly once
+    assert all(r["quality_event_id"] is None for r in rows[2:])
+    assert _wal_records(tmp_path) == wal_records and wal._total_wal_bytes() == wal_bytes   # the WAL did not grow
+    assert _disk_ckpt(tmp_path) == last_backed and app._quality_wal_inflight == set()
+    assert _alert_count(_alerts, "QUALITY WAL CAPACITY EXHAUSTED [BYBIT]") == 1             # alerted once per process
+
+
+def test_a_cap_refused_event_in_a_new_hour_checkpoints_only_the_old_segment(app, tmp_path):
+    calls = _spy_durable(app, tmp_path)
+    w = app.quality_writer
+    hour = {"now": w.current_hour}
+    w._get_current_hour_str = lambda: hour["now"]                           # instance-level, scoped to this app
+    _persist(app, 3, "h1-")
+    old = {x["seq"] for x in _wal_records(tmp_path)}
+    _cap_wal_at_current_size(app)
+
+    hour["now"] = "2099-01-01-00"                                           # the fallback write rolls the hour over
+    app._persist_quality_event(_ev("fb-h2"))
+
+    first, second = calls            # the rollover publishes the OLD segment; the fallback then publishes its own
+    old_rows = pq.read_table(first["path"]).to_pylist()
+    assert [r["reason"] for r in old_rows] == ["h1-0", "h1-1", "h1-2"]      # the fallback row is NOT in the old segment
+    assert first["bound"] == old == _backed_seqs(first["path"])
+    assert first["ckpt_after"] == max(old)
+    (new_row,) = pq.read_table(second["path"]).to_pylist()
+    assert new_row["reason"] == "fb-h2" and new_row["quality_event_id"] is None
+    assert second["bound"] == set() and second["record_count"] == 1
+    assert second["ckpt_before"] == second["ckpt_after"] == max(old) == _disk_ckpt(tmp_path)
+    assert app._quality_wal_inflight == set() and _pending(tmp_path) == []
+
+
+def test_a_cap_refused_publication_cannot_checkpoint_over_an_earlier_unresolved_prefix(
+        app, clock, faults, tmp_path, _alerts):
+    calls = _spy_durable(app, tmp_path)
+    _persist(app, 3, "e-")
+    originals = {w["quality_event_id"]: w["reason"] for w in _wal_records(tmp_path)}
+    faults.fail_checkpoint_replace = True
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()                       # segment 1 publishes; its checkpoint write fails -> latch
+    assert faults.checkpoint_replace_hits == 1 and len(_segs(tmp_path)) == 1 and _disk_ckpt(tmp_path) == -1
+    assert app._quality_checkpoint_block_reason == "checkpoint_write_failed:OSError"
+
+    faults.fail_checkpoint_replace = False              # the disk recovers; the latch must not
+    _cap_wal_at_current_size(app)
+    app._persist_quality_event(_ev("fb-after-latch"))   # refused by the cap, force-published
+
+    assert len(_segs(tmp_path)) == 2 and len(calls) == 2
+    (fb_row,) = pq.read_table(calls[1]["path"]).to_pylist()
+    assert fb_row["reason"] == "fb-after-latch" and fb_row["quality_event_id"] is None
+    assert calls[1]["bound"] == set()
+    # the fallback publication did NOT checkpoint over the earlier, unresolved records
+    assert _disk_ckpt(tmp_path) == -1 and faults.checkpoint_replace_hits == 1     # no second attempt either
+    assert {e["quality_event_id"]: e["reason"] for e in _pending(tmp_path)} == originals
+    assert app._quality_checkpoint_blocked is True
+    status = app.quality_channel_status()
+    assert status["quality_wal_capacity_exhausted"] is True and status["quality_checkpoint_blocked"] is True
+    assert status["quality_degraded"] is False and status["quality_events_lost"] == 0   # publication succeeded
+
+    _crash(app)                                         # restart: the WAL-backed records replay, the fallback row does not
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))
+    try:
+        rows = _rows(tmp_path)
+        assert Counter(r["quality_event_id"] for r in rows if r["quality_event_id"] in originals) == \
+            {i: 2 for i in originals}                   # at-least-once: the documented duplicate, same ids
+        assert [r["reason"] for r in rows].count("fb-after-latch") == 1       # never duplicated, never lost
+        assert [e for e in _pending(tmp_path) if e["quality_event_id"] in originals] == []
+        assert _disk_ckpt(tmp_path) >= max(_seq(i) for i in originals)
+    finally:
+        _crash(app2)
+
+
+def test_a_failed_cap_refused_publication_is_observable_and_leaves_every_wal_record_recoverable(
+        app, faults, tmp_path, _alerts):
+    _persist(app, 3, "p-")
+    wal_rows = _wal_records(tmp_path)
+    originals = {w["quality_event_id"]: w["reason"] for w in wal_rows}
+    seqs = {w["seq"] for w in wal_rows}
+    wal = _cap_wal_at_current_size(app)
+    counter = wal._seq
+
+    faults.fail_segment_rename = True
+    with expect_fatal(OSError, stage="rename") as info:
+        app._persist_quality_event(_ev("fb-fails"))
+    assert "No space left" in str(info.value.__cause__)                     # the original error is chained
+    assert faults.segment_rename_hits == 1
+
+    # nothing is claimed durable
+    assert _segs(tmp_path) == [] and _rows(tmp_path) == [] and len(_tmps(tmp_path)) == 1
+    assert _disk_ckpt(tmp_path) == -1 and app._quality_wal_inflight == seqs
+    # no fabricated WAL record for the refused event; every earlier record is intact and recoverable
+    assert _wal_for(tmp_path, "fb-fails") == [] and wal._seq == counter
+    assert {e["quality_event_id"]: e["reason"] for e in _pending(tmp_path)} == originals
+    # the failure is observable: latch, degraded channel, a counted loss for the unprotected event, alerts
+    assert app._quality_checkpoint_block_reason == "unprotected_event_publish_failed"
+    status = app.quality_channel_status()
+    assert status["quality_degraded"] is True and status["quality_failure"]["stage"] == "rename"
+    assert status["quality_wal_capacity_exhausted"] is True
+    assert status["quality_events_lost"] == 1                               # no WAL copy and publication failed
+    assert status["quality_events_wal_only"] == 0 and status["quality_events_wal_unconfirmed"] == 0
+    assert _alert_count(_alerts, "QUALITY WAL CAPACITY EXHAUSTED [BYBIT]") == 1
+    assert _alert_count(_alerts, "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]") == 1
+    assert _alert_count(_alerts, "QUALITY EVENTS UNRECORDED [BYBIT]") == 1
+
+    app._persist_quality_event(_ev("fb-after-failure"))                     # degraded: counted, never written
+    assert app.quality_channel_status()["quality_events_lost"] == 2
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+    assert _wal_for(tmp_path, "fb-after-failure") == []
+    assert _alert_count(_alerts, "QUALITY EVENTS UNRECORDED [BYBIT]") == 1
+
+    _crash(app)
+    faults.fail_segment_rename = False
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))
+    try:
+        rows = _rows(tmp_path)
+        replayed = [r for r in rows if r["quality_event_id"] in originals]
+        assert {r["quality_event_id"]: r["reason"] for r in replayed} == originals and len(replayed) == 3
+        # the loss was reported at runtime (counter + alert above); a restart never fabricates the lost rows
+        assert not [r for r in rows if r["reason"] in {"fb-fails", "fb-after-failure"}]
+    finally:
+        _crash(app2)
+
+
+def test_a_wal_over_the_cap_at_startup_replays_once_and_new_events_use_the_fallback(
+        app, tmp_path, monkeypatch, _alerts):
+    _persist(app, 3, "r-")
+    wal_rows = _wal_records(tmp_path)
+    originals = {w["quality_event_id"]: w["reason"] for w in wal_rows}
+    last_seq = max(w["seq"] for w in wal_rows)
+    _crash(app)                                         # 3 WAL-backed records, none published or checkpointed
+
+    monkeypatch.setenv(ENV_MAX_TOTAL_BYTES, "1")        # the configured cap is below what is already on disk
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))
+    try:
+        wal2 = app2._quality_wal
+        assert wal2.capacity_exhausted is True and wal2.capacity_reason == "existing_wal_at_or_over_capacity"
+        replayed = [r for r in _rows(tmp_path) if r["quality_event_id"] in originals]
+        assert {r["quality_event_id"]: r["reason"] for r in replayed} == originals and len(replayed) == 3
+        assert _disk_ckpt(tmp_path) == last_seq         # replay of WAL-backed records still checkpoints under the cap
+        assert [e for e in _pending(tmp_path) if e["quality_event_id"] in originals] == []
+        assert app2._quality_checkpoint_blocked is False
+
+        app2._persist_quality_event(_ev("after-cap"))
+        (row,) = [r for r in _rows(tmp_path) if r["reason"] == "after-cap"]
+        assert row["quality_event_id"] is None          # published, once, with no fabricated id
+        assert _wal_for(tmp_path, "after-cap") == [] and wal2.capacity_exhausted is True
+        assert _disk_ckpt(tmp_path) == last_seq
+        assert app2.quality_channel_status()["quality_wal_capacity_exhausted"] is True
+        assert _alert_count(_alerts, "QUALITY WAL CAPACITY EXHAUSTED [BYBIT]") == 1
+    finally:
+        _crash(app2)
+
+
+def test_defence_in_depth_a_cap_refused_publication_stops_the_checkpoint_before_an_unresolved_record(
+        app, tmp_path):
+    """Seeded state -- by design NOT reachable through single-writer operation (see the Stage 2A test of
+    the same name). It pins that the FALLBACK publication, which is what runs the durable callback here,
+    uses the same ``min(in-flight) - 1`` bound: a real WAL record is held in flight, the cap refuses the
+    next event, and the real writer publishes the fallback row through the real callback."""
+    app._persist_quality_event(_ev("before"))                               # seq a
+    stuck = app._quality_wal.append({**_ev("stuck"), "event_type": "ERROR", "local_ts": 1, "local_process_ts": 1})
+    stuck_seq = _seq(stuck)                                                 # seq a+1: WAL-appended, never written
+    app._quality_wal_inflight.add(stuck_seq)
+    app._persist_quality_event(_ev("after"))                                # seq a+2, published later than `stuck`
+    _cap_wal_at_current_size(app)
+
+    app._persist_quality_event(_ev("fallback"))          # refused by the cap; force-publishes the open segment
+
+    wal = _wal_records(tmp_path)
+    assert [w["reason"] for w in wal] == ["before", "stuck", "after"]       # the fallback never reached the WAL
+    assert [r["reason"] for r in _rows(tmp_path)] == ["before", "after", "fallback"]
+    assert app._quality_wal_inflight == {stuck_seq}
+    # the published high-water mark is `after` (a+2); the checkpoint must still stop BEFORE `stuck` (a)
+    assert _disk_ckpt(tmp_path) == wal[0]["seq"] < stuck_seq < wal[2]["seq"]
+    assert [e["reason"] for e in _pending(tmp_path)] == ["stuck", "after"]  # `after` replays (at-least-once)
