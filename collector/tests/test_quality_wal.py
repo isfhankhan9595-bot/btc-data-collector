@@ -16,7 +16,10 @@ import pytest
 
 from collector.collector.quality_wal import (
     CHECKPOINT_FILENAME,
+    DEFAULT_MAX_TOTAL_BYTES,
+    ENV_MAX_TOTAL_BYTES,
     QualityEventWAL,
+    QualityWALCapacityExceeded,
     QualityWALCorruption,
 )
 
@@ -394,3 +397,93 @@ def test_a_corrupted_checkpoint_file_is_treated_as_nothing_checkpointed_not_ever
     (tmp_path / CHECKPOINT_FILENAME).write_text("{not valid json", encoding="utf-8")
     recovered = QualityEventWAL.recover(tmp_path)
     assert [r["reason"] for r in recovered] == ["r0"]
+
+
+# ---------------------------------------------------------------------------
+# Aggregate admission capacity and reserved metadata invariants.
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_cap_counts_every_wal_file_and_rejects_before_writing(tmp_path):
+    first = QualityEventWAL(
+        tmp_path, process_start_marker="p1", max_total_bytes=1_000_000)
+    first.append(_event(reason="first-file"))
+    second = QualityEventWAL(
+        tmp_path, process_start_marker="p2", max_total_bytes=1_000_000)
+    second.append(_event(reason="second-file"))
+
+    current = first._total_wal_bytes()
+    candidate = {
+        **_event(reason="candidate"),
+        "quality_event_id": "p1-2",
+        "seq": 2,
+    }
+    requested = len((json.dumps(candidate, default=str) + "\\n").encode("utf-8"))
+    # Allow the candidate to fit beside the active file alone, but not when
+    # every WAL file in the shared namespace is counted.
+    first_active_size = first._active_path.stat().st_size
+    first.max_total_bytes = current + requested - 1
+    assert first_active_size + requested <= first.max_total_bytes
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")}
+
+    with pytest.raises(QualityWALCapacityExceeded) as caught:
+        first.append(_event(reason="candidate"))
+
+    assert caught.value.current_bytes == current
+    assert caught.value.requested_bytes == requested
+    assert caught.value.newly_exhausted is True
+    assert not hasattr(caught.value, "quality_event_id")
+    assert first.capacity_exhausted is True
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")} == before
+    with pytest.raises(QualityWALCapacityExceeded) as again:
+        first.append(_event(reason="later"))
+    assert again.value.newly_exhausted is False
+    first.close()
+    second.close()
+
+
+def test_oversized_single_event_is_rejected_without_a_wal_id_or_partial_line(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="p", max_total_bytes=256)
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")}
+
+    with pytest.raises(QualityWALCapacityExceeded) as caught:
+        wal.append(_event(reason="x" * 2048))
+
+    assert caught.value.reason == "aggregate_budget_exhausted"
+    assert not hasattr(caught.value, "quality_event_id")
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")} == before
+    assert wal.capacity_exhausted is True
+    wal.close()
+
+
+def test_wal_generated_identity_fields_cannot_be_overridden_by_event_data(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="owned")
+    event_id = wal.append(_event(reason="reserved", seq=999, quality_event_id="caller-spoof"))
+    wal.close()
+
+    recovered = QualityEventWAL.recover(tmp_path)
+    assert event_id == "owned-1"
+    assert recovered[0]["seq"] == 1
+    assert recovered[0]["quality_event_id"] == "owned-1"
+
+
+@pytest.mark.parametrize("bad_cap", [0, -1, True, "100"])
+def test_invalid_aggregate_cap_is_rejected(bad_cap, tmp_path):
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        QualityEventWAL(tmp_path / str(type(bad_cap).__name__) , max_total_bytes=bad_cap)
+
+
+def test_aggregate_cap_reads_environment_and_has_documented_default(tmp_path, monkeypatch):
+    monkeypatch.delenv(ENV_MAX_TOTAL_BYTES, raising=False)
+    default = QualityEventWAL(tmp_path / "default")
+    assert default.max_total_bytes == DEFAULT_MAX_TOTAL_BYTES
+    default.close()
+
+    monkeypatch.setenv(ENV_MAX_TOTAL_BYTES, "4096")
+    configured = QualityEventWAL(tmp_path / "configured")
+    assert configured.max_total_bytes == 4096
+    configured.close()
+
+    monkeypatch.setenv(ENV_MAX_TOTAL_BYTES, "4K")
+    with pytest.raises(ValueError, match=ENV_MAX_TOTAL_BYTES):
+        QualityEventWAL(tmp_path / "invalid")
