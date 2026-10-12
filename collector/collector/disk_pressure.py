@@ -266,8 +266,8 @@ class _State:
 
 _GUIDANCE = {
     Severity.WARNING: "Free space is falling: free disk before it reaches the critical threshold.",
-    Severity.CRITICAL: ("Free space is critically low: free disk now. If the quality checkpoint is "
-                        "blocked the quality WAL keeps growing; nothing deletes it automatically."),
+    Severity.CRITICAL: ("Free space is critically low: free disk now. The WAL byte cap limits WAL growth, "
+                        "but Parquet data and other files can still exhaust the filesystem."),
     Severity.EMERGENCY: ("Collection is being stopped through the controlled shutdown (exit status 1); "
                          "raw evidence and the quality WAL are preserved. Free disk before restarting; "
                          "a restart replays uncheckpointed quality events (at-least-once)."),
