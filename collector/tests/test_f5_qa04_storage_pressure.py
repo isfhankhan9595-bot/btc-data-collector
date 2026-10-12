@@ -1,17 +1,19 @@
 """F5-QA-04: continuous storage-pressure monitoring for the WAL-backed runners (Futures + Bybit).
 
-Phase A finding (kept as characterization tests below, see ``test_phase_a_*``)
------------------------------------------------------------------------------
-``QualityEventWAL.max_bytes`` is a per-file rotation threshold, not a total-size bound. After a
-checkpoint failure latches checkpointing off, ``maybe_rotate_for_size`` is never reached again and
-the WAL grows without bound; the old ``DiskMonitor`` ran once in the Futures constructor only and
-Bybit had no disk monitoring at all.
+Original Phase A finding (fixed below; regression test retains the injected failure)
+-----------------------------------------------------------------------------------
+``QualityEventWAL.max_bytes`` is a per-file rotation threshold. After a checkpoint failure latches
+checkpointing off, ``maybe_rotate_for_size`` is no longer reached. The aggregate-cap fix now
+refuses additional WAL appends before writing beyond the configured byte limit and routes those
+events through synchronous, force-published Parquet persistence. The continuous free-space monitor
+still protects against other disk growth.
 
-Policy under test (approved decisions)
---------------------------------------
-No hard WAL cap and nothing here deletes evidence; configurable 7/4/2 GiB thresholds checked every
-15 s off the hot path; one alert per severity entry with hysteresis; measurement failure is an
-explicit UNKNOWN state; EMERGENCY stops collection through each runner's controlled lifecycle with
+Policy under test
+------------------
+A hard aggregate WAL cap is tested separately from configurable 7/4/2 GiB free-space thresholds
+checked every 15 s off the hot path. No cap path deletes or truncates evidence. Once capped,
+events are synchronously force-published to Parquet and are not falsely labelled with WAL IDs.
+Free-space measurement failure is UNKNOWN; EMERGENCY uses each runner's controlled lifecycle with
 exit status 1 (70 stays reserved for fatal storage); startup preflight; read-only status.
 
 Everything below runs on scratch directories with the real runners / WAL / ``ParquetWriter``. The
@@ -365,9 +367,10 @@ def test_runner_monitors_its_own_configured_data_and_wal_directories(rig):
 
 
 def test_phase_a_healthy_rotation_vs_blocked_growth_beyond_max_bytes(rig):
-    """Phase A evidence retained: rotation is a per-file threshold, not a total-size bound."""
+    """Injected checkpoint failure must no longer allow aggregate WAL growth past its hard cap."""
     wal = rig.app._quality_wal
     wal.max_bytes = 800
+    wal.max_total_bytes = 12_000
     calls = {"rotate": 0}
     real = QualityEventWAL.maybe_rotate_for_size
 
@@ -380,6 +383,7 @@ def test_phase_a_healthy_rotation_vs_blocked_growth_beyond_max_bytes(rig):
         rig.emit_many("healthy", 30)
         healthy_bytes, healthy_files = _wal_dir_bytes_and_count(rig)
         assert calls["rotate"] >= 30 and healthy_bytes < 5 * 800        # healthy: rotation + deletion bound it
+        assert healthy_bytes < wal.max_total_bytes
         rotations_before = calls["rotate"]
         rig.armed = True
         rig.emit_many("blocked", 60)
@@ -388,14 +392,19 @@ def test_phase_a_healthy_rotation_vs_blocked_growth_beyond_max_bytes(rig):
     finally:
         QualityEventWAL.maybe_rotate_for_size = real
     blocked_bytes, blocked_files = _wal_dir_bytes_and_count(rig)
-    assert blocked_bytes > 10 * 800                                      # far beyond max_bytes
-    assert blocked_files <= 2                                            # rotation did not even split it
+    assert blocked_bytes <= wal.max_total_bytes                          # hard cap spans every WAL file
+    assert blocked_files <= 2
+    assert wal.capacity_exhausted is True
+    reasons = {row["reason"] for row in rig.rows()}
+    assert all(f"blocked{i}" in reasons for i in range(60))              # rejected WAL events still reach Parquet
+    assert rig.status()["quality_events_lost"] == 0
     rig.app.storage_pressure.poll()
     status = rig.app.storage_pressure_status()
     assert status["quality_wal_bytes"] == blocked_bytes and status["quality_wal_file_count"] == blocked_files
+    assert status["quality_wal_max_bytes"] == wal.max_total_bytes
     assert status["quality_checkpoint_blocked"] is True
     assert status["quality_checkpoint_block_reason"] == "checkpoint_write_failed:OSError"
-    assert status["wal_total_size_bounded"] is False
+    assert status["wal_total_size_bounded"] is True
 
 
 def test_disk_pressure_status_is_separate_from_quality_channel_counters(rig):
