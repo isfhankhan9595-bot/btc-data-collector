@@ -238,7 +238,6 @@ class QualityEventWAL:
             raise
         self._write_failed = False
         self._closed = False
-        self._delete_fully_checkpointed_files()
         self._capacity_exhausted = False
         self._capacity_reason = None
         self._capacity_current_bytes = None
@@ -251,6 +250,35 @@ class QualityEventWAL:
         else:
             if current >= self.max_total_bytes:
                 self._latch_capacity("existing_wal_at_or_over_capacity", current)
+
+    @classmethod
+    def cleanup_fully_checkpointed_files(cls, wal_dir: Any) -> None:
+        """Clean stale covered files only after the caller's full recovery pass succeeded.
+
+        Destructive startup cleanup is intentionally separate from __init__.
+        Runners call this only after recover() has parsed the WAL namespace
+        without corruption. Each file is still revalidated strictly here; a
+        malformed row, incomplete tail, read error or invalid seq makes that
+        file ineligible for deletion. The checkpoint file is already durable,
+        so a directory-sync failure after unlink may only cause covered files
+        to reappear after a crash, which is safe and retried on a later startup.
+        """
+        directory = Path(wal_dir)
+        checkpointed_seq = _read_checkpointed_seq(directory)
+        deleted = False
+        for wal_file in sorted(directory.glob("*.wal")):
+            max_seq = _safe_max_seq_in_file(wal_file)
+            if max_seq is not None and max_seq <= checkpointed_seq:
+                try:
+                    wal_file.unlink(missing_ok=True)
+                    deleted = True
+                except OSError:
+                    continue
+        if deleted:
+            try:
+                _fsync_directory(directory)
+            except OSError:
+                pass
 
     def _total_wal_bytes(self) -> int:
         """Actual aggregate bytes across every .wal file in this namespace."""
