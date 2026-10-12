@@ -46,7 +46,7 @@ from collector.collector.validator import Validator
 from collector.collector.gap_detector import GapDetector
 from collector.collector.disk_monitor import DiskMonitor
 from collector.collector.disk_pressure import (
-    EXIT_DISK_PRESSURE, DiskPressureConfig, Severity, StoragePressureMonitor,
+    EXIT_DISK_MONITOR_UNAVAILABLE, EXIT_DISK_PRESSURE, DiskPressureConfig, Severity, StoragePressureMonitor,
 )
 from collector.collector.health_monitor import HealthMonitor
 from collector.collector.parquet_writer import ParquetWriter
@@ -248,7 +248,9 @@ class CollectorApp:
         if self.terminal_failure is not None:
             return EXIT_FATAL_STORAGE          # 70 keeps priority: raw evidence was lost
         if getattr(self, "_disk_emergency", None) is not None:
-            return EXIT_DISK_PRESSURE          # 1: disk-pressure emergency stop (F5-QA-04)
+            return EXIT_DISK_PRESSURE          # 1: confirmed disk-pressure emergency stop (F5-QA-04)
+        if getattr(self, "_disk_monitor_unavailable", None) is not None:
+            return EXIT_DISK_MONITOR_UNAVAILABLE   # 69: storage could not be measured (fail closed)
         return 0
 
     def _on_fatal_storage(self, exc, origin: str = "handler") -> str:
@@ -1610,7 +1612,7 @@ class CollectorApp:
     async def start(self):
         # F5-QA-04: startup disk preflight. The app is fully constructed (so shutdown() is
         # safe) and no websocket client has started yet.
-        if self._storage_pressure_preflight_failed():
+        if await self._storage_pressure_preflight_failed():
             return
         logger.info("Starting Collector Application")
         logger.info("Collector WebSocket subscription", url=BINANCE_PUBLIC_WS_URL, requested_streams=self._requested_streams(BINANCE_PUBLIC_WS_URL))
@@ -1827,6 +1829,7 @@ class CollectorApp:
             checkpoint_state=lambda: (self._quality_checkpoint_is_blocked(),
                                       getattr(self, "_quality_checkpoint_block_reason", None)))
         self._disk_emergency = None
+        self._disk_monitor_unavailable = None
         self._disk_shutdown_task = None
 
     def storage_pressure_status(self) -> dict:
@@ -1837,38 +1840,61 @@ class CollectorApp:
             return {"monitoring": False, "severity": Severity.UNKNOWN.value}
         return monitor.status()
 
-    def _storage_pressure_preflight_failed(self) -> bool:
-        """True when storage is already at EMERGENCY pressure: shut down through the normal
-        (exception-safe, writer-ordered) ``shutdown()`` and never start ingestion. A failed
-        measurement does not block startup; the periodic task keeps retrying and alerting."""
+    async def _storage_pressure_preflight_failed(self) -> bool:
+        """Startup gate: True when ingestion must NOT start.
+
+        ``establish_measurement`` retries the probe (bounded by the unknown grace period) until a
+        valid reading exists. A reading below the emergency threshold, or no valid reading at all
+        within the grace period, ends in the normal exception-safe, writer-ordered ``shutdown()``
+        before any websocket client starts. UNKNOWN is never treated as OK."""
         monitor = getattr(self, "storage_pressure", None)
         if monitor is None:
             return False
-        result = monitor.poll()
-        if result.severity != Severity.EMERGENCY:
+        result = await monitor.establish_measurement()
+        if result.measurement_ok and result.severity != Severity.EMERGENCY:
             return False
-        self._disk_emergency = monitor.status()
-        logger.error("storage_pressure_emergency_at_startup", exit_status=EXIT_DISK_PRESSURE)
+        if result.measurement_ok:
+            self._disk_emergency = monitor.status()
+            logger.error("storage_pressure_emergency_at_startup", exit_status=EXIT_DISK_PRESSURE)
+        else:
+            self._disk_monitor_unavailable = monitor.status()
+            logger.error("storage_pressure_monitor_unavailable_at_startup",
+                         exit_status=EXIT_DISK_MONITOR_UNAVAILABLE,
+                         error=self._disk_monitor_unavailable["last_monitor_error"],
+                         unknown_for_s=self._disk_monitor_unavailable["monitor_failure_duration_s"])
         self.running = False
         self.shutdown()
         return True
 
+    def _request_disk_shutdown(self, reason: str) -> None:
+        """Run the controlled shutdown from its own task, exactly once for any disk reason."""
+        if getattr(self, "_disk_shutdown_task", None) is None:
+            self._disk_shutdown_task = asyncio.create_task(self._async_shutdown(0, reason=reason))
+
     def _on_disk_emergency(self, result) -> None:
-        """Runtime EMERGENCY: latch (exit status 1) and run the controlled shutdown from its own
-        task, never from the monitor task itself."""
+        """Runtime EMERGENCY (confirmed low space): latch (exit status 1) and stop."""
         monitor = getattr(self, "storage_pressure", None)
         self._disk_emergency = monitor.status() if monitor is not None else {"severity": "EMERGENCY"}
         logger.error("storage_pressure_emergency_shutdown", exit_status=EXIT_DISK_PRESSURE)
-        task = getattr(self, "_disk_shutdown_task", None)
-        if task is None:
-            self._disk_shutdown_task = asyncio.create_task(
-                self._async_shutdown(0, reason="disk_pressure_emergency"))
+        self._request_disk_shutdown("disk_pressure_emergency")
+
+    def _on_disk_monitor_unavailable(self, result) -> None:
+        """Runtime: storage could not be measured for the whole grace period. Latch separately
+        (exit status 69, never 1) and stop; this is NOT a confirmed low-disk emergency."""
+        monitor = getattr(self, "storage_pressure", None)
+        self._disk_monitor_unavailable = (monitor.status() if monitor is not None
+                                          else {"severity": "UNKNOWN"})
+        logger.error("storage_pressure_monitor_unavailable_shutdown",
+                     exit_status=EXIT_DISK_MONITOR_UNAVAILABLE,
+                     error=self._disk_monitor_unavailable.get("last_monitor_error"),
+                     unknown_for_s=self._disk_monitor_unavailable.get("monitor_failure_duration_s"))
+        self._request_disk_shutdown("disk_monitor_unavailable")
 
     async def _storage_pressure_loop(self) -> None:
         monitor = getattr(self, "storage_pressure", None)
         if monitor is None:
             return
-        await monitor.run(self._on_disk_emergency)
+        await monitor.run(self._on_disk_emergency, self._on_disk_monitor_unavailable)
 
     def _shutdown_step(self, step: str, function, *args) -> bool:
         """Run one shutdown step; a failure is logged and never stops the next one."""

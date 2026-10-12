@@ -37,16 +37,36 @@ pre-existing 7 / 4 / 2 GiB policy)::
   Recovery is logged and visible in ``status()`` (``last_transition``); it is not a
   notification.
 * A failed measurement is an explicit UNKNOWN / monitor-error state: it keeps the last
-  classification for hysteresis, is reported as ``severity: UNKNOWN``, alerts at most once
-  per ``error_alert_interval_s`` and is retried on the next poll.
+  classification for hysteresis (never exposed as the current severity), is reported as
+  ``severity: UNKNOWN``, alerts at most once per ``error_alert_interval_s`` and is retried on
+  the next poll.
+
+UNKNOWN fails closed (F5-QA-04 follow-up)
+-----------------------------------------
+UNKNOWN is never OK, and it is not allowed to last forever either, because with no hard WAL
+cap an unmonitored disk is a real risk to raw capture:
+
+* **Startup:** ``establish_measurement()`` retries the probe every ``interval_s`` until one
+  valid measurement exists. Ingestion starts only after that. If the probe is still failing
+  once ``unknown_grace_s`` has elapsed, startup ends in the runner's controlled shutdown
+  (exit status ``EXIT_DISK_MONITOR_UNAVAILABLE``) without starting any websocket client.
+* **Runtime:** a run of CONSECUTIVE failures that lasts ``unknown_grace_s`` requests the
+  runner's controlled shutdown, exactly once. Any successful measurement before that resets
+  the timer. One transient error never stops collection. A successful measurement after the
+  request was made does not cancel it (no flapping out of a committed shutdown).
+* Deadlines use ``time.monotonic()`` (injectable ``clock``), never wall-clock time.
+* A real low-space reading is independent of monitor availability: WARNING / CRITICAL /
+  EMERGENCY follow the threshold policy, and WARNING / CRITICAL never stop collection.
 
 Configuration (environment, GiB = 1024**3 bytes, seconds for intervals)
 ------------------------------------------------------------------------
 ``COLLECTOR_DISK_WARNING_GIB`` (7), ``COLLECTOR_DISK_CRITICAL_GIB`` (4),
 ``COLLECTOR_DISK_EMERGENCY_GIB`` (2), ``COLLECTOR_DISK_CHECK_INTERVAL_S`` (15),
-``COLLECTOR_DISK_HYSTERESIS_GIB`` (0.5), ``COLLECTOR_DISK_ERROR_ALERT_INTERVAL_S`` (900).
+``COLLECTOR_DISK_HYSTERESIS_GIB`` (0.5), ``COLLECTOR_DISK_ERROR_ALERT_INTERVAL_S`` (900),
+``COLLECTOR_DISK_UNKNOWN_GRACE_S`` (60).
 Invalid values are REJECTED at startup (``DiskPressureConfigError``), never coerced:
-``warning > critical > emergency >= 0``, ``interval > 0``, ``0 <= hysteresis < min(gap)``.
+``warning > critical > emergency >= 0``, ``interval > 0``, ``0 <= hysteresis < min(gap)``,
+``unknown_grace > 0`` (finite).
 """
 from __future__ import annotations
 
@@ -63,10 +83,10 @@ from .notifications import send_alert
 from .utils import logger
 
 __all__ = [
-    "GIB", "EXIT_DISK_PRESSURE", "Severity", "DiskPressureConfig", "DiskPressureConfigError",
+    "GIB", "EXIT_DISK_PRESSURE", "EXIT_DISK_MONITOR_UNAVAILABLE", "Severity", "DiskPressureConfig", "DiskPressureConfigError",
     "PollResult", "StoragePressureMonitor", "classify", "wal_dir_stats",
     "ENV_WARNING_GIB", "ENV_CRITICAL_GIB", "ENV_EMERGENCY_GIB", "ENV_INTERVAL_S",
-    "ENV_HYSTERESIS_GIB", "ENV_ERROR_ALERT_INTERVAL_S",
+    "ENV_HYSTERESIS_GIB", "ENV_ERROR_ALERT_INTERVAL_S", "ENV_UNKNOWN_GRACE_S",
 ]
 
 GIB = 1024 ** 3
@@ -77,12 +97,20 @@ GIB = 1024 ** 3
 #: alert distinguish the two.
 EXIT_DISK_PRESSURE = 1
 
+#: Process exit status when storage could NOT be measured for ``unknown_grace_s`` (at startup or
+#: at runtime) and the runner stopped itself. Distinct from a confirmed disk emergency (1) and
+#: from 70. 69 is sysexits ``EX_UNAVAILABLE`` and is unused elsewhere in this repository
+#: (existing statuses: 0, 1 = run task crashed / disk emergency, 70 = fatal raw-evidence storage).
+#: Precedence when several are latched: 70 > 1 (confirmed emergency) > 69.
+EXIT_DISK_MONITOR_UNAVAILABLE = 69
+
 ENV_WARNING_GIB = "COLLECTOR_DISK_WARNING_GIB"
 ENV_CRITICAL_GIB = "COLLECTOR_DISK_CRITICAL_GIB"
 ENV_EMERGENCY_GIB = "COLLECTOR_DISK_EMERGENCY_GIB"
 ENV_INTERVAL_S = "COLLECTOR_DISK_CHECK_INTERVAL_S"
 ENV_HYSTERESIS_GIB = "COLLECTOR_DISK_HYSTERESIS_GIB"
 ENV_ERROR_ALERT_INTERVAL_S = "COLLECTOR_DISK_ERROR_ALERT_INTERVAL_S"
+ENV_UNKNOWN_GRACE_S = "COLLECTOR_DISK_UNKNOWN_GRACE_S"
 
 
 class DiskPressureConfigError(ValueError):
@@ -117,6 +145,7 @@ class DiskPressureConfig:
     interval_s: float = 15.0
     hysteresis_gib: float = 0.5
     error_alert_interval_s: float = 900.0
+    unknown_grace_s: float = 60.0
 
     def __post_init__(self) -> None:
         warning = _finite(ENV_WARNING_GIB, self.warning_gib)
@@ -125,6 +154,7 @@ class DiskPressureConfig:
         interval = _finite(ENV_INTERVAL_S, self.interval_s)
         hysteresis = _finite(ENV_HYSTERESIS_GIB, self.hysteresis_gib)
         error_interval = _finite(ENV_ERROR_ALERT_INTERVAL_S, self.error_alert_interval_s)
+        grace = _finite(ENV_UNKNOWN_GRACE_S, self.unknown_grace_s)
         if not (warning > critical > emergency >= 0):
             raise DiskPressureConfigError(
                 "thresholds must satisfy warning > critical > emergency >= 0 (GiB); got "
@@ -134,6 +164,8 @@ class DiskPressureConfig:
         if error_interval <= 0:
             raise DiskPressureConfigError(
                 f"{ENV_ERROR_ALERT_INTERVAL_S} must be > 0 seconds, got {error_interval}")
+        if grace <= 0:
+            raise DiskPressureConfigError(f"{ENV_UNKNOWN_GRACE_S} must be > 0 seconds, got {grace}")
         smallest_gap = min(warning - critical, critical - emergency)
         if hysteresis < 0 or hysteresis >= smallest_gap:
             raise DiskPressureConfigError(
@@ -147,7 +179,8 @@ class DiskPressureConfig:
         names = {"warning_gib": ENV_WARNING_GIB, "critical_gib": ENV_CRITICAL_GIB,
                  "emergency_gib": ENV_EMERGENCY_GIB, "interval_s": ENV_INTERVAL_S,
                  "hysteresis_gib": ENV_HYSTERESIS_GIB,
-                 "error_alert_interval_s": ENV_ERROR_ALERT_INTERVAL_S}
+                 "error_alert_interval_s": ENV_ERROR_ALERT_INTERVAL_S,
+                 "unknown_grace_s": ENV_UNKNOWN_GRACE_S}
         values = {}
         for field_name, var in names.items():
             if var not in env:
@@ -163,7 +196,8 @@ class DiskPressureConfig:
         return {"warning_gib": self.warning_gib, "critical_gib": self.critical_gib,
                 "emergency_gib": self.emergency_gib, "interval_s": self.interval_s,
                 "hysteresis_gib": self.hysteresis_gib,
-                "error_alert_interval_s": self.error_alert_interval_s}
+                "error_alert_interval_s": self.error_alert_interval_s,
+                "unknown_grace_s": self.unknown_grace_s}
 
 
 def classify(free_bytes: int, config: DiskPressureConfig, margin_gib: float = 0.0) -> Severity:
@@ -196,6 +230,7 @@ class PollResult:
     severity: Severity                 # UNKNOWN when the measurement failed
     measurement_ok: bool
     emergency_entered: bool            # True exactly once, on the poll that entered EMERGENCY
+    unavailable_entered: bool = False  # True exactly once, when the unknown grace period expired
     free_bytes: Optional[int] = None
     total_bytes: Optional[int] = None
     error: Optional[str] = None
@@ -215,6 +250,10 @@ class _State:
     last_transition: Optional[dict] = None
     emergency_latched: bool = False
     emergency_handled: bool = False
+    failure_started_at: Optional[float] = None   # monotonic start of the current run of failures
+    unavailable_latched: bool = False
+    unavailable_handled: bool = False
+    monitor_error_alerts: int = 0
     polls: int = 0
     alerts_sent: dict = field(default_factory=lambda: {s.value: 0 for s in (
         Severity.WARNING, Severity.CRITICAL, Severity.EMERGENCY)})
@@ -277,6 +316,7 @@ class StoragePressureMonitor:
         state.sampled = True
         state.free_bytes, state.total_bytes, state.monitored_path = free, total, path
         state.consecutive_errors = 0
+        state.failure_started_at = None            # a valid measurement ends the run of failures
         previous = state.level
         new = self._next_level(previous, free)
         state.level = new
@@ -346,18 +386,38 @@ class StoragePressureMonitor:
         state.last_error = f"{type(exc).__name__}: {exc}"
         state.consecutive_errors += 1
         now = self._clock()
+        if state.failure_started_at is None:
+            state.failure_started_at = now           # first failure of this consecutive run
+        duration = max(0.0, now - state.failure_started_at)
         due = (state.last_error_alert_at is None
                or now - state.last_error_alert_at >= self.config.error_alert_interval_s)
         self._log("error", "storage_pressure_monitor_error", error=state.last_error,
-                  consecutive=state.consecutive_errors)
+                  consecutive=state.consecutive_errors, unknown_for_s=round(duration, 3))
         if due:
             state.last_error_alert_at = now          # marked BEFORE sending: a failing backend cannot re-send
+            state.monitor_error_alerts += 1
             self._send(f"DISK PRESSURE MONITOR ERROR [{self.label}]: free space could not be measured "
                        f"({state.last_error}). Disk state is UNKNOWN, not healthy; the monitor keeps "
-                       f"retrying every {self.config.interval_s:g}s. This alert repeats at most every "
-                       f"{self.config.error_alert_interval_s:g}s.")
+                       f"retrying every {self.config.interval_s:g}s. If it stays unavailable for "
+                       f"{self.config.unknown_grace_s:g}s collection is stopped through the controlled "
+                       f"shutdown (exit status {EXIT_DISK_MONITOR_UNAVAILABLE}). This alert repeats at "
+                       f"most every {self.config.error_alert_interval_s:g}s.")
+        entered = False
+        if duration >= self.config.unknown_grace_s and not state.unavailable_latched:
+            state.unavailable_latched = True         # exactly once per process
+            entered = True
+            self._log("error", "storage_pressure_monitor_unavailable", error=state.last_error,
+                      unknown_for_s=round(duration, 3), grace_s=self.config.unknown_grace_s,
+                      consecutive=state.consecutive_errors,
+                      last_classified_severity=None if state.level is None else state.level.value)
+            self._send(f"DISK PRESSURE MONITOR UNAVAILABLE [{self.label}]: free space could not be measured "
+                       f"for {duration:.0f}s (grace {self.config.unknown_grace_s:g}s; last error: "
+                       f"{state.last_error}). Stopping collection through the controlled shutdown (exit "
+                       f"status {EXIT_DISK_MONITOR_UNAVAILABLE}); raw evidence and the quality WAL are "
+                       f"preserved. This is NOT a confirmed low-disk emergency: fix the probe / filesystem "
+                       f"access, then restart.")
         return PollResult(severity=Severity.UNKNOWN, measurement_ok=False, emergency_entered=False,
-                          error=state.last_error)
+                          unavailable_entered=entered, error=state.last_error)
 
     def _alert_severity(self, severity: Severity, free: int, total: int, path: str) -> None:
         state = self._state
@@ -428,6 +488,12 @@ class StoragePressureMonitor:
             "quality_checkpoint_block_reason": reason,
             "last_monitor_error": state.last_error,
             "consecutive_monitor_errors": state.consecutive_errors,
+            "monitor_failure_duration_s": (None if state.failure_started_at is None
+                                           else round(max(0.0, self._clock() - state.failure_started_at), 3)),
+            "monitor_error_alerts": state.monitor_error_alerts,
+            "monitor_unavailable_latched": state.unavailable_latched,
+            "shutdown_reason": ("disk_emergency" if state.emergency_latched
+                                else "disk_monitor_unavailable" if state.unavailable_latched else None),
             "last_transition": None if state.last_transition is None else dict(state.last_transition),
             "emergency_latched": state.emergency_latched,
             "alerts_sent": dict(state.alerts_sent),
@@ -436,13 +502,34 @@ class StoragePressureMonitor:
         }
 
     # ------------------------------------------------------------------ lifecycle
-    async def run(self, on_emergency: Callable[[PollResult], Any]) -> None:
-        """Poll every ``interval_s`` OFF the event-loop thread until EMERGENCY is handled.
+    async def establish_measurement(self) -> PollResult:
+        """Startup gate: poll until ONE valid measurement exists or the unknown grace expires.
 
-        ``on_emergency`` is the runner's request for its own controlled shutdown. It is
-        retried every interval until it returns without raising, so a failing callback can
-        never leave the monitor silently disabled. No exception ends this loop except
-        cancellation."""
+        Returns the last ``PollResult``: ``measurement_ok`` (classified normally, any severity
+        including EMERGENCY) or ``unavailable_entered`` (the grace period expired without a
+        single valid measurement). Retries are spaced by ``interval_s`` (never a hot loop) and
+        bounded by the monotonic grace deadline. Polls run off the event-loop thread, and the
+        same monitor object is used afterwards, so retries cannot duplicate alerts or monitors.
+        """
+        state = self._state
+        while True:
+            result = await asyncio.to_thread(self.poll)
+            if result.measurement_ok or state.unavailable_latched:
+                return result
+            started = state.failure_started_at
+            remaining = (self.config.unknown_grace_s if started is None
+                         else self.config.unknown_grace_s - (self._clock() - started))
+            await asyncio.sleep(max(0.0, min(self.config.interval_s, remaining)))
+
+    async def run(self, on_emergency: Callable[[PollResult], Any],
+                  on_unavailable: Optional[Callable[[PollResult], Any]] = None) -> None:
+        """Poll every ``interval_s`` OFF the event-loop thread until a stop is handled.
+
+        ``on_emergency`` (confirmed low space) and ``on_unavailable`` (unknown grace expired) are
+        the runner's requests for its own controlled shutdown. Each is retried every interval
+        until it returns without raising, so a failing callback can never leave the monitor
+        silently disabled, and each is accepted at most once. Emergency has priority. No
+        exception ends this loop except cancellation."""
         state = self._state
         while True:
             result: Optional[PollResult] = None
@@ -459,5 +546,14 @@ class StoragePressureMonitor:
                     return
                 except Exception as exc:  # noqa: BLE001 - retried next interval
                     self._log("error", "storage_pressure_emergency_callback_failed",
+                              error=f"{type(exc).__name__}: {exc}")
+            elif (state.unavailable_latched and not state.unavailable_handled
+                    and on_unavailable is not None):
+                try:
+                    on_unavailable(result or PollResult(Severity.UNKNOWN, False, False, True))
+                    state.unavailable_handled = True
+                    return
+                except Exception as exc:  # noqa: BLE001 - retried next interval
+                    self._log("error", "storage_pressure_unavailable_callback_failed",
                               error=f"{type(exc).__name__}: {exc}")
             await asyncio.sleep(self.config.interval_s)

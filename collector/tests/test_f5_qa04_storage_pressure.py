@@ -92,7 +92,8 @@ def _unit(disk=None, *, config=DEFAULT, clock=None, notify=None, tmp_path=None, 
 
 
 def _pressure_alerts(sent):
-    return [m for m in sent if m.startswith("DISK PRESSURE ") and "MONITOR ERROR" not in m]
+    return [m for m in sent if m.startswith("DISK PRESSURE ") and "MONITOR" not in m.split("]")[0]
+            and "MONITOR ERROR" not in m and "MONITOR UNAVAILABLE" not in m]
 
 
 # ======================= configuration =======================
@@ -440,11 +441,14 @@ def _real_futures(tmp_path, monkeypatch):
 class _StubWS:
     connected = True
 
-    def __init__(self):
+    def __init__(self, events=None):
         self.started = False
+        self.events = events
 
     async def start(self):
         self.started = True
+        if self.events is not None:
+            self.events.append("ingest:start")
         await asyncio.sleep(3600)
 
     async def wait_connected(self, timeout_seconds=0):
@@ -457,8 +461,8 @@ class _StubWS:
         pass
 
 
-def _stub_futures_network(app):
-    app.ws_clients = [_StubWS()]
+def _stub_futures_network(app, events=None):
+    app.ws_clients = [_StubWS(events)]
 
     async def noop(*a, **k):
         return None
@@ -575,12 +579,15 @@ def test_futures_emergency_preserves_every_uncheckpointed_wal_record_and_replays
 
 # ======================= real Bybit app: preflight + runtime lifecycle =======================
 class _StubBybitClient:
-    def __init__(self):
+    def __init__(self, events=None):
         self.started = False
         self.stopped = False
+        self.events = events
 
     async def start(self):
         self.started = True
+        if self.events is not None:
+            self.events.append("ingest:start")
         await asyncio.sleep(3600)
 
     def stop(self):
@@ -664,7 +671,9 @@ def test_bybit_emergency_with_blocked_checkpoint_preserves_wal_and_recovers_on_r
         asyncio.run(restarted.shutdown())
 
 
-def test_runtime_monitor_error_in_a_runner_reports_unknown_and_never_stops_collection(tmp_path):
+def test_bybit_probe_failing_at_startup_is_retried_and_ingestion_waits_for_a_valid_measurement(tmp_path):
+    """Replaces the pre-follow-up expectation that a failing probe could run collection forever: a probe
+    that fails at startup is UNKNOWN, retried, and ingestion starts only after a valid measurement."""
     app = _real_bybit(tmp_path)
     disk = FakeDisk(50)
     disk.fail = OSError(5, "I/O error")
@@ -675,10 +684,691 @@ def test_runtime_monitor_error_in_a_runner_reports_unknown_and_never_stops_colle
         runner = asyncio.create_task(rbc._run_supervised(app, stop))
         await asyncio.sleep(0.3)
         assert not runner.done() and app.exit_code == 0
+        assert app.client.started is False                      # no ingestion while UNKNOWN
         assert app.storage_pressure_status()["severity"] == "UNKNOWN"
         disk.fail = None
-        await asyncio.sleep(0.15)
-        assert app.storage_pressure_status()["severity"] == "OK"
+        await asyncio.sleep(0.2)
+        assert app.client.started is True and app.storage_pressure_status()["severity"] == "OK"
         stop.set()
         return await asyncio.wait_for(runner, 30)
     assert asyncio.run(scenario()) == 0
+
+
+# ======================= F5-QA-04 follow-up: UNKNOWN fails closed =======================
+from collector.collector.disk_pressure import EXIT_DISK_MONITOR_UNAVAILABLE, EXIT_DISK_PRESSURE  # noqa: E402
+from collector.collector.quality_wal import CHECKPOINT_FILENAME  # noqa: E402
+
+
+class ScriptedDisk(FakeDisk):
+    """Free-space reading driven by a script of floats (GiB free) / exceptions, then ``fail`` / ``free_gib``.
+
+    Failing calls advance the injected monotonic clock by ``step`` seconds, so startup-grace tests are
+    deterministic and take no real time. ``events`` records ordering against ingestion start."""
+
+    def __init__(self, script=(), *, free_gib=50.0, clock=None, step=0.0, events=None):
+        super().__init__(free_gib)
+        self.script, self.clock, self.step = list(script), clock, step
+        self.events = events if events is not None else []
+        self.calls = 0
+
+    def __call__(self, path):
+        self.calls += 1
+        item = self.script.pop(0) if self.script else (self.fail if self.fail is not None else self.free_gib)
+        if isinstance(item, BaseException):
+            self.events.append("measure:fail")
+            if self.clock is not None:
+                self.clock.now += self.step
+            raise item
+        self.events.append("measure:ok")
+        free = int(item * GIB)
+        total = int(self.total_gib * GIB)
+        return (total, total - free, free)
+
+
+@pytest.fixture(params=["futures", "bybit"])
+def kind(request):
+    return request.param
+
+
+class Harness:
+    """Drives the REAL runner lifecycle (Futures ``start()`` / Bybit ``_run_supervised``) on scratch dirs."""
+
+    def __init__(self, kind, tmp_path, monkeypatch, *, disk=None, clock=None, grace="60"):
+        monkeypatch.setenv(dp.ENV_UNKNOWN_GRACE_S, str(grace))
+        self.kind, self.clock = kind, clock or Clock()
+        self.events: list = []
+        self.disk = disk if disk is not None else ScriptedDisk(clock=self.clock, events=self.events)
+        self.disk.events = self.events
+        self.shutdown_calls = 0
+        self.shutdown_requests = 0
+        if kind == "futures":
+            self.app = _real_futures(tmp_path, monkeypatch)
+            _stub_futures_network(self.app, self.events)
+        else:
+            self.app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
+            self.app.client = _StubBybitClient(self.events)
+        self.app.storage_pressure._usage = self.disk
+        self.app.storage_pressure._clock = self.clock
+        self._wrap()
+        self.task = None
+        self.stop = None
+
+    def _wrap(self):
+        app = self.app
+        real_shutdown = app.shutdown
+        if self.kind == "futures":
+            def shutdown(*a, **k):
+                self.shutdown_calls += 1
+                return real_shutdown(*a, **k)
+            real_async = app._async_shutdown
+
+            async def async_shutdown(*a, **k):
+                self.shutdown_requests += 1
+                return await real_async(*a, **k)
+            app._async_shutdown = async_shutdown
+        else:
+            async def shutdown(*a, **k):
+                self.shutdown_calls += 1
+                self.shutdown_requests += 1
+                return await real_shutdown(*a, **k)
+        app.shutdown = shutdown
+
+    def launch(self):
+        if self.kind == "futures":
+            self.task = asyncio.create_task(self.app.start())
+        else:
+            self.stop = asyncio.Event()
+            self.task = asyncio.create_task(rbc._run_supervised(self.app, self.stop))
+
+    @property
+    def ingest_started(self):
+        return (self.app.ws_clients[0].started if self.kind == "futures" else self.app.client.started)
+
+    @property
+    def done(self):
+        return self.task.done()
+
+    def status(self):
+        return self.app.storage_pressure_status()
+
+    def graceful_stop(self):
+        if self.kind == "futures":
+            self.app._graceful = asyncio.create_task(self.app._async_shutdown(0))
+        else:
+            self.stop.set()
+
+    async def wait_exit(self, timeout=30):
+        result = await asyncio.wait_for(self.task, timeout)
+        return self.app.exit_code if self.kind == "futures" else result
+
+    @property
+    def wal_closed(self):
+        return self.app._quality_wal._closed
+
+    def leftover_tasks(self):
+        current = asyncio.current_task()
+        return [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+
+    def finalized(self):
+        if self.kind == "futures":
+            assert self.app._shutdown_done is True
+            assert all(t.done() for t in self.app.tasks)
+        else:
+            assert self.app.client.stopped is True
+            assert self.app._disk_task is None or self.app._disk_task.done()
+        assert self.wal_closed is True
+
+
+def _monitor_tasks():
+    return [t for t in asyncio.all_tasks() if t.get_coro().__qualname__.endswith("_storage_pressure_loop")]
+
+
+def _count(alerts, text):
+    return len([m for m in alerts if text in m])
+
+
+# ---- configuration ----
+def test_unknown_grace_default_validation_and_environment():
+    assert DiskPressureConfig().unknown_grace_s == 60.0 == DiskPressureConfig.from_env({}).unknown_grace_s
+    assert DiskPressureConfig.from_env({dp.ENV_UNKNOWN_GRACE_S: "120"}).unknown_grace_s == 120.0
+    for bad in (0, -1, float("nan"), float("inf"), True):
+        with pytest.raises(DiskPressureConfigError):
+            DiskPressureConfig(unknown_grace_s=bad)
+    for bad in ("", "abc", "0", "-5", "nan"):
+        with pytest.raises(DiskPressureConfigError):
+            DiskPressureConfig.from_env({dp.ENV_UNKNOWN_GRACE_S: bad})
+    assert DiskPressureConfig().as_dict()["unknown_grace_s"] == 60.0
+
+
+def test_runner_construction_rejects_invalid_unknown_grace(tmp_path, monkeypatch):
+    monkeypatch.setenv(dp.ENV_UNKNOWN_GRACE_S, "0")
+    with pytest.raises(DiskPressureConfigError):
+        rbc.BybitCollectorApp(data_dir=str(tmp_path))
+
+
+def test_exit_statuses_are_distinct_and_documented():
+    assert (EXIT_DISK_PRESSURE, EXIT_DISK_MONITOR_UNAVAILABLE, EXIT_FATAL_STORAGE) == (1, 69, 70)
+    assert len({EXIT_DISK_PRESSURE, EXIT_DISK_MONITOR_UNAVAILABLE, EXIT_FATAL_STORAGE, 0}) == 4
+
+
+# ---- state machine (unit, injected monotonic clock) ----
+def _grace_unit(grace=60.0, **kw):
+    clock, disk = Clock(), FakeDisk(50)
+    monitor, sent = _unit(disk, clock=clock, config=DiskPressureConfig(unknown_grace_s=grace, **kw))
+    return monitor, disk, clock, sent
+
+
+def test_default_clock_is_monotonic_and_wall_clock_jumps_do_not_matter(monkeypatch):
+    import time
+    monitor = StoragePressureMonitor(label="T", config=DEFAULT, paths=lambda: ["/x"], notify=lambda m: True)
+    assert monitor._clock is time.monotonic
+    clock = Clock()
+    monitor, disk, _, _ = _grace_unit()
+    monitor._clock = clock
+    disk.fail = OSError("x")
+    monkeypatch.setattr(time, "time", lambda: 10 ** 12)                # absurd wall-clock jump
+    assert monitor.poll().unavailable_entered is False
+
+
+def test_unavailable_latches_exactly_once_after_the_grace_period_not_before():
+    monitor, disk, clock, sent = _grace_unit(60.0)
+    monitor.poll()
+    disk.fail = OSError(5, "I/O error")
+    results = []
+    for _ in range(4):
+        results.append(monitor.poll())
+        clock.now += 20                       # failures at +0, +20, +40, +60
+    assert [r.unavailable_entered for r in results] == [False, False, False, True]
+    for _ in range(5):
+        assert monitor.poll().unavailable_entered is False             # one-shot
+    status = monitor.status()
+    assert status["monitor_unavailable_latched"] is True and status["shutdown_reason"] == "disk_monitor_unavailable"
+    assert _count(sent, "MONITOR UNAVAILABLE") == 1 and "NOT a confirmed low-disk" in sent[-1]
+
+
+def test_a_success_before_the_grace_expires_resets_the_failure_run():
+    monitor, disk, clock, sent = _grace_unit(60.0)
+    monitor.poll()
+    disk.fail = OSError("x")
+    monitor.poll(); clock.now += 50; monitor.poll()
+    assert monitor.status()["monitor_failure_duration_s"] == 50.0
+    disk.fail = None
+    assert monitor.poll().measurement_ok
+    assert monitor.status()["monitor_failure_duration_s"] is None and monitor.status()["consecutive_monitor_errors"] == 0
+    disk.fail = OSError("x")
+    monitor.poll(); clock.now += 50
+    assert monitor.poll().unavailable_entered is False               # 50 s into a NEW run, not 100 s
+    clock.now += 10
+    assert monitor.poll().unavailable_entered is True
+
+
+def test_unknown_never_exposes_the_last_classification_as_the_current_severity():
+    monitor, disk, clock, _ = _grace_unit()
+    disk.free_gib = 6.0
+    assert monitor.poll().severity is Severity.WARNING
+    disk.fail = OSError("x")
+    monitor.poll()
+    status = monitor.status()
+    assert status["severity"] == "UNKNOWN" and status["last_classified_severity"] == "WARNING"
+    assert status["free_bytes"] is None and status["total_bytes"] is None and status["measurement_ok"] is False
+
+
+def test_low_space_readings_never_trigger_monitor_unavailable():
+    monitor, disk, clock, _ = _grace_unit(60.0)
+    for free in (6.0, 3.0, 6.0, 50.0):
+        disk.free_gib = free
+        clock.now += 1000
+        result = monitor.poll()
+        assert result.measurement_ok and not result.unavailable_entered
+    assert monitor.status()["monitor_unavailable_latched"] is False
+
+
+def test_establish_measurement_retries_then_succeeds_without_duplicate_alerts():
+    async def scenario():
+        clock, events = Clock(), []
+        disk = ScriptedDisk([OSError("boom"), OSError("boom")], free_gib=50, clock=clock, step=10, events=events)
+        monitor, sent = _unit(disk, clock=clock, config=DiskPressureConfig(interval_s=0.01))
+        result = await asyncio.wait_for(monitor.establish_measurement(), 5)
+        assert result.measurement_ok and result.severity is Severity.OK and disk.calls == 3
+        assert _count(sent, "MONITOR ERROR") == 1                      # rate limited across the retries
+        assert monitor.status()["alerts_sent"] == {"WARNING": 0, "CRITICAL": 0, "EMERGENCY": 0}
+    asyncio.run(scenario())
+
+
+def test_establish_measurement_is_bounded_by_the_grace_and_does_not_spin():
+    async def scenario():
+        clock, events = Clock(), []
+        disk = ScriptedDisk([], clock=clock, step=20, events=events)
+        disk.fail = OSError("dead probe")
+        monitor, sent = _unit(disk, clock=clock, config=DiskPressureConfig(interval_s=0.01, unknown_grace_s=60))
+        result = await asyncio.wait_for(monitor.establish_measurement(), 5)
+        assert not result.measurement_ok and result.unavailable_entered and disk.calls == 4
+        assert _count(sent, "MONITOR UNAVAILABLE") == 1 and _count(sent, "MONITOR ERROR") == 1
+    asyncio.run(scenario())
+
+
+def test_unavailable_callback_is_retried_until_it_succeeds_and_accepted_once():
+    async def scenario():
+        clock = Clock()
+        disk = ScriptedDisk([], clock=clock, step=100)
+        disk.fail = OSError("dead")
+        monitor, sent = _unit(disk, clock=clock, config=DiskPressureConfig(interval_s=0.01, unknown_grace_s=60))
+        attempts = []
+
+        def on_unavailable(result):
+            attempts.append(result)
+            if len(attempts) < 3:
+                raise RuntimeError("stop channel not ready")
+
+        await asyncio.wait_for(monitor.run(lambda r: pytest.fail("not an emergency"), on_unavailable), 5)
+        assert len(attempts) == 3 and _count(sent, "MONITOR UNAVAILABLE") == 1
+    asyncio.run(scenario())
+
+
+def test_establish_measurement_spaces_retries_by_the_interval_and_never_hot_loops():
+    """With a frozen clock the grace can never expire, so only the interval spacing bounds the probe rate."""
+    async def scenario():
+        clock = Clock()                                   # frozen: the grace deadline never arrives
+        disk = ScriptedDisk([], clock=clock, step=0)
+        disk.fail = OSError("dead probe")
+        monitor, _ = _unit(disk, clock=clock, config=DiskPressureConfig(interval_s=0.05, unknown_grace_s=60))
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(monitor.establish_measurement(), 0.4)
+        assert 3 <= disk.calls <= 12, disk.calls          # ~0.4 s / 0.05 s; a hot loop would be thousands
+    asyncio.run(scenario())
+
+
+def test_futures_runtime_stop_reasons_share_one_shutdown_even_if_both_fire(tmp_path, monkeypatch, alerts):
+    h = Harness("futures", tmp_path, monkeypatch)
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        assert h.ingest_started and h.shutdown_requests == 0
+        h.app._on_disk_emergency(None)                    # both stop reasons, repeated, back to back
+        h.app._on_disk_monitor_unavailable(None)
+        h.app._on_disk_emergency(None)
+        assert await h.wait_exit() == 1                   # confirmed emergency outranks unavailable
+        assert h.shutdown_requests == 1                   # one controlled shutdown, not three
+        h.finalized()
+        assert h.leftover_tasks() == []
+    asyncio.run(scenario())
+
+
+# ---- startup (real lifecycles, both runners) ----
+def test_startup_first_probe_fails_then_succeeds_ingestion_starts_only_after_the_valid_measurement(
+        kind, tmp_path, monkeypatch, alerts):
+    clock = Clock()
+    h = Harness(kind, tmp_path, monkeypatch, clock=clock,
+                disk=ScriptedDisk([OSError(5, "I/O error")], free_gib=50, clock=clock, step=20))
+
+    async def scenario():
+        h.launch()
+        for _ in range(100):
+            if h.ingest_started:
+                break
+            await asyncio.sleep(0.02)
+        assert h.ingest_started
+        ev = h.events
+        assert ev.index("measure:fail") < ev.index("measure:ok") < ev.index("ingest:start")
+        assert ev.count("ingest:start") == 1
+        await asyncio.sleep(0.15)                                       # runtime loop is running ...
+        assert len(_monitor_tasks()) == 1                               # ... exactly one monitor task
+        assert h.shutdown_requests == 0 and h.shutdown_calls == 0 and not h.done
+        status = h.status()
+        assert status["severity"] == "OK" and status["monitor_error_alerts"] == 1
+        assert status["alerts_sent"] == {"WARNING": 0, "CRITICAL": 0, "EMERGENCY": 0}
+        h.graceful_stop()
+        assert await h.wait_exit() == 0
+        h.finalized()
+        assert h.leftover_tasks() == []
+    asyncio.run(scenario())
+    assert _count(alerts, "MONITOR ERROR") == 1
+
+
+def test_startup_probe_never_recovers_controlled_shutdown_no_ingestion_exit_69(kind, tmp_path, monkeypatch, alerts):
+    clock = Clock()
+    disk = ScriptedDisk([], clock=clock, step=20)
+    disk.fail = OSError(5, "I/O error")
+    h = Harness(kind, tmp_path, monkeypatch, clock=clock, disk=disk)
+
+    async def scenario():
+        h.launch()
+        assert await h.wait_exit() == EXIT_DISK_MONITOR_UNAVAILABLE == 69
+        assert h.ingest_started is False and "ingest:start" not in h.events
+        assert disk.calls == 4                                          # bounded: failures at +0, +20, +40, +60
+        assert h.shutdown_calls == 1                                    # exactly one shutdown action
+        assert len(_monitor_tasks()) == 0                               # the periodic task was never started
+        h.finalized()
+        assert h.leftover_tasks() == []
+    asyncio.run(scenario())
+    status = h.status()
+    assert status["shutdown_reason"] == "disk_monitor_unavailable" and status["severity"] == "UNKNOWN"
+    assert status["free_bytes"] is None and "I/O error" in status["last_monitor_error"]
+    assert h.app._disk_emergency is None                                # NOT recorded as a disk emergency
+    assert _count(alerts, "MONITOR UNAVAILABLE") == 1 and _count(alerts, "MONITOR ERROR") == 1
+    assert _pressure_alerts(alerts) == []                               # no fabricated severity alert
+    if kind == "futures":
+        assert rc.main(app_factory=lambda: h.app) == 69                 # main() maps the latch to the status
+
+
+def test_startup_probe_fails_then_reports_emergency_exit_1_not_69_and_no_ingestion(kind, tmp_path, monkeypatch, alerts):
+    clock = Clock()
+    h = Harness(kind, tmp_path, monkeypatch, clock=clock,
+                disk=ScriptedDisk([OSError("boom"), 1.0], clock=clock, step=20))
+
+    async def scenario():
+        h.launch()
+        assert await h.wait_exit() == EXIT_DISK_PRESSURE == 1
+        assert h.ingest_started is False and h.shutdown_calls == 1
+        h.finalized()
+    asyncio.run(scenario())
+    assert h.app._disk_monitor_unavailable is None and h.status()["shutdown_reason"] == "disk_emergency"
+    assert _count(alerts, "EMERGENCY") == 1 and _count(alerts, "MONITOR UNAVAILABLE") == 0
+
+
+@pytest.mark.parametrize("free,label", [(6.0, "WARNING"), (3.0, "CRITICAL")])
+def test_startup_warning_or_critical_first_reading_proceeds_and_is_not_confused_with_unknown(
+        kind, tmp_path, monkeypatch, alerts, free, label):
+    h = Harness(kind, tmp_path, monkeypatch, disk=ScriptedDisk([free], free_gib=free))
+
+    async def scenario():
+        h.launch()
+        for _ in range(100):
+            if h.ingest_started:
+                break
+            await asyncio.sleep(0.02)
+        assert h.ingest_started and not h.done
+        status = h.status()
+        assert status["severity"] == label and status["measurement_ok"] is True
+        assert status["monitor_error_alerts"] == 0 and status["monitor_unavailable_latched"] is False
+        h.graceful_stop()
+        assert await h.wait_exit() == 0
+    asyncio.run(scenario())
+    assert [m.split("[")[0].strip() for m in _pressure_alerts(alerts)] == [f"DISK PRESSURE {label}"]   # once
+
+
+# ---- runtime (real lifecycles, both runners) ----
+def test_runtime_transient_error_is_unknown_rate_limited_and_never_stops_collection(kind, tmp_path, monkeypatch, alerts):
+    h = Harness(kind, tmp_path, monkeypatch)
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        assert h.ingest_started and h.status()["severity"] == "OK"
+        h.disk.fail = OSError(5, "I/O error")
+        await asyncio.sleep(0.2)                                        # ~10 failing polls, clock frozen
+        status = h.status()
+        assert status["severity"] == "UNKNOWN" and status["free_bytes"] is None and status["consecutive_monitor_errors"] >= 3
+        assert status["monitor_failure_duration_s"] == 0.0 and status["shutdown_reason"] is None
+        assert not h.done and h.app.exit_code == 0
+        assert _count(alerts, "MONITOR ERROR") == 1                     # rate limited, not one per poll
+        h.disk.fail = None                                              # recovers inside the grace period
+        await asyncio.sleep(0.2)
+        status = h.status()
+        assert status["severity"] == "OK" and status["monitor_failure_duration_s"] is None
+        assert status["consecutive_monitor_errors"] == 0 and "I/O error" in status["last_monitor_error"]
+        assert not h.done and h.shutdown_requests == 0
+        h.graceful_stop()
+        assert await h.wait_exit() == 0
+        h.finalized()
+    asyncio.run(scenario())
+
+
+def test_runtime_persistent_failure_stops_exactly_once_with_status_69_and_cleans_up(kind, tmp_path, monkeypatch, alerts):
+    h = Harness(kind, tmp_path, monkeypatch)
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        assert h.ingest_started
+        h.disk.free_gib = 6.0
+        await asyncio.sleep(0.1)                                        # WARNING classification remembered
+        h.disk.fail = OSError(5, "I/O error")
+        await asyncio.sleep(0.1)
+        h.clock.now += 25
+        await asyncio.sleep(0.1)
+        status = h.status()                                             # mid-failure diagnostics
+        assert status["severity"] == "UNKNOWN" and status["last_classified_severity"] == "WARNING"
+        assert status["monitor_failure_duration_s"] == 25.0 and status["free_bytes"] is None
+        assert status["shutdown_reason"] is None and not h.done
+        h.clock.now += 40                                               # 65 s of consecutive failures >= 60 s grace
+        assert await h.wait_exit() == 69
+        assert h.shutdown_requests == 1                                 # exactly once
+        h.finalized()
+        assert h.leftover_tasks() == []
+    asyncio.run(scenario())
+    status = h.status()
+    assert status["shutdown_reason"] == "disk_monitor_unavailable" and status["free_bytes"] is None
+    assert h.app._disk_emergency is None and h.app._disk_monitor_unavailable is not None
+    assert _count(alerts, "MONITOR UNAVAILABLE") == 1 and _pressure_alerts(alerts)[-1].startswith("DISK PRESSURE WARNING")
+    assert h.app.quality_channel_status()["quality_events_lost"] == 0
+
+
+def test_runtime_intermittent_success_resets_the_consecutive_failure_grace_period(kind, tmp_path, monkeypatch):
+    h = Harness(kind, tmp_path, monkeypatch)
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        h.disk.fail = OSError("flaky")
+        await asyncio.sleep(0.1)
+        h.clock.now += 50
+        await asyncio.sleep(0.1)
+        assert not h.done and h.status()["monitor_failure_duration_s"] == 50.0
+        h.disk.fail = None                                              # success resets the run
+        await asyncio.sleep(0.1)
+        assert h.status()["monitor_failure_duration_s"] is None
+        h.disk.fail = OSError("flaky")
+        await asyncio.sleep(0.1)
+        h.clock.now += 50                                               # 100 s total, but only 50 s consecutive
+        await asyncio.sleep(0.15)
+        assert not h.done and h.shutdown_requests == 0
+        h.clock.now += 20                                               # now 70 s consecutive
+        assert await h.wait_exit() == 69 and h.shutdown_requests == 1
+    asyncio.run(scenario())
+
+
+def test_runtime_real_emergency_during_unknown_uses_the_emergency_path_status_1(kind, tmp_path, monkeypatch, alerts):
+    h = Harness(kind, tmp_path, monkeypatch)
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        h.disk.fail = OSError("flaky")
+        await asyncio.sleep(0.1)
+        h.clock.now += 30
+        await asyncio.sleep(0.1)
+        h.disk.fail = None
+        h.disk.free_gib = 1.0                                           # a real measurement: confirmed emergency
+        assert await h.wait_exit() == 1
+        assert h.shutdown_requests == 1
+        h.finalized()
+    asyncio.run(scenario())
+    assert h.status()["shutdown_reason"] == "disk_emergency" and h.app._disk_monitor_unavailable is None
+    assert _count(alerts, "MONITOR UNAVAILABLE") == 0 and _count(alerts, "EMERGENCY") == 1
+
+
+def test_runtime_warning_and_critical_readings_never_trigger_monitor_unavailable(kind, tmp_path, monkeypatch, alerts):
+    h = Harness(kind, tmp_path, monkeypatch)
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        for free in (6.0, 3.0):
+            h.disk.fail = OSError("flaky")
+            await asyncio.sleep(0.08)
+            h.clock.now += 1000                                         # far beyond any grace if the run had not ended
+            h.disk.fail = None
+            h.disk.free_gib = free
+            await asyncio.sleep(0.15)
+            assert not h.done and h.app.exit_code == 0
+            assert h.status()["monitor_unavailable_latched"] is False
+        assert h.status()["severity"] == "CRITICAL" and h.ingest_started
+        h.graceful_stop()
+        assert await h.wait_exit() == 0
+    asyncio.run(scenario())
+
+
+def test_runtime_throwing_logger_and_notifier_cannot_stop_the_monitor_or_corrupt_state(kind, tmp_path, monkeypatch):
+    class BoomLogger:
+        def __getattr__(self, name):
+            def fail(*a, **k):
+                raise RuntimeError("logger exploded")
+            return fail
+
+    def exploding(message):
+        raise RuntimeError("notifier exploded")
+
+    h = Harness(kind, tmp_path, monkeypatch)
+    monkeypatch.setattr(dp, "logger", BoomLogger())
+    notifications.set_notifier(notifications.CallableNotifier(exploding))
+
+    async def scenario():
+        h.launch()
+        await asyncio.sleep(0.25)
+        h.disk.fail = OSError(5, "I/O error")
+        await asyncio.sleep(0.15)
+        assert h.status()["severity"] == "UNKNOWN" and not h.done          # polling continues despite both failing
+        h.clock.now += 100
+        assert await h.wait_exit() == 69 and h.shutdown_requests == 1
+        h.finalized()
+    asyncio.run(scenario())
+    assert h.status()["shutdown_reason"] == "disk_monitor_unavailable"
+
+
+def test_fatal_storage_status_70_has_priority_over_disk_emergency_and_monitor_unavailable(kind, tmp_path, monkeypatch):
+    h = Harness(kind, tmp_path, monkeypatch)
+    app = h.app
+    app._disk_emergency = {"severity": "EMERGENCY"}
+    app._disk_monitor_unavailable = {"severity": "UNKNOWN"}
+    assert app.exit_code == 1                                           # confirmed emergency outranks unavailable
+    app._disk_emergency = None
+    assert app.exit_code == 69
+    app._disk_emergency = {"severity": "EMERGENCY"}
+    (app if kind == "futures" else app.failure_policy).terminal_failure = object()
+    assert app.exit_code == EXIT_FATAL_STORAGE == 70
+    app._disk_emergency = None
+    assert app.exit_code == 70
+    app.storage_pressure  # still constructed; nothing was torn down
+    asyncio.run(_close(h))
+
+
+async def _close(h):
+    if h.kind == "bybit":
+        await h.app.shutdown()
+    else:
+        h.app.shutdown()
+
+
+def test_bybit_supervisor_mapping_keeps_70_and_maps_disk_stops(tmp_path, monkeypatch):
+    h = Harness("bybit", tmp_path, monkeypatch)
+    h.app._disk_monitor_unavailable = {"severity": "UNKNOWN"}
+
+    async def supervisor_70(app, stop, **kw):
+        return 70
+
+    async def supervisor_0(app, stop, **kw):
+        return 0
+
+    async def supervisor_crash(app, stop, **kw):
+        return 1
+
+    async def scenario():
+        monkeypatch.setattr(rbc, "supervise_standalone_runner", supervisor_70)
+        assert await rbc._run_supervised(h.app, asyncio.Event()) == 70          # 70 never overwritten
+        monkeypatch.setattr(rbc, "supervise_standalone_runner", supervisor_0)
+        assert await rbc._run_supervised(h.app, asyncio.Event()) == 69          # clean stop + latch -> 69
+        monkeypatch.setattr(rbc, "supervise_standalone_runner", supervisor_crash)
+        assert await rbc._run_supervised(h.app, asyncio.Event()) == 1           # a crash keeps its own status
+        await h.app.shutdown()
+    asyncio.run(scenario())
+
+
+# ---- WAL / data truth ----
+def _emit_blocked(kind, app, n):
+    for i in range(n):
+        if kind == "futures":
+            app._websocket_quality_event(rc.QualityEventType.DISCONNECT, f"blocked{i}")
+            app._persist_quality_event(app._quality_queue.get_nowait())
+            app._quality_queue.task_done()          # a real consumer acknowledges; shutdown joins the queue
+        else:
+            app._on_client_quality_event("DISCONNECT", f"blocked{i}", "bybit-1", "bybit")
+
+
+def _wal_ids(wal_dir):
+    return {json.loads(line)["quality_event_id"] for f in wal_dir.glob("*.wal")
+            for line in f.read_text().splitlines() if line.strip()}
+
+
+def _disk_checkpoint(wal_dir):
+    path = wal_dir / CHECKPOINT_FILENAME
+    return json.loads(path.read_text())["checkpointed_seq"] if path.exists() else -1
+
+
+@pytest.mark.parametrize("when", ["startup", "runtime"])
+def test_monitor_unavailable_shutdown_preserves_uncheckpointed_wal_and_restart_recovers(
+        kind, when, tmp_path, monkeypatch):
+    clock = Clock()
+    disk = ScriptedDisk(clock=clock, step=20)
+    h = Harness(kind, tmp_path, monkeypatch, clock=clock, disk=disk)
+    app = h.app
+    wal_dir = app._quality_wal.wal_dir
+    real_replace, armed = os.replace, {"on": False}
+
+    def replace(src, dst, *a, **k):
+        if armed["on"] and str(src).endswith("checkpoint.json.tmp"):
+            raise OSError(28, "No space left on device (injected checkpoint replace)")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", replace)
+    _emit_blocked(kind, app, 1)                                         # healthy event: checkpoint advances
+    armed["on"] = True
+    _emit_blocked(kind, app, 12)
+    assert app.quality_channel_status()["quality_checkpoint_blocked"] is True
+    ids_before, pending_before = _wal_ids(wal_dir), {r["quality_event_id"] for r in QualityEventWAL.recover(wal_dir)}
+    ckpt_before, status_before = _disk_checkpoint(wal_dir), app.quality_channel_status()
+    bytes_before = sum(f.stat().st_size for f in wal_dir.glob("*.wal"))
+    assert len(pending_before) >= 12
+
+    async def scenario():
+        if when == "startup":
+            disk.fail = OSError(5, "I/O error")
+            h.launch()
+        else:
+            h.launch()
+            await asyncio.sleep(0.25)
+            assert h.ingest_started
+            disk.fail = OSError(5, "I/O error")
+            await asyncio.sleep(0.1)
+            clock.now += 100
+        assert await h.wait_exit() == 69
+        h.finalized()
+    asyncio.run(scenario())
+
+    assert ids_before <= _wal_ids(wal_dir)                              # nothing deleted
+    assert pending_before <= {r["quality_event_id"] for r in QualityEventWAL.recover(wal_dir)}
+    assert sum(f.stat().st_size for f in wal_dir.glob("*.wal")) >= bytes_before   # nothing truncated
+    assert _disk_checkpoint(wal_dir) == ckpt_before                     # no fabricated checkpoint success
+    status = app.quality_channel_status()
+    for key in ("quality_events_lost", "quality_events_wal_only", "quality_events_wal_unconfirmed"):
+        assert status[key] == status_before[key], key                   # stopping is not loss
+    assert status["quality_events_lost"] == 0
+
+    monkeypatch.setattr(os, "replace", real_replace)                    # transient fault is gone: restart
+    monkeypatch.setenv(dp.ENV_UNKNOWN_GRACE_S, "60")
+    if kind == "futures":
+        restarted = _real_futures(tmp_path, monkeypatch)
+    else:
+        restarted = rbc.BybitCollectorApp(data_dir=str(tmp_path))
+    try:
+        top = max(int(i.rsplit("-", 1)[1]) for i in pending_before)
+        assert restarted._quality_wal.checkpointed_seq >= top           # existing at-least-once recovery
+        assert restarted.quality_channel_status()["quality_checkpoint_blocked"] is False
+        assert restarted.quality_channel_status()["quality_events_lost"] == 0
+        assert QualityEventWAL.recover(restarted._quality_wal.wal_dir) == []
+    finally:
+        if kind == "futures":
+            restarted.shutdown()
+        else:
+            asyncio.run(restarted.shutdown())

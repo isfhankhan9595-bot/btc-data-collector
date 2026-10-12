@@ -47,8 +47,13 @@ Not in the unit. `EnvironmentFile=/etc/btc-collector.env` (root-owned, 0600) sup
   behaviour under a real systemd/disk fault is not verified live. See `F5_FATAL_STORAGE_TOPOLOGY.md`.
 - **F5-QA-04 disk pressure:** both WAL-backed runners monitor free space continuously (defaults warn at
   7 GiB, critical at 4 GiB, controlled stop with exit status **1** below 2 GiB; configurable via
-  `COLLECTOR_DISK_*`). There is no hard WAL size cap. The unit file is unchanged and Bybit has no unit,
-  so it stays stopped after an emergency stop unless an external supervisor is configured. See
+  `COLLECTOR_DISK_*`). **UNKNOWN fails closed:** ingestion does not start until one valid measurement
+  exists, and storage that cannot be measured for `COLLECTOR_DISK_UNKNOWN_GRACE_S` (default 60 s,
+  consecutive) ends in the controlled shutdown with exit status **69** (distinct from the disk emergency
+  1; **70** keeps priority). There is no hard WAL size cap. The unit file is unchanged; `Restart=always`
+  restarts 1 and 69 too, and a persistently failing probe cycles about every 65 s (grace + `RestartSec`),
+  which by inference may stay under `StartLimitBurst` (not verified on a real host). Bybit has no unit, so
+  it stays stopped after either stop unless an external supervisor is configured. See
   `F5_QA_04_STORAGE_PRESSURE.md`.
 
 ## Runner coverage (repository evidence, P0-12 finalization)
