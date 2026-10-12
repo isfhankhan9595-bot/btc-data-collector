@@ -400,7 +400,8 @@ class Rehearsal:
         self.malformed, self.derivation_failed = Tally(ex), Tally(ex)
         self.missing_trade_id_col = Tally(ex)
         self.marker_tallies = {k: Tally(ex) for k in (
-            "valid", "absent", "absent_v1_hint", "invalid", "size_mismatch", "sha256_mismatch", "record_count_mismatch")}
+            "valid", "absent", "absent_v1_hint", "invalid", "unreadable", "size_mismatch", "sha256_mismatch",
+            "record_count_mismatch")}
         self.marker_tallies["valid"] = Tally(0)
         self.evidence_tallies = {k: Tally(ex) for k in ("ok", "missing", "invalid", "stale", "mismatch", "not_evaluated")}
         self.segs: List[SegInfo] = []
@@ -483,11 +484,12 @@ class Rehearsal:
         t = self.marker_tallies
         if marker.status is pub.MarkerStatus.ABSENT:
             (t["absent_v1_hint"] if marker.v1 else t["absent"]).add(key)
-        elif marker.status in (pub.MarkerStatus.INVALID, pub.MarkerStatus.UNKNOWN_IO):
-            # Report-only tally, unchanged output: an unreadable marker (UNKNOWN_IO) keeps its
-            # "unreadable: ..." reason text here. Without this branch it would fall through to the
-            # ``valid`` branch below and trip ``marker.publication``.
+        elif marker.status is pub.MarkerStatus.INVALID:                 # bytes were read and are malformed
             t["invalid"].add(f"{key}: {_marker_reason(marker.reason)[:100]}")
+        elif marker.status is pub.MarkerStatus.UNKNOWN_IO:              # bytes could NOT be read: contents unknown
+            # Not "invalid" (that is reserved for content that was inspected and found malformed) and not
+            # "absent": real startup_reconcile() refuses to run while any marker is unreadable.
+            t["unreadable"].add(f"{key}: {_marker_reason(marker.reason)[:100]}")
         else:
             t["valid"].add(key)
             p = marker.publication
@@ -986,7 +988,15 @@ class Rehearsal:
         diff = snap["diff"]
         changed = [f"{kind}:{k}" for kind in ("added", "removed", "modified") for k in diff[kind]]
         rebuild_reasons = (["index missing, unreadable or older/other schema"] if schema_stale else []) + diverged
+        # Only markers whose state is KNOWN: an unreadable marker is never written (startup refuses instead).
         markers_to_write = sum(t.count for k, t in self.marker_tallies.items() if k in ("absent", "absent_v1_hint", "invalid"))
+        unreadable_markers = self.marker_tallies["unreadable"].count
+        refusal_reasons = [index["schema_problem"]] if future else []
+        if unreadable_markers:
+            refusal_reasons.append(
+                f"{unreadable_markers} publication marker(s) could not be read (I/O error; contents unknown, NOT "
+                f"malformed): startup_reconcile() aborts with DedupStateError before renaming, re-confirming or "
+                f"replacing any marker, rebuilding the index or writing evidence")
         not_indexed = (cmp_.get("segments_on_disk_not_indexed") or {}).get("count") if cmp_ else None
         evid_bad = sum(t.count for k, t in self.evidence_tallies.items() if k in ("missing", "invalid", "stale", "mismatch"))
         mt = self.marker_tallies
@@ -1029,6 +1039,7 @@ class Rehearsal:
                                   "segments": [s.to_json() for s in affected[: self.top_segments]]},
             "markers": {"valid": mt["valid"].count, "absent": mt["absent"].to_json(),
                         "absent_with_v1_hint": mt["absent_v1_hint"].to_json(), "invalid": mt["invalid"].to_json(),
+                        "unreadable": mt["unreadable"].to_json(),
                         "size_mismatch": mt["size_mismatch"].to_json(), "sha256_mismatch": mt["sha256_mismatch"].to_json(),
                         "record_count_mismatch": mt["record_count_mismatch"].to_json()},
             "legacy_parquet": legacy,
@@ -1043,6 +1054,7 @@ class Rehearsal:
                 "valid_marker_but_sha256_differs": mt["sha256_mismatch"].count,
                 "valid_marker_but_record_count_differs": mt["record_count_mismatch"].count,
                 "index_unsupported_future_schema": 1 if future else 0,
+                "unreadable_publication_marker": unreadable_markers,
                 "unreadable_parquet": self.malformed.count,
                 "identity_derivation_failed": self.derivation_failed.count},
             "estimated_work": {
@@ -1050,7 +1062,7 @@ class Rehearsal:
                 "full_rebuild": {"segments": len(readable), "bytes_read": read_bytes, "rows_decoded": rows_total,
                                  "identity_rows_to_insert": sum(s.distinct for s in readable)},
                 "index_rebuild_expected": bool(rebuild_reasons), "index_rebuild_reasons": rebuild_reasons,
-                "startup_refusal_reasons": [index["schema_problem"]] if future else [],
+                "startup_refusal_reasons": refusal_reasons,
                 "segments_to_index_incrementally": (len(readable) if (not_indexed is None) else not_indexed),
                 "markers_to_write_by_startup_refsync": markers_to_write,
                 "evidence_files_to_write": evid_bad,
@@ -1079,12 +1091,17 @@ def format_summary(result: Dict[str, Any]) -> str:
         f"in {ci['segments_affected']} segments; cross-only extra rows: {ci['cross_only_extra_rows']}",
         f"  markers: valid={r['markers']['valid']} absent={r['markers']['absent']['count']} "
         f"v1-hint={r['markers']['absent_with_v1_hint']['count']} invalid={r['markers']['invalid']['count']} "
+        f"unreadable={r['markers']['unreadable']['count']} "
         f"size-mismatch={r['markers']['size_mismatch']['count']} sha-mismatch={r['markers']['sha256_mismatch']['count']}",
     ]
     if ev.get("checked"):
         e = ev["per_segment"]
         lines.append("  evidence: " + " ".join(f"{k}={e[k]['count']}" for k in ("ok", "missing", "invalid", "stale", "mismatch"))
                      + f" orphans={ev['orphan_evidence_files']['count']}")
+    if r["markers"]["unreadable"]["count"]:
+        lines.append(f"  MARKERS UNREADABLE: {r['markers']['unreadable']['count']} publication marker(s) could not be read "
+                     f"(I/O error, contents unknown; not counted as malformed); startup would REFUSE (DedupStateError) "
+                     f"before changing any marker, segment or index")
     lg = r["legacy_parquet"]
     lines.append(f"  legacy parquet: {lg['legacy_hourly_files']} hourly files (NOT merged); hours with both legacy and "
                  f".seg: {lg['hours_with_both']}")
