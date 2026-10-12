@@ -27,6 +27,7 @@ from collector.tests.test_parquet_writer_publication_failure import expect_fatal
 from collector.collector.quality_events import QualityEventType
 from collector.collector.quality_wal import CHECKPOINT_FILENAME, QualityEventWAL
 from collector.run_bybit_collector import BybitCollectorApp
+from collector.tests._bybit_quality_fixtures import one_row_bybit_quality_segments
 import collector.run_bybit_collector as rbc
 
 
@@ -76,15 +77,15 @@ def _ms(dt) -> int:
 
 
 def _app(root):
-    """Real constructor + real recovery, with the quality writer pinned to one-row segments.
+    """Real constructor + real recovery, with the quality writer built with one-row segments.
 
     Bybit batches quality rows in production (P0-3: 500 rows / 30 s, like Futures). The tests
     in this module exercise WAL/checkpoint/failure semantics at the publication boundary, which
     fires at write() time with one-row segments (the same idiom run_collector's tests use).
-    Batched behaviour itself is covered by tests/test_bybit_quality_batching.py."""
-    app = BybitCollectorApp(data_dir=str(root))
-    app.quality_writer.segment_rows = 1
-    return app
+    The one-row setting is applied BEFORE construction (it must govern constructor-time events and
+    WAL replay too). Batched behaviour itself is covered by tests/test_bybit_quality_batching.py."""
+    with one_row_bybit_quality_segments():
+        return BybitCollectorApp(data_dir=str(root))
 
 
 def _crash(app):

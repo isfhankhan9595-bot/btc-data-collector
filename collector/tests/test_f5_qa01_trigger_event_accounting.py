@@ -56,6 +56,7 @@ from collector.tests.test_f5_a4_counter_accuracy import (
 import collector.run_bybit_collector as rbc
 import collector.run_collector as rc
 from collector.tests.test_p0_4_runner_lifecycle import _build, _publish_all
+from collector.tests._bybit_quality_fixtures import one_row_bybit_quality_segments
 
 KINDS = ["usdm", "bybit"]
 APP_CLASS = {"usdm": rc.CollectorApp, "bybit": rbc.BybitCollectorApp}
@@ -73,12 +74,16 @@ def alerts():
 # ----------------------------------------------------------------------------- helpers
 def _make(kind, tmp_path, monkeypatch):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    app = _build(kind, tmp_path, monkeypatch)
-    # Both venues batch quality rows (500/segment, P0-3). These tests' subject is accounting at the
-    # publication boundary, which fires at write() time with one-row segments, so both venues are
-    # pinned to that shape. Batched behaviour: _make_batched here and test_bybit_quality_batching.py.
-    app.quality_writer.segment_rows = 1
-    return app
+    if kind == "usdm":
+        app = _build(kind, tmp_path, monkeypatch)
+        # Futures batches quality rows (500/segment). One-row segments reproduce the shape where write()
+        # itself publishes the segment and then opens the next one. (Futures configuration unchanged.)
+        app.quality_writer.segment_rows = 1
+        return app
+    # Bybit also batches (P0-3). Its one-row shape must be in force at CONSTRUCTION, so it is scoped
+    # around the build. Batched behaviour: _make_batched here and test_bybit_quality_batching.py.
+    with one_row_bybit_quality_segments():
+        return _build(kind, tmp_path, monkeypatch)
 
 
 def _make_batched(kind, tmp_path, monkeypatch):
