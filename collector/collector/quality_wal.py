@@ -186,7 +186,19 @@ class QualityEventWAL:
                 max_total_bytes: Optional[int] = None,
                 process_start_marker: Optional[str] = None, start_seq: int = 0):
         self.wal_dir = Path(wal_dir)
+        # fsyncing the WAL directory persists entries inside it, but not the
+        # entry that names the directory itself. Record every newly-created
+        # directory's parent before relying on the new WAL path for durability.
+        missing_directories = []
+        candidate = self.wal_dir
+        while not candidate.exists():
+            missing_directories.append(candidate)
+            if candidate.parent == candidate:
+                break
+            candidate = candidate.parent
         self.wal_dir.mkdir(parents=True, exist_ok=True)
+        for created_directory in reversed(missing_directories):
+            _fsync_directory(created_directory.parent)
         self.max_bytes = max_bytes
         raw_cap = os.environ.get(ENV_MAX_TOTAL_BYTES) if max_total_bytes is None else None
         if max_total_bytes is None:
