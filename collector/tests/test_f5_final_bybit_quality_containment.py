@@ -418,7 +418,10 @@ def test_counters_are_zero_and_the_channel_healthy_before_and_after_normal_traff
     try:
         healthy = {"quality_degraded": False, "quality_events_wal_only": 0, "quality_events_wal_unconfirmed": 0,
                    "quality_events_lost": 0, "quality_checkpoint_blocked": False,
-                   "quality_checkpoint_block_reason": None, "quality_failure": None}
+                   "quality_checkpoint_block_reason": None, "quality_failure": None,
+                   "quality_wal_capacity_exhausted": False,
+                   "quality_wal_capacity_reason": None,
+                   "quality_wal_max_bytes": 100_000_000}
         assert app.quality_channel_status() == healthy
         for i in range(5):
             _emit_ws(app, f"healthy-{i}")
@@ -458,7 +461,7 @@ def test_wal_retained_events_are_really_replayed_by_the_next_start(tmp_path, mon
         _cleanup(app)
 
 
-def test_events_whose_wal_append_is_in_doubt_are_unconfirmed_not_retained_and_not_lost(tmp_path, monkeypatch, caplog):
+def test_uncertain_wal_write_freezes_followup_appends_and_counts_double_failure_loss(tmp_path, monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     app = _app(tmp_path)
     try:
@@ -469,12 +472,17 @@ def test_events_whose_wal_append_is_in_doubt_are_unconfirmed_not_retained_and_no
             _emit_ws(app, f"u{i}")
 
         assert app.quality_degraded is not None
-        assert _status_counts(app) == (0, N_EVENTS, 0), "in-doubt events must be neither 'retained' nor 'lost'"
+        # The first full JSONL record reached the file, but fsync failed so its
+        # durability is uncertain. The WAL now freezes further appends to avoid
+        # writing behind an uncertain tail; with the Parquet writer also failed,
+        # the remaining N_EVENTS-1 events genuinely have no surviving copy.
+        assert _status_counts(app) == (0, 1, N_EVENTS - 1)
         errors = _error_events(caplog)
         assert errors.count("bybit_quality_event_wal_append_failed_in_persist") == 1, "per-event log while degraded"
-        assert errors.count("bybit_quality_event_wal_unconfirmed") == N_EVENTS.bit_length(), errors  # 1,2,4,...,32
+        assert errors.count("bybit_quality_event_wal_unconfirmed") == 1, errors
+        assert errors.count("bybit_quality_event_unrecorded") == N_EVENTS.bit_length(), errors
         assert len(errors) <= 12
-        assert len(_wal_records(tmp_path)) == N_EVENTS, "the bytes did reach the file; durability is just unproven"
+        assert len(_wal_records(tmp_path)) == 1, "later appends must not extend a WAL with uncertain write state"
     finally:
         _cleanup(app)
 
