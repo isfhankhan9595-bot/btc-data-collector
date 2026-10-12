@@ -531,35 +531,36 @@ def _safe_max_seq_in_file(wal_file: Path) -> Optional[int]:
     """Return the maximum seq only when every line is valid and complete.
 
     Used for destructive cleanup, so it is intentionally stricter than the
-    resume-sequence helper below. A corrupt or unterminated tail means the
-    file cannot be proven fully covered by a checkpoint and must be retained.
-    Empty files contain no event evidence and return -1.
+    resume-sequence helper below. Stream one line at a time: a large WAL must
+    not be read into RAM just to decide whether it can be deleted. A corrupt
+    or unterminated tail means the file cannot be proven fully covered and
+    must be retained. Empty files contain no event evidence and return -1.
     """
-    try:
-        raw = wal_file.read_bytes()
-        if not raw:
-            return -1
-        text = raw.decode("utf-8", errors="strict")
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not text.endswith("\n"):
-        return None
     highest = -1
-    for line in text.splitlines():
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(record, dict):
-            return None
-        seq = record.get("seq")
-        if isinstance(seq, bool) or not isinstance(seq, int):
-            return None
-        highest = max(highest, seq)
+    try:
+        with wal_file.open("rb") as handle:
+            for raw_line in handle:
+                if not raw_line.endswith(b"\\n"):
+                    return None
+                try:
+                    line = raw_line.decode("utf-8", errors="strict").strip()
+                except UnicodeDecodeError:
+                    return None
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(record, dict):
+                    return None
+                seq = record.get("seq")
+                if isinstance(seq, bool) or not isinstance(seq, int):
+                    return None
+                highest = max(highest, seq)
+    except OSError:
+        return None
     return highest
-
 
 def _max_seq_in_file(wal_file: Path) -> Optional[int]:
     """The highest `seq` found in wal_file, tolerating a truncated final
