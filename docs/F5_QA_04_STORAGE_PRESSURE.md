@@ -37,8 +37,8 @@ and are **not** a basis for a size limit.
 integer. The value is intentionally independent of the per-file rotation threshold (`max_bytes`).
 Every append sums all `.wal` file sizes in the WAL namespace and measures the candidate's UTF-8
 JSONL bytes including newline. If it cannot prove the candidate will fit, the append is refused
-before writing; admission latches closed until restart. A startup WAL already at/over the limit or
-an unmeasurable aggregate also latches admission closed. Invalid capacity configuration fails
+before writing; admission latches closed until restart. After recovery-gated removal of strictly validated checkpoint-covered files, any remaining aggregate
+already at/over the limit or an unmeasurable aggregate latches admission closed. Invalid capacity configuration fails
 startup; it is never coerced.
 
 **No WAL evidence is deleted, truncated, rewritten, or moved to meet the limit.** Existing
