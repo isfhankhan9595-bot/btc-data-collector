@@ -135,7 +135,13 @@ class Rig:
             self.app._on_client_quality_event("DISCONNECT", reason, "bybit-1", "bybit")
         else:
             self.app._websocket_quality_event(QualityEventType.DISCONNECT, reason)
-            event = self.app._quality_queue.get_nowait()
+            # At the hard WAL cap the runner skips the RAM queue and directly
+            # force-publishes the event, so an empty queue is the expected
+            # durable-degraded path rather than an event loss.
+            try:
+                event = self.app._quality_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
             self.app._persist_quality_event(event)
             self.app._quality_queue.task_done()
 
