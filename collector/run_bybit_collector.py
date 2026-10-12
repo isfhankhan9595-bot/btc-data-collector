@@ -79,7 +79,7 @@ from collector.collector.failure_topology import FailureRecord
 from collector.collector.instrument import BYBIT_LINEAR_BTCUSDT, InstrumentIdError
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
-from collector.collector.quality_wal import QualityEventWAL, QualityWALCorruption
+from collector.collector.quality_wal import QualityEventWAL, QualityWALCapacityExceeded, QualityWALCorruption
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
 from collector.collector.standalone_failure_policy import (
     StandaloneFailurePolicy,
@@ -208,6 +208,7 @@ class BybitCollectorApp:
             label="BYBIT", config=DiskPressureConfig.from_env(),
             paths=lambda: [self.quality_writer.base_dir, self._quality_wal.wal_dir],
             wal_dir=lambda: self._quality_wal.wal_dir,
+            wal_max_bytes=lambda: self._quality_wal.max_total_bytes,
             checkpoint_state=lambda: (self._quality_checkpoint_is_blocked(),
                                       getattr(self, "_quality_checkpoint_block_reason", None)))
 
@@ -576,7 +577,8 @@ class BybitCollectorApp:
         wal = getattr(self, "_quality_wal", None)
         wal_seq = event.get("_wal_seq")
         wal_protected = wal is not None and wal_seq is not None
-        if wal is not None and wal_seq is None:
+        capacity_fallback = bool(event.get("_wal_capacity_exhausted", False))
+        if wal is not None and wal_seq is None and not capacity_fallback:
             # The row below takes timestamp / local_process_ts from the wall
             # clock when the event does not carry them. Pin exactly those
             # values into the WAL record NOW, so a replayed row carries the
@@ -591,6 +593,12 @@ class BybitCollectorApp:
                 event_type_for_wal = event_type_for_wal.value
             try:
                 event_id = wal.append({**event, "event_type": event_type_for_wal})
+            except QualityWALCapacityExceeded as exc:
+                capacity_fallback = True
+                if exc.newly_exhausted:
+                    logger.error("bybit_quality_wal_capacity_exhausted",
+                                 reason=exc.reason, current_bytes=exc.current_bytes,
+                                 requested_bytes=exc.requested_bytes, limit_bytes=exc.max_total_bytes)
             except Exception as exc:  # noqa: BLE001 - any append failure, not only OSError
                 _policy = getattr(self, "failure_policy", None)
                 if _policy is None or _policy.quality_degraded is None:
