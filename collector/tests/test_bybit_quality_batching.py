@@ -36,11 +36,18 @@ Stage 2B-1 (WAL-cap fallback under batching) is appended after Stage 2A. The WAL
 closed through its real admission arithmetic (``QualityEventWAL.append`` refuses the record itself, or
 the startup check latches from the on-disk size), and the app's real capacity-fallback branch, writer,
 durable callback and checkpoint then run unmodified.
+
+Stage 2B-2 (shutdown and recovery) is appended after Stage 2B-1. ``shutdown()`` is driven for real: the
+final partial batch is published by the real ``quality_writer.close()`` and checkpointed by the real
+callback before the real WAL is closed. Publication failure is injected at ``os.replace`` of the segment
+and at the directory ``fsync``; recovery is the real startup replay of a second app on the same storage.
+The ordering tests wrap each real ``close()`` (they call through) so order is observed, not simulated.
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import time as _real_time
 from collections import Counter
 
@@ -880,3 +887,282 @@ def test_defence_in_depth_a_cap_refused_publication_stops_the_checkpoint_before_
     # the published high-water mark is `after` (a+2); the checkpoint must still stop BEFORE `stuck` (a)
     assert _disk_ckpt(tmp_path) == wal[0]["seq"] < stuck_seq < wal[2]["seq"]
     assert [e["reason"] for e in _pending(tmp_path)] == ["stuck", "after"]  # `after` replays (at-least-once)
+
+
+# =========================================================================================== STAGE 2B-2
+# Shutdown and recovery. The open (partial) batch is published by the real ``quality_writer.close()``,
+# checkpointed by the real durable callback, and only then is the real WAL closed.
+_SIX_OTHER_WRITERS = ("raw_wire_writer", "ob_writer", "trades_writer", "mark_writer", "oi_writer", "liq_writer")
+
+
+class _GatedStopClient:
+    """Network stand-in whose ``stop()`` is ASYNCHRONOUS and stays suspended until released."""
+
+    def __init__(self):
+        self.running = False
+        self.entered = asyncio.Event()      # set once stop() is suspended
+        self.release = asyncio.Event()
+
+    async def start(self):
+        await asyncio.sleep(3600)
+
+    async def stop(self):
+        self.entered.set()
+        await self.release.wait()
+
+
+class _DirFsyncFault:
+    """Fails the ``fsync`` of the quality segment DIRECTORY (and only that) while armed.
+
+    This is the real ``dir_fsync`` publication stage: the segment has already been renamed into place, so
+    its durability is unproven. Other fsyncs (tmp file, WAL, WAL directory) are untouched."""
+
+    def __init__(self, monkeypatch, directory):
+        self.armed = False
+        self.hits = 0
+        self._ino = os.stat(directory).st_ino
+        real = os.fsync
+
+        def fsync(fd):
+            number = fd if isinstance(fd, int) else fd.fileno()
+            st = os.fstat(number)
+            if self.armed and stat.S_ISDIR(st.st_mode) and st.st_ino == self._ino:
+                self.hits += 1
+                raise OSError(5, "I/O error (injected segment directory fsync)")
+            return real(fd)
+        monkeypatch.setattr(os, "fsync", fsync)
+
+
+def _record_close_order(app, monkeypatch, probe=lambda: None):
+    """Wrap (never replace) every real ``close()``: record ``(name, probe())`` on entry, then run it."""
+    order = []
+
+    def wrap(name, obj):
+        real = obj.close
+
+        def close():
+            order.append((name, probe()))
+            return real()
+        monkeypatch.setattr(obj, "close", close)
+    for name in (*_SIX_OTHER_WRITERS, "quality_writer"):
+        wrap(name, getattr(app, name))
+    wrap("wal", app._quality_wal)
+    return order
+
+
+async def _start_running(app, monkeypatch, client=None):
+    """Real ``run()`` with a fast idle tick; returns ``(runner, idle_task)``."""
+    monkeypatch.setattr(rbc, "QUALITY_IDLE_TICK_SECONDS", 0.01)
+    app.client = client if client is not None else _StubClient()
+    runner = asyncio.create_task(app.run())
+    await _until(lambda: getattr(app, "_quality_idle_task", None) is not None)
+    return runner, app._quality_idle_task
+
+
+async def test_shutdown_publishes_the_final_buffered_tail_checkpoints_it_and_closes_the_wal(app, tmp_path):
+    app.client = _StubClient()
+    _persist(app, 3, "tail-")
+    wal = _wal_records(tmp_path)
+    seqs = {w["seq"] for w in wal}
+    assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1             # only WAL-appended and buffered
+    assert app._quality_wal_inflight == seqs
+
+    await app.shutdown()
+
+    (seg,) = _segs(tmp_path)
+    assert _seqs_in_segment(seg) == seqs                                    # the tail really is in the segment
+    assert sorted(r["reason"] for r in _rows(tmp_path)) == ["tail-0", "tail-1", "tail-2"]
+    assert _disk_ckpt(tmp_path) == max(seqs)                                # checkpointed by the real callback
+    assert _pending(tmp_path) == [] and app._quality_wal_inflight == set()
+    assert app._quality_checkpoint_blocked is False
+    assert app._quality_wal._closed is True and app.quality_writer._closed is True
+    assert _tmps(tmp_path) == []
+
+
+async def test_a_failed_shutdown_tail_publication_is_contained_and_every_record_stays_recoverable(
+        app, faults, tmp_path, _alerts):
+    app.client = _StubClient()
+    _persist(app, 3, "sd-fail-")
+    wal = _wal_records(tmp_path)
+    ids = {w["quality_event_id"] for w in wal}
+    faults.fail_segment_rename = True
+
+    await app.shutdown()                                    # contained: shutdown itself does not raise
+
+    assert faults.segment_rename_hits == 1                  # the publication really failed
+    assert _segs(tmp_path) == [] and _rows(tmp_path) == []  # nothing reported as published
+    assert len(_tmps(tmp_path)) == 1                        # .tmp left for orphan recovery
+    assert _disk_ckpt(tmp_path) == -1                       # never checkpointed
+    assert {e["quality_event_id"] for e in _pending(tmp_path)} == ids       # every record recoverable
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "quality_writer_close_failed"
+    assert app._quality_wal._closed is True                 # the WAL is still closed, AFTER the failed publish
+    assert len([m for m in _alerts if "QUALITY WAL CHECKPOINT BLOCKED [BYBIT]" in m]) == 1
+
+
+async def test_a_failed_shutdown_tail_after_a_published_segment_checkpoints_only_the_published_prefix(
+        app, faults, tmp_path):
+    app.client = _StubClient()
+    _persist(app, 503, "pp-")                               # 500 publish from write(); 3 stay buffered
+    wal = _wal_records(tmp_path)
+    first_seqs, last_first = _seq_range(wal, 0, 500), wal[499]["seq"]
+    tail_ids = {w["quality_event_id"] for w in wal[500:]}
+    all_ids = {w["quality_event_id"] for w in wal}
+    (seg1,) = _segs(tmp_path)
+    assert _seqs_in_segment(seg1) == first_seqs and _disk_ckpt(tmp_path) == last_first
+
+    faults.fail_segment_rename = True
+    await app.shutdown()
+
+    assert faults.segment_rename_hits == 1
+    assert _segs(tmp_path) == [seg1]                        # the failed tail never became a second segment
+    assert _disk_ckpt(tmp_path) == last_first               # the checkpoint stops at the published prefix
+    assert {e["quality_event_id"] for e in _pending(tmp_path)} == tail_ids  # exactly the tail is pending
+
+    faults.fail_segment_rename = False
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))        # real startup recovery
+    try:
+        counts = Counter(r["quality_event_id"] for r in _rows(tmp_path))
+        assert set(counts) == all_ids and set(counts.values()) == {1}       # 503 rows: the tail replayed once
+        assert _disk_ckpt(tmp_path) == wal[502]["seq"] and _pending(tmp_path) == []
+        assert app2._quality_checkpoint_blocked is False
+    finally:
+        _crash(app2)
+
+
+async def test_a_directory_fsync_failure_at_shutdown_is_never_checkpointed_and_replays_at_least_once(
+        app, tmp_path, monkeypatch):
+    dirfault = _DirFsyncFault(monkeypatch, _qdir(tmp_path))
+    app.client = _StubClient()
+    _persist(app, 3, "dfs-")
+    wal = _wal_records(tmp_path)
+    ids = {w["quality_event_id"] for w in wal}
+    dirfault.armed = True
+
+    await app.shutdown()
+
+    assert dirfault.hits == 1                               # the dir_fsync stage really failed
+    assert len(_segs(tmp_path)) == 1                        # renamed into place, but durability was never proven
+    assert _disk_ckpt(tmp_path) == -1                       # so it is NOT checkpointed
+    assert {e["quality_event_id"] for e in _pending(tmp_path)} == ids
+    assert app._quality_checkpoint_blocked is True
+    assert app._quality_checkpoint_block_reason == "quality_writer_close_failed"
+    assert app._quality_wal._closed is True
+
+    dirfault.armed = False
+    app2 = BybitCollectorApp(data_dir=str(tmp_path))
+    try:
+        counts = Counter(r["quality_event_id"] for r in _rows(tmp_path) if r["quality_event_id"] in ids)
+        assert set(counts) == ids and min(counts.values()) >= 1             # at-least-once; same ids on replay
+        assert _disk_ckpt(tmp_path) >= max(w["seq"] for w in wal) and _pending(tmp_path) == []
+        assert app2._quality_checkpoint_blocked is False
+    finally:
+        _crash(app2)
+
+
+async def test_the_idle_task_is_retired_and_awaited_before_the_first_writer_close(
+        app, clock, tmp_path, monkeypatch):
+    runner, task = await _start_running(app, monkeypatch)
+    try:
+        _persist(app, 2, "retire-")
+        seqs = {w["seq"] for w in _wal_records(tmp_path)}
+        order = _record_close_order(app, monkeypatch, probe=task.done)
+
+        await app.shutdown()
+
+        assert [name for name, _ in order][-2:] == ["quality_writer", "wal"] and len(order) == 8
+        assert all(idle_done is True for _, idle_done in order)     # already finished at EVERY close
+        assert task.cancelled() and app._quality_idle_task is None
+        assert _seqs_in_segment(_segs(tmp_path)[0]) == seqs and len(_segs(tmp_path)) == 1
+        assert _disk_ckpt(tmp_path) == max(seqs)
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+async def test_cancelling_shutdown_while_client_stop_is_suspended_propagates_cancellation_and_closes_nothing(
+        app, tmp_path, monkeypatch):
+    client = _GatedStopClient()
+    runner, _ = await _start_running(app, monkeypatch, client)
+    try:
+        _persist(app, 3, "cancel-")
+        ids = {w["quality_event_id"] for w in _wal_records(tmp_path)}
+        shutdown_task = asyncio.create_task(app.shutdown())
+        await asyncio.wait_for(client.entered.wait(), 5.0)          # shutdown is now suspended in client.stop()
+
+        shutdown_task.cancel()
+        with pytest.raises(asyncio.CancelledError):                 # cancellation propagates; it is not swallowed
+            await shutdown_task
+        assert shutdown_task.cancelled()
+
+        for name in (*_SIX_OTHER_WRITERS, "quality_writer"):        # nothing was closed prematurely
+            assert getattr(app, name)._closed is False, name
+        assert app._quality_wal._closed is False
+        assert {e["quality_event_id"] for e in _pending(tmp_path)} == ids    # unresolved data still recoverable
+        assert _segs(tmp_path) == [] and _disk_ckpt(tmp_path) == -1
+    finally:
+        client.release.set()
+        idle = getattr(app, "_quality_idle_task", None)             # never leak the background task out of a test
+        if idle is not None:
+            idle.cancel()
+            await asyncio.gather(idle, return_exceptions=True)
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+async def test_shutdown_closes_the_other_writers_first_then_the_quality_writer_and_only_then_the_wal(
+        app, tmp_path, monkeypatch):
+    app.client = _StubClient()
+    _persist(app, 2, "order-")
+    order = _record_close_order(app, monkeypatch)
+    assert app.quality_writer.on_segment_durable == app._on_quality_segment_durable
+    real_cb = app._on_quality_segment_durable
+    wal_open_at_publish = []
+
+    def durable(path, record_count):
+        wal_open_at_publish.append(app._quality_wal._closed is False)
+        order.append(("quality_segment_published", None))
+        real_cb(path, record_count)
+    app.quality_writer.on_segment_durable = durable
+
+    await app.shutdown()
+
+    names = [name for name, _ in order]
+    assert set(names[:6]) == set(_SIX_OTHER_WRITERS) and len(names) == 9
+    assert names[6:] == ["quality_writer", "quality_segment_published", "wal"]
+    assert wal_open_at_publish == [True]                    # the final publish ran while the WAL was still open
+    assert _disk_ckpt(tmp_path) == max(w["seq"] for w in _wal_records(tmp_path))
+
+
+async def test_another_writers_close_failure_is_reported_through_the_still_open_quality_writer(
+        app, tmp_path, monkeypatch):
+    app.client = _StubClient()
+
+    def boom():
+        raise OSError("raw close failed (injected)")
+    monkeypatch.setattr(app.raw_wire_writer, "close", boom)
+
+    await app.shutdown()
+
+    reason = "storage_shutdown_close_failed:raw_wire_writer:OSError"
+    (rec,) = [w for w in _wal_records(tmp_path) if w["reason"] == reason]
+    assert [r["reason"] for r in _rows(tmp_path)] == [reason]               # published by the final quality close
+    assert _disk_ckpt(tmp_path) == rec["seq"] and _pending(tmp_path) == []
+    assert app._quality_checkpoint_blocked is False and app._quality_wal._closed is True
+
+
+async def test_shutdown_with_nothing_buffered_publishes_no_empty_segment_and_moves_no_checkpoint(
+        app, clock, tmp_path):
+    app.client = _StubClient()
+    _persist(app, 2, "done-")
+    clock.set_elapsed(30.0)
+    app._quality_publish_if_due()                           # already published and checkpointed
+    (seg,) = _segs(tmp_path)
+    ckpt = _disk_ckpt(tmp_path)
+    assert ckpt == max(w["seq"] for w in _wal_records(tmp_path))
+
+    await app.shutdown()
+
+    assert _segs(tmp_path) == [seg] and _disk_ckpt(tmp_path) == ckpt and len(_rows(tmp_path)) == 2
+    assert _pending(tmp_path) == [] and app._quality_checkpoint_blocked is False
+    assert app._quality_wal._closed is True
