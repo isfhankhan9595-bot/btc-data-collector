@@ -386,7 +386,10 @@ class QualityEventWAL:
         for wal_file in sorted(self.wal_dir.glob("*.wal")):
             if wal_file == self._active_path:
                 continue  # never delete the file currently being appended to
-            max_seq = _max_seq_in_file(wal_file)
+            max_seq = _safe_max_seq_in_file(wal_file)
+            # Unknown/malformed/truncated contents are evidence, not a basis
+            # for cleanup. Only a fully parseable file whose every seq is
+            # at/below the durable checkpoint may be removed.
             if max_seq is not None and max_seq <= self._checkpointed_seq:
                 try:
                     wal_file.unlink(missing_ok=True)
@@ -522,6 +525,40 @@ def _read_checkpointed_seq(wal_dir: Path) -> int:
         # deduplicates quality events automatically (replay is
         # at-least-once; reconciliation is a downstream responsibility).
         return -1
+
+
+def _safe_max_seq_in_file(wal_file: Path) -> Optional[int]:
+    """Return the maximum seq only when every line is valid and complete.
+
+    Used for destructive cleanup, so it is intentionally stricter than the
+    resume-sequence helper below. A corrupt or unterminated tail means the
+    file cannot be proven fully covered by a checkpoint and must be retained.
+    Empty files contain no event evidence and return -1.
+    """
+    try:
+        raw = wal_file.read_bytes()
+        if not raw:
+            return -1
+        text = raw.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.endswith("\\n"):
+        return None
+    highest = -1
+    for line in text.splitlines():
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(record, dict):
+            return None
+        seq = record.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            return None
+        highest = max(highest, seq)
+    return highest
 
 
 def _max_seq_in_file(wal_file: Path) -> Optional[int]:
