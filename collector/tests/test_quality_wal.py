@@ -512,7 +512,7 @@ def test_startup_cleanup_preserves_any_corrupt_or_unterminated_wal_file(tmp_path
     wal.close()
     old_active = wal._active_path
     with old_active.open("ab") as handle:
-        handle.write(b"{corrupt-tail}\\n")
+        handle.write(b"{corrupt-tail}\n")
 
     restarted = QualityEventWAL(tmp_path, process_start_marker="restarted")
     assert old_active.exists()
