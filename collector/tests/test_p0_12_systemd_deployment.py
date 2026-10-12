@@ -280,4 +280,4 @@ def test_documentation_describes_the_failed_state_and_the_recovery_action():
         assert "not verified" in text.lower() or "unverified" in text.lower(), doc
     storage = (REPO / "docs" / "F5_QA_04_STORAGE_PRESSURE.md").read_text()
     assert "Bybit" in storage and "UNKNOWN" in storage
-    assert "aggregate admission cap" in storage.lower()
+    assert "aggregate wal admission cap" in storage.lower()
