@@ -418,7 +418,7 @@ def test_aggregate_cap_counts_every_wal_file_and_rejects_before_writing(tmp_path
         "quality_event_id": "p1-2",
         "seq": 2,
     }
-    requested = len((json.dumps(candidate, default=str) + "\\n").encode("utf-8"))
+    requested = len((json.dumps(candidate, default=str) + "\n").encode("utf-8"))
     # Allow the candidate to fit beside the active file alone, but not when
     # every WAL file in the shared namespace is counted.
     first_active_size = first._active_path.stat().st_size
