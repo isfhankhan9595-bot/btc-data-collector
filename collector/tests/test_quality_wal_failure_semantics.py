@@ -377,6 +377,20 @@ def test_partial_write_failure_latches_wal_before_any_later_append(tmp_path):
     assert wal._active_path.read_bytes() == b'{"excha'
 
 
+def test_new_wal_directory_syncs_each_parent_entry(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(qw, "_fsync_directory", lambda path: calls.append(path))
+    wal_dir = tmp_path / "quality_events" / "wal"
+    wal = QualityEventWAL(wal_dir, process_start_marker="p")
+
+    # Creating quality_events/wal adds one entry to tmp_path and one entry to
+    # quality_events; the WAL itself adds an entry inside wal_dir.
+    assert tmp_path in calls
+    assert wal_dir.parent in calls
+    assert wal_dir in calls
+    wal.close()
+
+
 def test_checkpoint_directory_fsync_failure_keeps_in_memory_checkpoint_and_wal(tmp_path, monkeypatch):
     wal = QualityEventWAL(tmp_path, process_start_marker="p")
     wal.append(_ev("published-before-checkpoint"))
