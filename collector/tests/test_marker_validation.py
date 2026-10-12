@@ -924,13 +924,16 @@ def test_read_marker_statuses_and_reasons_are_unchanged_for_recovery_callers(tmp
     assert result.v1 is (label in {"v1 hint", "empty object"})
 
 
-def test_read_marker_keeps_its_recovery_semantics_for_absence_and_io_errors(tmp_path):
+def test_read_marker_keeps_absence_and_reports_io_errors_as_unknown_io_not_invalid(tmp_path):
     seg = tmp_path / SEG
     seg.write_bytes(b"x")
     assert (pub.read_marker(seg).status, pub.read_marker(seg).reason) == (pub.MarkerStatus.ABSENT, "no marker file")
     pub.marker_path(seg).mkdir()                                     # an OSError that is not FileNotFoundError
     result = pub.read_marker(seg)
-    assert result.status is pub.MarkerStatus.INVALID and result.reason.startswith("unreadable: IsADirectoryError")
+    # An unreadable marker is unknown evidence: it used to be reported as INVALID (malformed content),
+    # which made startup recovery rename a marker it had never read. The reason text is unchanged.
+    assert result.status is pub.MarkerStatus.UNKNOWN_IO and result.reason.startswith("unreadable: IsADirectoryError")
+    assert result.status is not pub.MarkerStatus.INVALID and not result.valid and not result.v1
     assert pub.MARKER_SCHEMA == 2 and pub.ALLOWED_CONFIRMED_BY == {"writer", "startup_refsync"}
 
 

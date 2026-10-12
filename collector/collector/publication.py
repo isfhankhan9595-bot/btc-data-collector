@@ -81,8 +81,13 @@ class PublicationState(str, Enum):
 
 class MarkerStatus(str, Enum):
     VALID = "valid"
+    #: The marker's bytes were read and are provably malformed (content evidence).
     INVALID = "invalid"
     ABSENT = "absent"
+    #: The marker's bytes could NOT be read (an ``OSError`` other than "not found"): its content is
+    #: unknown. Neither proof of corruption nor proof of absence -- recovery must stop, never
+    #: rename, re-confirm or replace it, and never treat the segment as merely unconfirmed.
+    UNKNOWN_IO = "unknown_io"
 
 
 @dataclass(frozen=True)
@@ -291,9 +296,11 @@ def parse_marker_bytes(raw: bytes, seg_name: str) -> MarkerResult:
 
 
 def read_marker(seg_path: Path | str) -> MarkerResult:
-    """Classify ``<seg>.meta.json``: VALID / INVALID / ABSENT. Never raises.
+    """Classify ``<seg>.meta.json``: VALID / INVALID / ABSENT / UNKNOWN_IO. Never raises.
 
-    * no file -> ABSENT
+    * no file (``FileNotFoundError``) -> ABSENT
+    * the file exists but could not be read (any other ``OSError``) -> UNKNOWN_IO: the content is
+      unknown, so this is NOT INVALID (malformed bytes) and NOT ABSENT. Callers must fail closed.
     * a JSON object with no ``publication`` key (pre-F1 hint) -> ABSENT, ``v1=True``
     * anything else that is not a fully valid schema-2 marker for THIS segment -> INVALID
 
@@ -301,9 +308,10 @@ def read_marker(seg_path: Path | str) -> MarkerResult:
     :func:`classify_segment`'s / the coordinator's job (they hold the file).
 
     The content rules live in :func:`parse_marker_bytes`. This function is the *recovery* reader: it
-    reads the whole file unbounded and maps any ``OSError`` other than "not found" to INVALID, which
-    is a conservative recovery verdict and NOT evidence about the marker's content. Read-only
-    verifiers must not reuse it: see ``collector.collector.marker_validation``.
+    reads the whole file unbounded. A read failure is reported as UNKNOWN_IO, never as INVALID: INVALID
+    makes recovery preserve (rename) the marker, which is only justified by bytes that were actually
+    read and found malformed. Read-only verifiers must not reuse it: see
+    ``collector.collector.marker_validation``.
     """
     seg = Path(seg_path)
     path = marker_path(seg)
@@ -312,12 +320,20 @@ def read_marker(seg_path: Path | str) -> MarkerResult:
     except FileNotFoundError:
         return MarkerResult(MarkerStatus.ABSENT, reason="no marker file")
     except OSError as exc:
-        return MarkerResult(MarkerStatus.INVALID, reason=f"unreadable: {type(exc).__name__}: {exc}")
+        return MarkerResult(MarkerStatus.UNKNOWN_IO, reason=f"unreadable: {type(exc).__name__}: {exc}")
     return parse_marker_bytes(raw, seg.name)
 
 
 def classify_segment(seg_path: Path | str, marker: MarkerResult) -> PublicationState:
-    """State of a visible ``.seg`` given its marker result (cheap: one stat)."""
+    """State of a visible ``.seg`` given its marker result (cheap: one stat).
+
+    Raises :class:`PublicationError` for an UNKNOWN_IO marker: there is no truthful state to return
+    (not unconfirmed, not corrupt, not legacy), and returning any would let recovery proceed as if the
+    marker were absent or malformed."""
+    if marker.status is MarkerStatus.UNKNOWN_IO:
+        raise PublicationError(
+            f"cannot classify {Path(seg_path).name}: its publication marker could not be read "
+            f"({marker.reason}); refusing to treat unreadable evidence as absent or invalid")
     if marker.valid:
         try:
             size = Path(seg_path).stat().st_size
@@ -488,6 +504,11 @@ def confirm_unmarked(unmarked: Sequence[UnmarkedSegment], stream_dir: Path, *,
     """
     if not unmarked:
         return []
+    unreadable = [item.path.name for item in unmarked if item.marker.status is MarkerStatus.UNKNOWN_IO]
+    if unreadable:     # before ANY fsync or write: a marker we could not read is never replaced
+        raise PublicationError(
+            f"{len(unreadable)} segment(s) have an unreadable publication marker and cannot be confirmed "
+            f"(first: {unreadable[0]}); refusing to replace evidence that could not be inspected")
     if not verdict.allows_promotion:
         raise PublicationError(
             f"{len(unmarked)} unmarked segment(s) in {stream_dir} cannot be confirmed: {verdict.reason} "

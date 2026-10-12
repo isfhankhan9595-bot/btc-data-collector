@@ -303,6 +303,166 @@ def test_invalid_marker_is_reported_and_left_in_place(tmp_path):
     assert sorted(p.name for p in stream_dir(base).iterdir()) == before          # NOT renamed to .invalid.N
 
 
+# ---------------------------------------------------------------- unreadable (UNKNOWN_IO) vs malformed markers
+def _unreadable_dataset(base: Path, kind: str) -> Path:
+    """seg0: a readable parquet whose marker cannot be read | seg1: valid marker | seg2: genuinely malformed marker."""
+    seg0 = write_seg(base, 0, ids("u", 3))
+    write_seg(base, 1, ids("v", 3))
+    write_seg(base, 2, ids("w", 3), marker="garbage")
+    mk = pub.marker_path(seg0)
+    if kind == "directory":                      # a real filesystem fault, no mocking: IsADirectoryError on read
+        mk.unlink()
+        mk.mkdir()
+    return mk
+
+
+def _marker_read_fault(kind: str, marker_name: str):
+    """Context manager: an injected EIO / EACCES on reading that one marker (a directory needs no injection)."""
+    mp = pytest.MonkeyPatch()
+    if kind in ("eio", "eacces"):
+        import errno
+        real, code = Path.read_bytes, (errno.EIO if kind == "eio" else errno.EACCES)
+
+        def faulty(self):
+            if self.name == marker_name:
+                raise OSError(code, os.strerror(code))
+            return real(self)
+        mp.setattr(Path, "read_bytes", faulty)
+    return mp
+
+
+@pytest.mark.parametrize("kind", ["directory", "eio", "eacces"])
+def test_unreadable_marker_is_reported_as_unreadable_not_malformed_and_startup_refusal_is_explicit(tmp_path, kind):
+    base = tmp_path / "data"
+    mk = _unreadable_dataset(base, kind)
+    before = tree_state(base)
+    mp = _marker_read_fault(kind, mk.name)
+    try:
+        result = rehearse(base, tmp_path, with_index=False)
+    finally:
+        mp.undo()
+    r, m, est = result["report"], result["report"]["markers"], result["report"]["estimated_work"]
+
+    # the parquet is readable and fully analysed; only the marker is unknown
+    assert (r["segments"]["total_seg_files"], r["segments"]["readable"]) == (3, 3)
+    assert r["segments"]["malformed_or_unreadable"]["count"] == 0 and r["identities"]["distinct_total"] == 9
+    # unreadable is its own bucket, reason text names the error class and never a path
+    assert m["unreadable"]["count"] == 1 and m["unreadable"]["examples"][0].startswith(f"{STREAM}/{mk.name[:-len('.meta.json')]}: unreadable: ")
+    assert "not valid JSON" not in m["unreadable"]["examples"][0] and str(tmp_path) not in json.dumps(m)
+    # invalid is reserved for inspected-and-malformed content: only the garbage marker, behaviour unchanged
+    assert m["invalid"]["count"] == 1 and "not valid JSON" in m["invalid"]["examples"][0]
+    assert (m["valid"], m["absent"]["count"], m["absent_with_v1_hint"]["count"]) == (1, 0, 0)
+    # startup refuses before ANY marker write, so nothing is planned; the malformed marker that would need a
+    # rewrite once the refusal is cleared is reported separately and conditionally
+    assert est["markers_to_write_by_startup_refsync"] == 0
+    assert est["markers_to_write_if_unreadable_markers_were_resolved"] == 1
+    assert "conditional" in est["markers_to_write_note"]
+    assert len(est["startup_refusal_reasons"]) == 1
+    reason = est["startup_refusal_reasons"][0]
+    assert "1 publication marker(s) could not be read" in reason and "NOT malformed" in reason and "DedupStateError" in reason
+    assert r["fail_closed_conditions"]["unreadable_publication_marker"] == 1
+    # operators can tell the two apart in the human summary
+    summary = c1.format_summary(result)
+    assert "invalid=1 unreadable=1" in summary and "MARKERS UNREADABLE: 1" in summary and "REFUSE" in summary
+    assert "0 markers will be written; 1 would need writing once the unreadable ones are resolved" in summary
+    # strictly read-only
+    assert r["read_only_check"]["unchanged"] is True
+    assert tree_state(base) == before and not list(stream_dir(base).glob("*.invalid.*"))
+
+    # ...and the claim matches what the real startup does, on a copy under the same fault
+    copy = tmp_path / "copy"
+    shutil.copytree(base, copy)
+    (copy / "dedup_state").mkdir(exist_ok=True)
+    index = sd.SegmentDedupIndex(str(copy / "dedup_state" / f"{STREAM}.sqlite3"))
+    copy_before = tree_state(stream_dir(copy))
+    mp = _marker_read_fault(kind, mk.name)
+    try:
+        with pytest.raises(sd.DedupStateError, match="could not be read"):
+            sd.SegmentDedupCoordinator(index, SPEC.row_identity).startup_reconcile(stream_dir(copy))
+    finally:
+        mp.undo()
+        index.close()
+    assert tree_state(stream_dir(copy)) == copy_before, "startup changed nothing: no rename, no marker written"
+
+
+def test_clean_and_malformed_only_datasets_report_zero_unreadable_markers(tmp_path):
+    base = tmp_path / "data"
+    write_seg(base, 0, ["a"])
+    write_seg(base, 1, ["b"], marker="garbage")
+    write_seg(base, 2, ["c"], marker="none")
+    r = rehearse(base, tmp_path, with_index=False)["report"]
+    assert r["markers"]["unreadable"] == {"count": 0, "examples": []}
+    assert r["markers"]["invalid"]["count"] == 1
+    assert r["fail_closed_conditions"]["unreadable_publication_marker"] == 0
+    assert r["estimated_work"]["startup_refusal_reasons"] == []
+    assert r["estimated_work"]["markers_to_write_by_startup_refsync"] == 2
+    assert r["estimated_work"]["markers_to_write_if_unreadable_markers_were_resolved"] == 2   # no refusal: equal
+
+
+def test_unreadable_marker_alone_plans_no_writes_and_has_nothing_conditional(tmp_path):
+    base = tmp_path / "data"
+    write_seg(base, 0, ["a"])
+    seg = write_seg(base, 1, ["b"], marker="none")
+    pub.marker_path(seg).mkdir()                                        # the only damage: one unreadable marker
+    before = tree_state(base)
+    r = rehearse(base, tmp_path, with_index=False)["report"]
+    est, m = r["estimated_work"], r["markers"]
+    assert (m["unreadable"]["count"], m["invalid"]["count"], m["absent"]["count"]) == (1, 0, 0)
+    assert est["markers_to_write_by_startup_refsync"] == 0
+    assert est["markers_to_write_if_unreadable_markers_were_resolved"] == 0
+    assert len(est["startup_refusal_reasons"]) == 1 and r["fail_closed_conditions"]["unreadable_publication_marker"] == 1
+    assert r["read_only_check"]["unchanged"] is True and tree_state(base) == before
+
+
+def test_malformed_markers_without_unreadable_ones_keep_the_positive_estimate_and_no_refusal(tmp_path):
+    base = tmp_path / "data"
+    write_seg(base, 0, ["a"], marker="garbage")
+    write_seg(base, 1, ["b"], marker="garbage")
+    write_seg(base, 2, ["c"])
+    r = rehearse(base, tmp_path, with_index=False)["report"]
+    est = r["estimated_work"]
+    assert (r["markers"]["invalid"]["count"], r["markers"]["unreadable"]["count"]) == (2, 0)
+    assert est["markers_to_write_by_startup_refsync"] == 2 == est["markers_to_write_if_unreadable_markers_were_resolved"]
+    assert est["startup_refusal_reasons"] == [] and r["fail_closed_conditions"]["unreadable_publication_marker"] == 0
+
+
+@pytest.mark.parametrize("unreadable,malformed,absent", [(0, 0, 0), (1, 0, 0), (0, 2, 0), (1, 2, 0), (2, 1, 1), (0, 1, 2)])
+def test_refusal_reporting_and_write_estimates_are_consistent(tmp_path, unreadable, malformed, absent):
+    base = tmp_path / "data"
+    seq = 0
+    write_seg(base, seq, ["ok"])
+    for _ in range(unreadable):
+        seq += 1
+        pub.marker_path(write_seg(base, seq, [f"u{seq}"], marker="none")).mkdir()
+    for _ in range(malformed):
+        seq += 1
+        write_seg(base, seq, [f"m{seq}"], marker="garbage")
+    for _ in range(absent):
+        seq += 1
+        write_seg(base, seq, [f"n{seq}"], marker="none")
+    r = rehearse(base, tmp_path, with_index=False)["report"]
+    est, m, fc = r["estimated_work"], r["markers"], r["fail_closed_conditions"]
+    assert (m["unreadable"]["count"], m["invalid"]["count"], m["absent"]["count"]) == (unreadable, malformed, absent)
+    refused = bool(unreadable)
+    assert fc["unreadable_publication_marker"] == unreadable
+    assert bool(est["startup_refusal_reasons"]) is refused
+    assert est["markers_to_write_if_unreadable_markers_were_resolved"] == malformed + absent
+    assert est["markers_to_write_by_startup_refsync"] == (0 if refused else malformed + absent)
+
+
+def test_unreadable_marker_report_is_deterministic_across_runs_and_locations(tmp_path):
+    one, two = tmp_path / "a" / "data", tmp_path / "bbbb" / "deeper" / "data"
+    for base in (one, two):
+        base.mkdir(parents=True)
+        _unreadable_dataset(base, "directory")
+    first, again = rehearse(one, tmp_path), rehearse(one, tmp_path)
+    elsewhere = rehearse(two, tmp_path)
+    assert first["report"]["markers"]["unreadable"]["count"] == 1
+    assert first["report"]["estimated_work"]["markers_to_write_by_startup_refsync"] == 0
+    assert first["report"] == again["report"] == elsewhere["report"]
+    assert first["report_digest"] == again["report_digest"] == elsewhere["report_digest"]
+
+
 @pytest.mark.parametrize("mutation,field", [("sha", "sha256_mismatch"), ("size", "size_mismatch"),
                                             ("records", "record_count_mismatch")])
 def test_valid_marker_that_disagrees_with_the_bytes(tmp_path, mutation, field):
