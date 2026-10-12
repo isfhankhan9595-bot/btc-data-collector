@@ -1,32 +1,20 @@
 import shutil
-import sys
-from typing import Callable, Optional
-from .utils import logger, send_telegram_alert
+from typing import Optional
+
 
 class DiskMonitor:
-    def __init__(self, data_dir: str = "data", shutdown_callback: Optional[Callable[[], None]] = None):
-        self.data_dir = data_dir
-        self.shutdown_callback = shutdown_callback
+    """Read-only free-space probe used by the health summary.
 
-    def get_free_gb(self) -> float:
+    F5-QA-04: this class no longer classifies pressure, alerts, invokes a shutdown callback
+    or calls ``sys.exit``. The old ``check_disk_space`` ran once in the Futures constructor,
+    before the app was initialised, and its shutdown callback hit a half-built object. The
+    continuous, state-machine-based policy lives in ``disk_pressure.StoragePressureMonitor``.
+    """
+
+    def __init__(self, data_dir: str = "data"):
+        self.data_dir = data_dir
+
+    def get_free_gb(self) -> Optional[float]:
+        """Free GiB on the filesystem containing ``data_dir``."""
         total, used, free = shutil.disk_usage(self.data_dir)
         return free / (1024 ** 3)
-
-    def check_disk_space(self):
-        free_gb = self.get_free_gb()
-
-        if free_gb < 2.0:
-            msg = f"EMERGENCY: Free disk < 2GB ({free_gb:.2f}GB). Halting collection."
-            logger.critical(msg)
-            send_telegram_alert(msg)
-            if self.shutdown_callback:
-                self.shutdown_callback()
-            sys.exit(1)
-        elif free_gb < 4.0:
-            msg = f"CRITICAL: Free disk < 4GB ({free_gb:.2f}GB)."
-            logger.error(msg)
-            send_telegram_alert(msg)
-        elif free_gb < 7.0:
-            msg = f"WARNING: Free disk < 7GB ({free_gb:.2f}GB)."
-            logger.warning(msg)
-            send_telegram_alert(msg)

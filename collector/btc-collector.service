@@ -30,6 +30,14 @@ EnvironmentFile=/etc/btc-collector.env
 ExecStart=/home/ec2-user/btc-data-collector/.venv/bin/python -m collector.run_collector
 Restart=always
 RestartSec=5
+# F5-QA-04: exit status 69 = free disk space could not be MEASURED for the whole grace period
+# (collector/collector/disk_pressure.py EXIT_DISK_MONITOR_UNAVAILABLE). A restart cannot fix an
+# unmeasurable filesystem, and the ~65 s cycle (60 s grace + RestartSec) is too slow to ever trip
+# StartLimitBurst=5 per 300 s, so Restart=always alone would cycle forever without ingesting.
+# This leaves the unit `failed` and visible for an operator. It deliberately does NOT cover exit 1
+# (confirmed disk emergency: fast repeated exits still hit the start limit) or exit 70 (fatal
+# storage), and Restart=always still applies to every other exit.
+RestartPreventExitStatus=69
 # The collector handles SIGTERM itself (asyncio signal handler). Stop must
 # outlast the websocket ingest-queue drain (30 s, websocket_client.start)
 # plus quality-queue flush and Parquet close, or systemd SIGKILLs mid-flush.

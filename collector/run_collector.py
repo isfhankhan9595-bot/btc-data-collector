@@ -5,6 +5,7 @@ import time
 import json
 import os
 from decimal import Decimal
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 from dataclasses import replace
 from collector.collector.utils import logger, send_telegram_alert, validate_telegram_startup
@@ -44,6 +45,9 @@ from collector.collector.feature_computer import (
 from collector.collector.validator import Validator
 from collector.collector.gap_detector import GapDetector
 from collector.collector.disk_monitor import DiskMonitor
+from collector.collector.disk_pressure import (
+    EXIT_DISK_MONITOR_UNAVAILABLE, EXIT_DISK_PRESSURE, DiskPressureConfig, Severity, StoragePressureMonitor,
+)
 from collector.collector.health_monitor import HealthMonitor
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.storage_errors import (
@@ -95,8 +99,10 @@ class CollectorApp:
         }
         self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}, "openinterest": {}, "liquidation": {}}
 
-        self.disk_monitor = DiskMonitor(shutdown_callback=self.shutdown)
-        self.disk_monitor.check_disk_space()
+        # F5-QA-04: no disk check and no shutdown callback here. The old constructor-time
+        # ``check_disk_space`` could invoke ``shutdown()`` on a half-built app. Disk pressure is
+        # now enforced by ``storage_pressure`` (built once the quality WAL exists, below):
+        # a startup preflight in ``start()`` plus a periodic task.
 
         self.validator = Validator()
         self.gap_detector = GapDetector()
@@ -192,7 +198,10 @@ class CollectorApp:
             ),
         ]
 
+        # The health summary probes the filesystem that actually holds the collector's data.
+        self.disk_monitor = DiskMonitor(data_dir=str(self.quality_writer.base_dir))
         self.health_monitor = HealthMonitor(self.disk_monitor, self.validator, self)
+        self._init_storage_pressure()
         self.tasks = []
 
     @property
@@ -236,7 +245,13 @@ class CollectorApp:
     @property
     def exit_code(self) -> int:
         self._ensure_failure_state()
-        return EXIT_FATAL_STORAGE if self.terminal_failure is not None else 0
+        if self.terminal_failure is not None:
+            return EXIT_FATAL_STORAGE          # 70 keeps priority: raw evidence was lost
+        if getattr(self, "_disk_emergency", None) is not None:
+            return EXIT_DISK_PRESSURE          # 1: confirmed disk-pressure emergency stop (F5-QA-04)
+        if getattr(self, "_disk_monitor_unavailable", None) is not None:
+            return EXIT_DISK_MONITOR_UNAVAILABLE   # 69: storage could not be measured (fail closed)
+        return 0
 
     def _on_fatal_storage(self, exc, origin: str = "handler") -> str:
         """Classify and latch one typed storage fatal. Idempotent and non-raising
@@ -1595,6 +1610,10 @@ class CollectorApp:
         return handler
 
     async def start(self):
+        # F5-QA-04: startup disk preflight. The app is fully constructed (so shutdown() is
+        # safe) and no websocket client has started yet.
+        if await self._storage_pressure_preflight_failed():
+            return
         logger.info("Starting Collector Application")
         logger.info("Collector WebSocket subscription", url=BINANCE_PUBLIC_WS_URL, requested_streams=self._requested_streams(BINANCE_PUBLIC_WS_URL))
         logger.info("Collector WebSocket subscription", url=BINANCE_MARKET_WS_URL, requested_streams=self._requested_streams(BINANCE_MARKET_WS_URL))
@@ -1603,6 +1622,7 @@ class CollectorApp:
         self._quality_task = asyncio.create_task(self._quality_persistence_loop())
         # F5: latent writer-failure detection + the controlled terminal shutdown.
         self.tasks.append(asyncio.create_task(self._failure_supervisor_loop()))
+        self.tasks.append(asyncio.create_task(self._storage_pressure_loop()))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._async_shutdown(s)))
@@ -1756,8 +1776,10 @@ class CollectorApp:
             raise RuntimeError(msg)
         logger.info("Startup stream verification passed", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
 
-    async def _async_shutdown(self, signum: int, terminal: bool = False):
-        if terminal:
+    async def _async_shutdown(self, signum: int, terminal: bool = False, reason: Optional[str] = None):
+        if reason is not None:
+            logger.error("Controlled shutdown requested", reason=reason)
+        elif terminal:
             logger.error("Terminal storage failure, initiating controlled shutdown",
                          failure=None if self.terminal_failure is None else self.terminal_failure.as_dict())
         else:
@@ -1793,6 +1815,86 @@ class CollectorApp:
             finally:
                 for task in self.tasks:
                     task.cancel()
+
+    # ------------------------------------------------------------------
+    # F5-QA-04: continuous storage-pressure policy (read-only monitor + controlled stop)
+    # ------------------------------------------------------------------
+    def _init_storage_pressure(self) -> None:
+        """Build the monitor for THIS runner's configured data / quality-WAL directories.
+        An invalid threshold configuration raises here: startup fails, nothing is coerced."""
+        self.storage_pressure = StoragePressureMonitor(
+            label="FUTURES", config=DiskPressureConfig.from_env(),
+            paths=lambda: [self.quality_writer.base_dir, self._quality_wal.wal_dir],
+            wal_dir=lambda: self._quality_wal.wal_dir,
+            checkpoint_state=lambda: (self._quality_checkpoint_is_blocked(),
+                                      getattr(self, "_quality_checkpoint_block_reason", None)))
+        self._disk_emergency = None
+        self._disk_monitor_unavailable = None
+        self._disk_shutdown_task = None
+
+    def storage_pressure_status(self) -> dict:
+        """Read-only storage-pressure view, separate from ``quality_channel_status`` (writer
+        failure / lost / unconfirmed / WAL-only counters are not touched by disk pressure)."""
+        monitor = getattr(self, "storage_pressure", None)
+        if monitor is None:
+            return {"monitoring": False, "severity": Severity.UNKNOWN.value}
+        return monitor.status()
+
+    async def _storage_pressure_preflight_failed(self) -> bool:
+        """Startup gate: True when ingestion must NOT start.
+
+        ``establish_measurement`` retries the probe (bounded by the unknown grace period) until a
+        valid reading exists. A reading below the emergency threshold, or no valid reading at all
+        within the grace period, ends in the normal exception-safe, writer-ordered ``shutdown()``
+        before any websocket client starts. UNKNOWN is never treated as OK."""
+        monitor = getattr(self, "storage_pressure", None)
+        if monitor is None:
+            return False
+        result = await monitor.establish_measurement()
+        if result.measurement_ok and result.severity != Severity.EMERGENCY:
+            return False
+        if result.measurement_ok:
+            self._disk_emergency = monitor.status()
+            logger.error("storage_pressure_emergency_at_startup", exit_status=EXIT_DISK_PRESSURE)
+        else:
+            self._disk_monitor_unavailable = monitor.status()
+            logger.error("storage_pressure_monitor_unavailable_at_startup",
+                         exit_status=EXIT_DISK_MONITOR_UNAVAILABLE,
+                         error=self._disk_monitor_unavailable["last_monitor_error"],
+                         unknown_for_s=self._disk_monitor_unavailable["monitor_failure_duration_s"])
+        self.running = False
+        self.shutdown()
+        return True
+
+    def _request_disk_shutdown(self, reason: str) -> None:
+        """Run the controlled shutdown from its own task, exactly once for any disk reason."""
+        if getattr(self, "_disk_shutdown_task", None) is None:
+            self._disk_shutdown_task = asyncio.create_task(self._async_shutdown(0, reason=reason))
+
+    def _on_disk_emergency(self, result) -> None:
+        """Runtime EMERGENCY (confirmed low space): latch (exit status 1) and stop."""
+        monitor = getattr(self, "storage_pressure", None)
+        self._disk_emergency = monitor.status() if monitor is not None else {"severity": "EMERGENCY"}
+        logger.error("storage_pressure_emergency_shutdown", exit_status=EXIT_DISK_PRESSURE)
+        self._request_disk_shutdown("disk_pressure_emergency")
+
+    def _on_disk_monitor_unavailable(self, result) -> None:
+        """Runtime: storage could not be measured for the whole grace period. Latch separately
+        (exit status 69, never 1) and stop; this is NOT a confirmed low-disk emergency."""
+        monitor = getattr(self, "storage_pressure", None)
+        self._disk_monitor_unavailable = (monitor.status() if monitor is not None
+                                          else {"severity": "UNKNOWN"})
+        logger.error("storage_pressure_monitor_unavailable_shutdown",
+                     exit_status=EXIT_DISK_MONITOR_UNAVAILABLE,
+                     error=self._disk_monitor_unavailable.get("last_monitor_error"),
+                     unknown_for_s=self._disk_monitor_unavailable.get("monitor_failure_duration_s"))
+        self._request_disk_shutdown("disk_monitor_unavailable")
+
+    async def _storage_pressure_loop(self) -> None:
+        monitor = getattr(self, "storage_pressure", None)
+        if monitor is None:
+            return
+        await monitor.run(self._on_disk_emergency, self._on_disk_monitor_unavailable)
 
     def _shutdown_step(self, step: str, function, *args) -> bool:
         """Run one shutdown step; a failure is logged and never stops the next one."""

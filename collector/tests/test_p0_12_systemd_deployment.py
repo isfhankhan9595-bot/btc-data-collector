@@ -182,3 +182,101 @@ def test_systemd_analyze_verify_on_path_remapped_copy(tmp_path):
     problems = [l for l in (r.stdout + r.stderr).splitlines()
                 if l.strip() and "ec2-user" not in l and "network-online" not in l]
     assert problems == [], problems
+
+
+# ---------------------------------------------------------------------------
+# F5-QA-04: exit status 69 (disk monitor unavailable) must not restart-loop.
+#
+# EVIDENCE LEVELS. Static: the unit text and the parser (systemd-analyze verify above). Arithmetic:
+# the start-limit calculation below, on systemd's documented StartLimit semantics. NOT VERIFIED on a
+# real host: no live systemd was available, so the failed-state / restart behaviour is inferred.
+# ---------------------------------------------------------------------------
+def _exit_status_tokens(u, key):
+    return {tok for val in u["Service"].get(key, []) for tok in val.split()}
+
+
+def test_unit_prevents_restart_for_exactly_exit_69():
+    from collector.collector.disk_pressure import EXIT_DISK_MONITOR_UNAVAILABLE
+    u = parse()
+    assert one(u, "Service", "RestartPreventExitStatus") == "69"
+    assert EXIT_DISK_MONITOR_UNAVAILABLE == 69          # the unit and the application agree on the status
+
+
+def test_restart_and_start_limit_settings_are_unchanged():
+    u = parse()
+    assert one(u, "Service", "Restart") == "always"
+    assert one(u, "Service", "RestartSec") == "5"
+    assert one(u, "Unit", "StartLimitIntervalSec") == "300"
+    assert one(u, "Unit", "StartLimitBurst") == "5"
+    assert "RestartForceExitStatus" not in u["Service"]
+
+
+def test_restart_prevention_does_not_cover_exit_1_exit_70_or_unrelated_failures():
+    from collector.collector.disk_pressure import EXIT_DISK_PRESSURE
+    from collector.collector.failure_topology import EXIT_FATAL_STORAGE
+    u = parse()
+    prevented = _exit_status_tokens(u, "RestartPreventExitStatus")
+    assert prevented == {"69"}                           # nothing else: no 1, no 70, no signals, no 0
+    assert str(EXIT_DISK_PRESSURE) not in prevented and str(EXIT_FATAL_STORAGE) not in prevented
+    assert one(u, "Service", "Restart") == "always"      # so every other exit still restarts
+    # 69 must remain a FAILURE for systemd (visible as `failed`), never a "success" status.
+    assert "69" not in _exit_status_tokens(u, "SuccessExitStatus")
+
+
+def test_application_exit_precedence_is_70_over_1_over_69():
+    import types
+    import collector.run_collector as rc
+    from collector.collector.disk_pressure import EXIT_DISK_MONITOR_UNAVAILABLE, EXIT_DISK_PRESSURE
+    from collector.collector.failure_topology import EXIT_FATAL_STORAGE
+
+    def code(terminal, emergency, unavailable):
+        stub = types.SimpleNamespace(_ensure_failure_state=lambda: None,
+                                     terminal_failure=object() if terminal else None,
+                                     _disk_emergency={"x": 1} if emergency else None,
+                                     _disk_monitor_unavailable={"x": 1} if unavailable else None)
+        return rc.CollectorApp.exit_code.fget(stub)
+
+    assert (EXIT_FATAL_STORAGE, EXIT_DISK_PRESSURE, EXIT_DISK_MONITOR_UNAVAILABLE) == (70, 1, 69)
+    assert code(True, True, True) == code(True, False, True) == code(True, True, False) == 70
+    assert code(False, True, True) == code(False, True, False) == 1
+    assert code(False, False, True) == 69
+    assert code(False, False, False) == 0
+
+
+def test_start_limit_cannot_contain_exit_69_which_is_why_it_is_prevented_explicitly():
+    """Arithmetic, not a host measurement. systemd allows StartLimitBurst starts per StartLimitIntervalSec,
+    so containment needs the 6th start inside the window, i.e. a restart cycle <= interval / burst."""
+    from collector.collector.disk_pressure import DiskPressureConfig
+    u = parse()
+    interval = float(one(u, "Unit", "StartLimitIntervalSec"))
+    burst = int(one(u, "Unit", "StartLimitBurst"))
+    restart_sec = float(one(u, "Service", "RestartSec"))
+    grace = DiskPressureConfig().unknown_grace_s
+    max_containing_cycle = interval / burst                       # 60 s
+    cycle_69 = grace + restart_sec                                # lower bound: startup/shutdown only add
+    cycle_1 = restart_sec + 2                                     # confirmed emergency exits within seconds
+    assert cycle_69 > max_containing_cycle, "start limit would contain exit 69 now; revisit the directive"
+    assert cycle_1 <= max_containing_cycle                        # exit 1 is still contained by the start limit
+    # simulate systemd's fixed start window for both cycles
+    def blocked_at(cycle):
+        begin, num = None, 0
+        for i in range(60):
+            t = i * cycle
+            if begin is None or t - begin > interval:
+                begin, num = t, 1
+            elif num < burst:
+                num += 1
+            else:
+                return t
+        return None
+    assert blocked_at(cycle_1) is not None and blocked_at(cycle_69) is None
+
+
+def test_documentation_describes_the_failed_state_and_the_recovery_action():
+    for doc in ("DEPLOYMENT.md", "F5_QA_04_STORAGE_PRESSURE.md"):
+        text = (REPO / "docs" / doc).read_text()
+        assert "RestartPreventExitStatus=69" in text, doc
+        assert "failed" in text and "systemctl restart btc-collector" in text, doc
+        assert "not verified" in text.lower() or "unverified" in text.lower(), doc
+    storage = (REPO / "docs" / "F5_QA_04_STORAGE_PRESSURE.md").read_text()
+    assert "Bybit" in storage and "UNKNOWN" in storage and "no hard wal cap" in storage.lower()
