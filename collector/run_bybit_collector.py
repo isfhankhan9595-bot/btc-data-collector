@@ -612,7 +612,9 @@ class BybitCollectorApp:
         if (wal is not None and wal_seq is None and not capacity_fallback
                 and getattr(wal, "capacity_exhausted", False)):
             capacity_fallback = True
-            event = {**event, "_wal_capacity_exhausted": True}
+            event = {k: v for k, v in event.items()
+                     if k not in {"quality_event_id", "_wal_seq"}}
+            event["_wal_capacity_exhausted"] = True
             self._note_quality_wal_capacity_exhausted(
                 reason=wal.capacity_reason, current_bytes=getattr(wal, "_capacity_current_bytes", None),
                 limit_bytes=wal.max_total_bytes)
@@ -633,7 +635,9 @@ class BybitCollectorApp:
                 event_id = wal.append({**event, "event_type": event_type_for_wal})
             except QualityWALCapacityExceeded as exc:
                 capacity_fallback = True
-                event = {**event, "_wal_capacity_exhausted": True}
+                event = {k: v for k, v in event.items()
+                         if k not in {"quality_event_id", "_wal_seq"}}
+                event["_wal_capacity_exhausted"] = True
                 self._note_quality_wal_capacity_exhausted(
                     reason=exc.reason, current_bytes=exc.current_bytes,
                     requested_bytes=exc.requested_bytes, limit_bytes=exc.max_total_bytes)
