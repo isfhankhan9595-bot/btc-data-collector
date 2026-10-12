@@ -529,6 +529,10 @@ class BybitCollectorApp:
             recovered_events = []
             self._quality_wal_recovery_error = str(exc)
             self._block_quality_checkpoint("wal_corruption_on_startup")
+        else:
+            # Recovery parsed every WAL record successfully; now clean only
+            # strictly validated files already covered by the durable checkpoint.
+            QualityEventWAL.cleanup_fully_checkpointed_files(wal_dir)
         self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
         if self._quality_wal_recovery_error is not None:
             self._persist_quality_event({
