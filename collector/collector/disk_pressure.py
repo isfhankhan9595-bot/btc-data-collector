@@ -266,8 +266,8 @@ class _State:
 
 _GUIDANCE = {
     Severity.WARNING: "Free space is falling: free disk before it reaches the critical threshold.",
-    Severity.CRITICAL: ("Free space is critically low: free disk now. If the quality checkpoint is "
-                        "blocked the quality WAL keeps growing; nothing deletes it automatically."),
+    Severity.CRITICAL: ("Free space is critically low: free disk now. The WAL byte cap limits WAL growth, "
+                        "but Parquet data and other files can still exhaust the filesystem."),
     Severity.EMERGENCY: ("Collection is being stopped through the controlled shutdown (exit status 1); "
                          "raw evidence and the quality WAL are preserved. Free disk before restarting; "
                          "a restart replays uncheckpointed quality events (at-least-once)."),
@@ -285,6 +285,7 @@ class StoragePressureMonitor:
     def __init__(self, *, label: str, config: DiskPressureConfig,
                  paths: Callable[[], Sequence[Any]],
                  wal_dir: Optional[Callable[[], Any]] = None,
+                 wal_max_bytes: Optional[Callable[[], Optional[int]]] = None,
                  checkpoint_state: Optional[Callable[[], Tuple[bool, Optional[str]]]] = None,
                  notify: Optional[Callable[[str], Any]] = None,
                  usage_fn: Callable[[str], Any] = shutil.disk_usage,
@@ -293,6 +294,7 @@ class StoragePressureMonitor:
         self.config = config
         self._paths = paths
         self._wal_dir = wal_dir
+        self._wal_max_bytes = wal_max_bytes
         self._checkpoint_state = checkpoint_state
         self._notify = notify
         self._usage = usage_fn
@@ -473,6 +475,15 @@ class StoragePressureMonitor:
         state = self._state
         ok = state.measurement_ok
         blocked, reason = self._checkpoint()
+        wal_cap = None
+        if self._wal_max_bytes is not None:
+            try:
+                candidate = self._wal_max_bytes()
+                if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                    wal_cap = candidate
+            except Exception:
+                # A missing/unreadable cap is UNKNOWN, never a positive claim.
+                wal_cap = None
         return {
             "monitoring": True,
             "severity": self.severity.value,
@@ -485,7 +496,11 @@ class StoragePressureMonitor:
             "quality_wal_bytes": state.wal_bytes,
             "quality_wal_file_count": state.wal_file_count,
             "quality_wal_error": state.wal_error,
-            "wal_total_size_bounded": False,   # no hard cap exists; max_bytes is a per-file rotation threshold
+            "quality_wal_max_bytes": wal_cap,
+            # This is true only after a successful size sample proves the aggregate
+            # is currently within the hard admission cap. UNKNOWN is not bounded.
+            "wal_total_size_bounded": bool(
+                wal_cap is not None and state.wal_bytes is not None and state.wal_bytes <= wal_cap),
             "quality_checkpoint_blocked": blocked,
             "quality_checkpoint_block_reason": reason,
             "last_monitor_error": state.last_error,

@@ -130,6 +130,43 @@ from pathlib import Path
 from typing import Any, Optional
 
 CHECKPOINT_FILENAME = "checkpoint.json"
+DEFAULT_MAX_TOTAL_BYTES = 100_000_000  # 100 MB; configurable before startup
+ENV_MAX_TOTAL_BYTES = "COLLECTOR_QUALITY_WAL_MAX_TOTAL_BYTES"
+
+
+class QualityWALCapacityExceeded(OSError):
+    """An append was refused before writing because a safe aggregate size could not be proved.
+
+    This exception deliberately has no quality_event_id: the rejected event
+    has no WAL record and must not be counted as WAL-backed by a caller.
+    """
+
+    def __init__(self, *, reason: str, max_total_bytes: int,
+                 current_bytes: Optional[int], requested_bytes: Optional[int],
+                 newly_exhausted: bool = False):
+        super().__init__(
+            f"quality WAL append refused: {reason}; current={current_bytes}, "
+            f"requested={requested_bytes}, limit={max_total_bytes}")
+        self.reason = reason
+        self.max_total_bytes = max_total_bytes
+        self.current_bytes = current_bytes
+        self.requested_bytes = requested_bytes
+        self.newly_exhausted = newly_exhausted
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make directory-entry changes durable after create/replace/unlink.
+
+    The file's own fsync does not guarantee that its name survives power loss.
+    If the platform/filesystem cannot sync this directory, fail closed rather
+    than claiming the checkpoint or new WAL name is durable.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class QualityWALCorruption(Exception):
@@ -146,10 +183,35 @@ class QualityWALCorruption(Exception):
 
 class QualityEventWAL:
     def __init__(self, wal_dir: Any, *, max_bytes: int = 10_000_000,
+                max_total_bytes: Optional[int] = None,
                 process_start_marker: Optional[str] = None, start_seq: int = 0):
         self.wal_dir = Path(wal_dir)
+        # fsyncing the WAL directory persists entries inside it, but not the
+        # entry that names the directory itself. Record every newly-created
+        # directory's parent before relying on the new WAL path for durability.
+        missing_directories = []
+        candidate = self.wal_dir
+        while not candidate.exists():
+            missing_directories.append(candidate)
+            if candidate.parent == candidate:
+                break
+            candidate = candidate.parent
         self.wal_dir.mkdir(parents=True, exist_ok=True)
+        for created_directory in reversed(missing_directories):
+            _fsync_directory(created_directory.parent)
         self.max_bytes = max_bytes
+        raw_cap = os.environ.get(ENV_MAX_TOTAL_BYTES) if max_total_bytes is None else None
+        if max_total_bytes is None:
+            if raw_cap is None:
+                max_total_bytes = DEFAULT_MAX_TOTAL_BYTES
+            else:
+                try:
+                    max_total_bytes = int(raw_cap, 10)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{ENV_MAX_TOTAL_BYTES} must be a positive integer") from exc
+        if isinstance(max_total_bytes, bool) or not isinstance(max_total_bytes, int) or max_total_bytes <= 0:
+            raise ValueError(f"max_total_bytes must be a positive integer, got {max_total_bytes!r}")
+        self.max_total_bytes = max_total_bytes
         self.process_start_marker = process_start_marker or f"{int(time.time() * 1000)}-{os.getpid()}"
         self._lock = threading.Lock()
         # Independent audit finding: this must read the ACTUAL on-disk
@@ -181,54 +243,152 @@ class QualityEventWAL:
         self._seq = max(start_seq, self._checkpointed_seq, self.highest_recovered_seq(self.wal_dir))
         self._active_path = self._new_wal_path()
         self._handle = open(self._active_path, "a", encoding="utf-8")
+        try:
+            _fsync_directory(self.wal_dir)
+        except Exception:
+            self._handle.close()
+            raise
         self._write_failed = False
         self._closed = False
+        self._capacity_exhausted = False
+        self._capacity_reason = None
+        self._capacity_current_bytes = None
+        # Preserve existing evidence and refuse more WAL appends if startup
+        # finds the namespace over budget or cannot establish its size.
+        try:
+            current = self._total_wal_bytes()
+        except OSError:
+            self._latch_capacity("aggregate_size_unavailable", None)
+        else:
+            if current >= self.max_total_bytes:
+                self._latch_capacity("existing_wal_at_or_over_capacity", current)
+
+    @classmethod
+    def cleanup_fully_checkpointed_files(cls, wal_dir: Any) -> None:
+        """Clean stale covered files only after the caller's full recovery pass succeeded.
+
+        Destructive startup cleanup is intentionally separate from __init__.
+        Runners call this only after recover() has parsed the WAL namespace
+        without corruption. Each file is still revalidated strictly here; a
+        malformed row, incomplete tail, read error or invalid seq makes that
+        file ineligible for deletion. The checkpoint file is already durable,
+        so a directory-sync failure after unlink may only cause covered files
+        to reappear after a crash, which is safe and retried on a later startup.
+        """
+        directory = Path(wal_dir)
+        checkpointed_seq = _read_checkpointed_seq(directory)
+        deleted = False
+        for wal_file in sorted(directory.glob("*.wal")):
+            max_seq = _safe_max_seq_in_file(wal_file)
+            if max_seq is not None and max_seq <= checkpointed_seq:
+                try:
+                    wal_file.unlink(missing_ok=True)
+                    deleted = True
+                except OSError:
+                    continue
+        if deleted:
+            try:
+                _fsync_directory(directory)
+            except OSError:
+                pass
+
+    def _total_wal_bytes(self) -> int:
+        """Actual aggregate bytes across every .wal file in this namespace."""
+        total = 0
+        for wal_file in self.wal_dir.glob("*.wal"):
+            try:
+                total += wal_file.stat().st_size
+            except FileNotFoundError:
+                # A concurrent checkpoint cleanup may have removed this
+                # directory entry between glob and stat. It contributes zero.
+                continue
+        return total
+
+    def _latch_capacity(self, reason: str, current_bytes: Optional[int]) -> bool:
+        first = not self._capacity_exhausted
+        self._capacity_exhausted = True
+        if first:
+            self._capacity_reason = reason
+            self._capacity_current_bytes = current_bytes
+        return first
+
+    def _capacity_error(self, *, requested_bytes: Optional[int] = None,
+                        current_bytes: Optional[int] = None,
+                        newly_exhausted: bool = False) -> QualityWALCapacityExceeded:
+        return QualityWALCapacityExceeded(
+            reason=self._capacity_reason or "capacity_latched",
+            max_total_bytes=self.max_total_bytes,
+            current_bytes=(self._capacity_current_bytes if current_bytes is None else current_bytes),
+            requested_bytes=requested_bytes,
+            newly_exhausted=newly_exhausted)
+
+    @property
+    def capacity_exhausted(self) -> bool:
+        return self._capacity_exhausted
+
+    @property
+    def capacity_reason(self) -> Optional[str]:
+        return self._capacity_reason
 
     def _new_wal_path(self) -> Path:
         stamp = time.strftime("%Y-%m-%d-%H%M%S", time.gmtime())
         return self.wal_dir / f"{stamp}-{self.process_start_marker}-{self._seq:012d}.wal"
 
     def append(self, event: dict) -> str:
-        """Durably append one quality event. Returns its quality_event_id.
+        """Durably append one quality event, subject to an aggregate hard cap.
 
-        On a write/flush/fsync failure, marks this WAL degraded (see
-        ``write_failed``) and re-raises -- callers must not treat a failed
-        append as if the event were durable (Step 11 / acceptance
-        criterion: write failures are visible, never silently absorbed).
+        Capacity is checked against the on-disk byte sizes of ALL .wal files
+        and the exact UTF-8 line size (including its newline). A rejected
+        record is not written and receives no WAL event ID. The capacity latch
+        remains closed until restart; runners use their synchronous,
+        force-published Parquet fallback for events rejected after the cap.
+
+        On a write/flush/fsync failure, re-raises with the assigned event ID
+        because bytes may already be present.
         """
         with self._lock:
-            self._seq += 1
-            event_id = f"{self.process_start_marker}-{self._seq}"
             if self._closed:
-                # Explicit, loud, and an OSError so callers that already
-                # treat "the WAL could not durably record this" as one
-                # failure class (fall back / report) handle a late append
-                # during teardown the same way, rather than seeing an
-                # incidental ValueError from a closed file object.
-                exc = OSError("quality WAL is closed")
-                exc.quality_event_id = event_id
-                raise exc
-            record = {"quality_event_id": event_id, "seq": self._seq, **event}
+                raise OSError("quality WAL is closed")
+            if self._write_failed:
+                raise OSError("quality WAL is in a write-failed state; restart/recovery is required")
+            if self._capacity_exhausted:
+                raise self._capacity_error()
+
+            next_seq = self._seq + 1
+            event_id = f"{self.process_start_marker}-{next_seq}"
+            # WAL-owned fields must not be overridable by caller data.
+            record = {**event, "quality_event_id": event_id, "seq": next_seq}
             line = json.dumps(record, default=str)
+            encoded_size = len((line + "\n").encode("utf-8"))
+
+            try:
+                current_bytes = self._total_wal_bytes()
+            except OSError as exc:
+                first = self._latch_capacity("aggregate_size_unavailable", None)
+                raise self._capacity_error(
+                    requested_bytes=encoded_size, current_bytes=None,
+                    newly_exhausted=first) from exc
+
+            if encoded_size > self.max_total_bytes or current_bytes + encoded_size > self.max_total_bytes:
+                first = self._latch_capacity("aggregate_budget_exhausted", current_bytes)
+                raise self._capacity_error(
+                    requested_bytes=encoded_size, current_bytes=current_bytes,
+                    newly_exhausted=first)
+
+            # Reserve the sequence only after admission, but before writing:
+            # uncertain I/O may have left a partial record, so the same process
+            # must not append a valid line behind that uncertain tail.
+            self._seq = next_seq
             try:
                 self._handle.write(line + "\n")
                 self._handle.flush()
                 os.fsync(self._handle.fileno())
             except OSError as exc:
                 self._write_failed = True
-                # The id was already assigned and bytes may already be in
-                # the file (e.g. write() and flush() succeeded but fsync()
-                # failed). Attach it so a caller that falls back to a
-                # direct write can stamp the SAME id on that row -- a
-                # WAL-resident copy recovered later then carries the same
-                # id, so a downstream consumer CAN identify it as a replay
-                # of that row. The collector does not remove such a
-                # duplicate: no automatic quality-event deduplication is
-                # implemented in this repository.
+                # Bytes may already be present after write/flush/fsync failure.
                 exc.quality_event_id = event_id
                 raise
             return event_id
-
     @property
     def write_failed(self) -> bool:
         return self._write_failed
@@ -254,28 +414,39 @@ class QualityEventWAL:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, checkpoint_path)
-            # In-memory state advances ONLY after the durable replace
-            # succeeded. Advancing it first (the previous order) meant a
-            # failed write left this object claiming a checkpoint that
-            # never reached disk, and made an immediate retry of the
-            # same seq a silent no-op via the guard above.
+            # Sync the parent directory as well as the temporary file: its
+            # fsync alone does not make the rename durable after power loss.
+            # On failure, leave in-memory state unchanged and delete no WAL.
+            _fsync_directory(self.wal_dir)
             self._checkpointed_seq = up_to_seq
             self._delete_fully_checkpointed_files()
 
     def _delete_fully_checkpointed_files(self) -> None:
+        deleted = False
         for wal_file in sorted(self.wal_dir.glob("*.wal")):
             if wal_file == self._active_path:
                 continue  # never delete the file currently being appended to
-            max_seq = _max_seq_in_file(wal_file)
+            max_seq = _safe_max_seq_in_file(wal_file)
+            # Unknown/malformed/truncated contents are evidence, not a basis
+            # for cleanup. Only a fully parseable file whose every seq is
+            # at/below the durable checkpoint may be removed.
             if max_seq is not None and max_seq <= self._checkpointed_seq:
                 try:
                     wal_file.unlink(missing_ok=True)
+                    deleted = True
                 except OSError:
                     # The checkpoint is already durable, so a file we
                     # could not delete is harmless: recover() filters by
                     # seq, so it contributes nothing pending, and the
                     # next checkpoint() retries the deletion.
                     continue
+        if deleted:
+            try:
+                _fsync_directory(self.wal_dir)
+            except OSError:
+                # The checkpoint is already durable. Cleanup sync failure
+                # can only cause covered files to return after a crash.
+                pass
 
     def maybe_rotate_for_size(self) -> None:
         """Open a new WAL file if the active one has grown past max_bytes.
@@ -294,6 +465,11 @@ class QualityEventWAL:
                 os.fsync(self._handle.fileno())
                 new_path = self._new_wal_path()
                 new_handle = open(new_path, "a", encoding="utf-8")
+                try:
+                    _fsync_directory(self.wal_dir)
+                except Exception:
+                    new_handle.close()
+                    raise
                 old_handle = self._handle
                 self._handle = new_handle
                 self._active_path = new_path
@@ -304,9 +480,14 @@ class QualityEventWAL:
             if self._closed:
                 return
             self._closed = True
-            self._handle.flush()
-            os.fsync(self._handle.fileno())
-            self._handle.close()
+            try:
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+            except OSError:
+                self._write_failed = True
+                raise
+            finally:
+                self._handle.close()
 
     @staticmethod
     def recover(wal_dir: Any) -> list[dict]:
@@ -385,6 +566,41 @@ def _read_checkpointed_seq(wal_dir: Path) -> int:
         # at-least-once; reconciliation is a downstream responsibility).
         return -1
 
+
+def _safe_max_seq_in_file(wal_file: Path) -> Optional[int]:
+    """Return the maximum seq only when every line is valid and complete.
+
+    Used for destructive cleanup, so it is intentionally stricter than the
+    resume-sequence helper below. Stream one line at a time: a large WAL must
+    not be read into RAM just to decide whether it can be deleted. A corrupt
+    or unterminated tail means the file cannot be proven fully covered and
+    must be retained. Empty files contain no event evidence and return -1.
+    """
+    highest = -1
+    try:
+        with wal_file.open("rb") as handle:
+            for raw_line in handle:
+                if not raw_line.endswith(b"\n"):
+                    return None
+                try:
+                    line = raw_line.decode("utf-8", errors="strict").strip()
+                except UnicodeDecodeError:
+                    return None
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(record, dict):
+                    return None
+                seq = record.get("seq")
+                if isinstance(seq, bool) or not isinstance(seq, int):
+                    return None
+                highest = max(highest, seq)
+    except OSError:
+        return None
+    return highest
 
 def _max_seq_in_file(wal_file: Path) -> Optional[int]:
     """The highest `seq` found in wal_file, tolerating a truncated final

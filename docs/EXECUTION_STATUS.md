@@ -1744,3 +1744,37 @@ pre-P0-8 segments (`bid_depth`/`ask_depth`); it is fixed here, together with
 the new `_exact` columns, under the existing "absent nullable column -> nulls"
 policy. Measured cost is a real slowdown (trade write path 0.59x) and is
 reported, not hidden. Out of scope and untouched: P0-10/P0-11/P0-4/P0-2/P0-3.
+
+
+### P0-2 follow-up — aggregate quality-WAL cap — 2026-10-12 — IMPLEMENTED ON BRANCH; CI PENDING
+
+This follow-up addresses the confirmed post-PR-108 failure mode: per-file rotation plus a latched
+checkpoint can leave quality events appending to an ever-growing WAL. PR #108's continuous free-space
+monitor remains useful but is not an aggregate WAL byte cap.
+
+Current implementation on branch `p0-2-quality-wal-aggregate-cap` (not merged):
+
+- Added a default aggregate limit of 100,000,000 bytes per runner WAL namespace, configurable with
+  `COLLECTOR_QUALITY_WAL_MAX_TOTAL_BYTES`. Invalid configuration fails startup. Each append checks
+  all `.wal` file sizes plus the exact UTF-8 JSONL candidate length including newline before writing.
+- A refused append creates no WAL record/ID and latches admission closed. Futures and Bybit synchronously
+  force-publish such quality rows to Parquet without a fabricated WAL ID. If that direct path fails,
+  existing quality-channel failure/lost accounting remains authoritative; no durability is inferred.
+- After an uncertain write/flush/fsync error, the WAL instance rejects subsequent appends until restart
+  rather than risking a valid JSONL record behind a partial tail. WAL-generated `seq` and
+  `quality_event_id` fields cannot be overridden by caller payload.
+- Checkpoint replacement and WAL creation/rotation sync the parent directory. Covered-file cleanup is
+  strict and evidence-preserving: runners invoke startup cleanup only after `recover()` succeeds, and
+  a file is removable only if every line is complete/valid and all sequence numbers are checkpointed.
+  Corrupt, unreadable or unterminated files are not deleted to satisfy the cap.
+- Storage status exposes the configured cap and reports `wal_total_size_bounded` only when measured
+  aggregate bytes are at/below it. Quality-channel status includes the capacity latch/reason, and a
+  one-time capacity alert explains that new quality events now rely on direct Parquet publication.
+
+Regression tests added for aggregate multi-file accounting, exact no-write rejection, oversized events,
+reserved IDs/sequences, invalid/env cap configuration, partial-write freeze, checkpoint directory-sync
+failure, recovery-gated cleanup, and the Futures/Bybit blocked-checkpoint growth scenario. The existing
+growth characterization was replaced with an assertion that the WAL remains at/below the cap and that
+all blocked-period event reasons appear in Parquet. Exact-commit GitHub CI is pending; no local checkout
+is available in this implementation environment. No claim is made yet that this is tested/merged or
+verified on a live VPS. Real ENOSPC, power loss and deployed supervisor behavior remain unverified.

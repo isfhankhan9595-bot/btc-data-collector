@@ -8,6 +8,54 @@
 
 `ParquetWriter.write()` returning means nothing about durability once batching is on.
 
+## Aggregate WAL capacity and admission behavior
+
+Only the Binance USD-M Futures and Bybit runners use this WAL. Its hard admission budget is
+**100,000,000 bytes by default** (100 MB, decimal), configured before startup with
+`COLLECTOR_QUALITY_WAL_MAX_TOTAL_BYTES`. The value must be a positive base-10 integer. Invalid
+configuration fails startup; it is never coerced. The budget is aggregate across every `.wal` file
+in that runner's WAL directory, not a per-file rotation threshold.
+
+For each append, the WAL calculates the UTF-8 JSONL record size including its newline and checks
+the current aggregate `.wal` bytes before writing. WAL-owned `seq` and `quality_event_id` fields
+cannot be overridden by event data. If the candidate would cross the limit, or the aggregate size
+cannot be safely measured, that record is refused **before bytes are written**, no WAL ID is issued,
+and admission is latched closed until process restart. After a successful full recovery pass, runners
+may remove files that are strictly validated and already covered by the durable checkpoint. If the
+remaining WAL is at/over budget, cannot be measured, or recovery fails, unverified files are preserved
+and admission remains fail-closed when the cap condition is detected. Uncheckpointed, corrupt or
+unterminated records are never deleted to meet the limit.
+
+When the cap is latched, runners route new quality events through the existing synchronous
+`ParquetWriter.write()` plus immediate `publish_open_segment()` fallback. Those rows have no
+`quality_event_id` because they do not have WAL records; the row is not falsely counted as
+WAL-retained. Successful segment publication is the durability evidence. If the Parquet fallback
+also fails, the existing degraded/lost/unconfirmed counters and alerts apply; this cap does not
+manufacture durability or guarantee the quality event survives a failure of both paths. The
+collector's raw and derived market-data routes are not stopped by a quality-WAL cap.
+
+A write/flush/fsync error after an append has been admitted remains different: bytes may have been
+partly written and the assigned ID is attached to the error so an uncertain duplicate can be
+correlated. The WAL instance then refuses later appends until restart/recovery, preventing a new
+valid JSON record from being appended behind a possible partial tail. Checkpoint replacement syncs
+the parent directory before in-memory checkpoint advancement or deletion of covered WAL files;
+WAL create/rotation also syncs the parent directory, and WAL namespace creation syncs each newly-created directory's parent. Unsupported directory-sync operations fail
+closed rather than being reported as durable.
+
+`storage_pressure_status()` exposes `quality_wal_max_bytes` and reports
+`wal_total_size_bounded: true` only when a current aggregate-size measurement is available and is
+at or below the configured cap. `quality_channel_status()` separately exposes
+`quality_wal_capacity_exhausted`, `quality_wal_capacity_reason` and `quality_wal_max_bytes`.
+The cap can remain latched even after checkpointed files are later removed; restarting after
+recovery re-evaluates the namespace. This deliberate fail-closed policy is visible in status.
+
+Scope of the guarantee: the limit bounds the WAL files in one correctly single-writer WAL namespace.
+It is not a cap on total dataset/Parquet size or on inode count. Under sustained cap mode, immediate
+Parquet publication can create more quality segment files; disk free-space monitoring remains
+necessary and continues to trigger controlled shutdown at its existing emergency threshold. These
+are filesystem syscall-level guarantees; the test suite does not establish behavior under real
+power loss, physical ENOSPC, or an unsupported filesystem.
+
 ## Single choke point
 
 All ~14 direct callers, the queue loop, queue overflow and recovery replay go through `CollectorApp._persist_quality_event`:

@@ -9,14 +9,20 @@ QualityEventWAL/recover() call exactly as a restarted process would.
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
+import textwrap
 
 import pytest
 
 from collector.collector.quality_wal import (
     CHECKPOINT_FILENAME,
+    DEFAULT_MAX_TOTAL_BYTES,
+    ENV_MAX_TOTAL_BYTES,
     QualityEventWAL,
+    QualityWALCapacityExceeded,
     QualityWALCorruption,
 )
 
@@ -276,20 +282,134 @@ def test_checkpoint_never_deletes_the_active_file_even_when_fully_covered(tmp_pa
 # ---------------------------------------------------------------------------
 
 
+_CONTAINER_NODES = (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)
+_CONTAINER_CALLS = {"list", "dict", "set", "deque", "defaultdict", "OrderedDict", "Counter", "bytearray"}
+_GROWTH_METHODS = {"append", "appendleft", "extend", "extendleft", "add", "update", "insert", "setdefault"}
+_EVENT_BUFFER_NAMES = {"_events", "_buffer", "_records"}
+
+
+def _self_attr(node):
+    """Return the attribute name for a ``self.<name>`` node, else None."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+        return node.attr
+    return None
+
+
+def _is_container_expr(node):
+    if isinstance(node, _CONTAINER_NODES):
+        return True
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        return name in _CONTAINER_CALLS
+    return False
+
+
+def _instance_retention_violations(func_source):
+    """Statically list ways a method could make the INSTANCE own a collection.
+
+    Flags, for ``self.<attr>`` only: assignment of a list/dict/set literal,
+    comprehension or container constructor; ``+=`` of such a value; item
+    assignment (``self.x[k] = ...``); growth-method calls
+    (``self.x.append(...)``); and the historical event-buffer attribute names.
+    Plain locals (``missing = []``) are never flagged: they die with the call
+    and cannot grow per event.
+    """
+    tree = ast.parse(textwrap.dedent(func_source))
+    found = []
+
+    def check_assignment(target, value, lineno):
+        if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple) \
+                and len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts):
+                check_assignment(t, v, lineno)
+            return
+        attr = _self_attr(target)
+        if attr is not None and value is not None and _is_container_expr(value):
+            found.append(f"line {lineno}: self.{attr} assigned a container")
+        if isinstance(target, ast.Subscript) and _self_attr(target.value) is not None:
+            found.append(f"line {lineno}: item assignment on self.{_self_attr(target.value)}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                check_assignment(target, node.value, node.lineno)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            check_assignment(node.target, node.value, node.lineno)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            owner = _self_attr(node.func.value)
+            if owner is not None and node.func.attr in _GROWTH_METHODS:
+                found.append(f"line {node.lineno}: self.{owner}.{node.func.attr}(...) grows instance state")
+        attr = _self_attr(node) if isinstance(node, ast.Attribute) else None
+        if attr in _EVENT_BUFFER_NAMES and isinstance(getattr(node, "ctx", None), ast.Store):
+            found.append(f"line {node.lineno}: self.{attr} is an event-buffer attribute")
+    return found
+
+
 def test_wal_object_retains_no_per_event_memory():
     """The instance itself must not accumulate a growing list/dict per
     event -- only a plain int counter (_seq) and one open file handle,
     both O(1) regardless of how many events have been appended.
-    recover()'s own local list (a return value built once per call, not
-    instance state) is a different, unrelated thing and is not what this
-    checks."""
-    import inspect
+
+    Checked structurally on the AST of ``__init__`` and ``append``: only
+    assignments to ``self.<attr>`` count. Function-local temporaries (e.g.
+    the ancestor list ``__init__`` builds to fsync parent directories, which
+    is discarded when the constructor returns) are not instance state and are
+    deliberately not flagged. recover()'s own local list is likewise
+    unrelated."""
     from collector.collector.quality_wal import QualityEventWAL
-    init_src = inspect.getsource(QualityEventWAL.__init__)
-    append_src = inspect.getsource(QualityEventWAL.append)
-    for forbidden in ("self._events", "self._buffer", "self._records", "= []", "= {}"):
-        assert forbidden not in init_src
-        assert forbidden not in append_src
+    for method in (QualityEventWAL.__init__, QualityEventWAL.append):
+        assert _instance_retention_violations(inspect.getsource(method)) == [], method.__qualname__
+
+
+@pytest.mark.parametrize("statement", [
+    "self._events = []",
+    "self._cache = {}",
+    "self._pending = set()",
+    "self._pending = list()",
+    "self._cache = dict()",
+    "self._pending = deque()",
+    "self._pending = collections.deque(maxlen=None)",
+    "self._cache = defaultdict(list)",
+    "self._pending = [e for e in ()]",
+    "self._pending: list = []",
+    "self._pending, self._count = [], 0",
+    "self._pending += [event]",
+    "self._cache[event['seq']] = event",
+    "self._pending.append(event)",
+    "self._pending.extend([event])",
+    "self._seen.add(event['seq'])",
+    "self._buffer = None",
+])
+def test_instance_retention_guard_rejects_instance_owned_collections(statement):
+    """The structural check must still catch a regression that makes the WAL
+    instance retain events, in the forms a regression would plausibly take."""
+    source = f"def append(self, event):\n    {statement}\n"
+    assert _instance_retention_violations(source), statement
+
+
+def test_instance_retention_guard_ignores_temporary_locals():
+    """A throwaway local collection is not retained state and must not be
+    falsely flagged -- this is exactly the shape that tripped the old
+    substring check (``missing_directories = []`` in ``__init__``)."""
+    source = (
+        "def __init__(self, wal_dir):\n"
+        "    self.wal_dir = wal_dir\n"
+        "    missing_directories = []\n"
+        "    lookup = {}\n"
+        "    seen = set()\n"
+        "    candidate = self.wal_dir\n"
+        "    while candidate:\n"
+        "        missing_directories.append(candidate)\n"
+        "        lookup[candidate] = True\n"
+        "        seen.add(candidate)\n"
+        "        candidate = None\n"
+        "    self._seq = 0\n"
+        "    self._seq += 1\n"
+        "    self._handle = open(wal_dir)\n"
+        "    self._depth = len(missing_directories)\n"
+    )
+    assert _instance_retention_violations(source) == []
 
 
 def test_large_burst_round_trips_without_loss(tmp_path):
@@ -394,3 +514,127 @@ def test_a_corrupted_checkpoint_file_is_treated_as_nothing_checkpointed_not_ever
     (tmp_path / CHECKPOINT_FILENAME).write_text("{not valid json", encoding="utf-8")
     recovered = QualityEventWAL.recover(tmp_path)
     assert [r["reason"] for r in recovered] == ["r0"]
+
+
+# ---------------------------------------------------------------------------
+# Aggregate admission capacity and reserved metadata invariants.
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_cap_counts_every_wal_file_and_rejects_before_writing(tmp_path):
+    first = QualityEventWAL(
+        tmp_path, process_start_marker="p1", max_total_bytes=1_000_000)
+    first.append(_event(reason="first-file"))
+    second = QualityEventWAL(
+        tmp_path, process_start_marker="p2", max_total_bytes=1_000_000)
+    second.append(_event(reason="second-file"))
+
+    current = first._total_wal_bytes()
+    candidate = {
+        **_event(reason="candidate"),
+        "quality_event_id": "p1-2",
+        "seq": 2,
+    }
+    requested = len((json.dumps(candidate, default=str) + "\n").encode("utf-8"))
+    # Allow the candidate to fit beside the active file alone, but not when
+    # every WAL file in the shared namespace is counted.
+    first_active_size = first._active_path.stat().st_size
+    first.max_total_bytes = current + requested - 1
+    assert first_active_size + requested <= first.max_total_bytes
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")}
+
+    with pytest.raises(QualityWALCapacityExceeded) as caught:
+        first.append(_event(reason="candidate"))
+
+    assert caught.value.current_bytes == current
+    assert caught.value.requested_bytes == requested
+    assert caught.value.newly_exhausted is True
+    assert not hasattr(caught.value, "quality_event_id")
+    assert first.capacity_exhausted is True
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")} == before
+    with pytest.raises(QualityWALCapacityExceeded) as again:
+        first.append(_event(reason="later"))
+    assert again.value.newly_exhausted is False
+    first.close()
+    second.close()
+
+
+def test_oversized_single_event_is_rejected_without_a_wal_id_or_partial_line(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="p", max_total_bytes=256)
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")}
+
+    with pytest.raises(QualityWALCapacityExceeded) as caught:
+        wal.append(_event(reason="x" * 2048))
+
+    assert caught.value.reason == "aggregate_budget_exhausted"
+    assert not hasattr(caught.value, "quality_event_id")
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.wal")} == before
+    assert wal.capacity_exhausted is True
+    wal.close()
+
+
+def test_wal_generated_identity_fields_cannot_be_overridden_by_event_data(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="owned")
+    event_id = wal.append(_event(reason="reserved", seq=999, quality_event_id="caller-spoof"))
+    wal.close()
+
+    recovered = QualityEventWAL.recover(tmp_path)
+    assert event_id == "owned-1"
+    assert recovered[0]["seq"] == 1
+    assert recovered[0]["quality_event_id"] == "owned-1"
+
+
+@pytest.mark.parametrize("bad_cap", [0, -1, True, "100"])
+def test_invalid_aggregate_cap_is_rejected(bad_cap, tmp_path):
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        QualityEventWAL(tmp_path / str(type(bad_cap).__name__) , max_total_bytes=bad_cap)
+
+
+def test_aggregate_cap_reads_environment_and_has_documented_default(tmp_path, monkeypatch):
+    monkeypatch.delenv(ENV_MAX_TOTAL_BYTES, raising=False)
+    default = QualityEventWAL(tmp_path / "default")
+    assert default.max_total_bytes == DEFAULT_MAX_TOTAL_BYTES
+    default.close()
+
+    monkeypatch.setenv(ENV_MAX_TOTAL_BYTES, "4096")
+    configured = QualityEventWAL(tmp_path / "configured")
+    assert configured.max_total_bytes == 4096
+    configured.close()
+
+    monkeypatch.setenv(ENV_MAX_TOTAL_BYTES, "4K")
+    with pytest.raises(ValueError, match=ENV_MAX_TOTAL_BYTES):
+        QualityEventWAL(tmp_path / "invalid")
+
+
+def test_startup_cleanup_removes_only_fully_checkpointed_valid_wal_files(tmp_path):
+    previous = QualityEventWAL(tmp_path, process_start_marker="previous")
+    previous.append(_event(reason="already-published"))
+    previous.checkpoint(up_to_seq=1)
+    previous.close()
+    old_active = previous._active_path
+    assert old_active.exists()
+    assert QualityEventWAL.recover(tmp_path) == []   # full recovery validation succeeded
+    QualityEventWAL.cleanup_fully_checkpointed_files(tmp_path)
+
+    restarted = QualityEventWAL(
+        tmp_path, process_start_marker="restarted", max_total_bytes=256)
+    assert not old_active.exists()                 # only valid, checkpoint-covered evidence is cleaned
+    assert restarted.capacity_exhausted is False
+    assert restarted._total_wal_bytes() == 0
+    restarted.close()
+
+
+def test_startup_cleanup_preserves_any_corrupt_or_unterminated_wal_file(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="previous")
+    wal.append(_event(reason="covered"))
+    wal.checkpoint(up_to_seq=1)
+    wal.close()
+    old_active = wal._active_path
+    with old_active.open("ab") as handle:
+        handle.write(b"{corrupt-tail}\n")
+
+    with pytest.raises(QualityWALCorruption):
+        QualityEventWAL.recover(tmp_path)       # failed recovery forbids cleanup
+    restarted = QualityEventWAL(tmp_path, process_start_marker="restarted")
+    assert old_active.exists()
+    restarted.close()

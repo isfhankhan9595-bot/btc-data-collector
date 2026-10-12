@@ -279,4 +279,5 @@ def test_documentation_describes_the_failed_state_and_the_recovery_action():
         assert "failed" in text and "systemctl restart btc-collector" in text, doc
         assert "not verified" in text.lower() or "unverified" in text.lower(), doc
     storage = (REPO / "docs" / "F5_QA_04_STORAGE_PRESSURE.md").read_text()
-    assert "Bybit" in storage and "UNKNOWN" in storage and "no hard wal cap" in storage.lower()
+    assert "Bybit" in storage and "UNKNOWN" in storage
+    assert "aggregate wal admission cap" in storage.lower()
