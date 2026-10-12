@@ -798,6 +798,11 @@ class CollectorApp:
             # cover its seqs and the file would be deleted -- destroying the
             # evidence. Checkpointing stays off until an operator resolves it.
             self._block_quality_checkpoint("wal_corruption_on_startup")
+        else:
+            # Recovery successfully parsed every WAL record; only now is it
+            # safe to remove old, strictly validated files already covered
+            # by the durable checkpoint.
+            QualityEventWAL.cleanup_fully_checkpointed_files(wal_dir)
         self._quality_wal = QualityEventWAL(wal_dir, start_seq=resume_seq)
         if self._quality_wal_recovery_error is not None:
             self._emit_quality_event({
