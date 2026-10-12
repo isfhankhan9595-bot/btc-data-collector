@@ -487,3 +487,35 @@ def test_aggregate_cap_reads_environment_and_has_documented_default(tmp_path, mo
     monkeypatch.setenv(ENV_MAX_TOTAL_BYTES, "4K")
     with pytest.raises(ValueError, match=ENV_MAX_TOTAL_BYTES):
         QualityEventWAL(tmp_path / "invalid")
+
+
+def test_startup_cleanup_removes_only_fully_checkpointed_valid_wal_files(tmp_path):
+    previous = QualityEventWAL(tmp_path, process_start_marker="previous")
+    previous.append(_event(reason="already-published"))
+    previous.checkpoint(up_to_seq=1)
+    previous.close()
+    old_active = previous._active_path
+    assert old_active.exists()
+
+    restarted = QualityEventWAL(
+        tmp_path, process_start_marker="restarted", max_total_bytes=256)
+    assert not old_active.exists()                 # only valid, checkpoint-covered evidence is cleaned
+    assert restarted.capacity_exhausted is False
+    assert restarted._total_wal_bytes() == 0
+    restarted.close()
+
+
+def test_startup_cleanup_preserves_any_corrupt_or_unterminated_wal_file(tmp_path):
+    wal = QualityEventWAL(tmp_path, process_start_marker="previous")
+    wal.append(_event(reason="covered"))
+    wal.checkpoint(up_to_seq=1)
+    wal.close()
+    old_active = wal._active_path
+    with old_active.open("ab") as handle:
+        handle.write(b"{corrupt-tail}\\n")
+
+    restarted = QualityEventWAL(tmp_path, process_start_marker="restarted")
+    assert old_active.exists()
+    with pytest.raises(QualityWALCorruption):
+        QualityEventWAL.recover(tmp_path)
+    restarted.close()
