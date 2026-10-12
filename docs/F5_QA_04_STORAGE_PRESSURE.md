@@ -1,8 +1,10 @@
 # F5-QA-04 — quality-WAL growth and continuous storage-pressure monitoring
 
 Scope: the two WAL-backed runners only — Binance USD-M Futures (`run_collector.py`) and Bybit
-(`run_bybit_collector.py`). Spot, OKX and OKX capture-only are unchanged. WAL format, schema,
-event IDs, sequencing, checkpoint semantics and at-least-once delivery are unchanged.
+(`run_bybit_collector.py`). Spot, OKX and OKX capture-only are unchanged. The WAL row shape,
+sequence/checkpoint contract and at-least-once replay semantics remain intact; the WAL now owns and
+protects its `seq` / `quality_event_id` fields against caller override. New cap-refused events are
+force-published to Parquet without WAL IDs rather than being misrepresented as WAL-retained.
 
 ## Problem (Phase A evidence, test results — not production rates)
 
@@ -14,8 +16,8 @@ only free-space control, `DiskMonitor.check_disk_space()` (7/4/2 GiB), ran once 
 constructor (where its shutdown callback hit a half-built app: `AttributeError: 'CollectorApp'
 object has no attribute 'ws_clients'`) and Bybit had no disk monitoring at all.
 
-Reproduction (real runners, real WAL and `ParquetWriter`, scratch dirs, `max_bytes=800`, checkpoint
-`os.replace` failure injected after a successful publish):
+Original uncapped reproduction (real runners, real WAL and `ParquetWriter`, scratch dirs,
+`max_bytes=800`, checkpoint `os.replace` failure injected after a successful publish):
 
 | scenario | runner | events | WAL files | WAL bytes | rotations / WAL unlinks |
 |---|---|---|---|---|---|
@@ -30,13 +32,29 @@ and are **not** a basis for a size limit.
 
 ## Policy
 
-**There is no hard WAL size cap.** Nothing in this change deletes, truncates, rewrites or moves an
-uncheckpointed WAL file, and the WAL is *not* bounded by `max_bytes` (`status()` reports
-`wal_total_size_bounded: false`). A retention/cap policy would need its own explicit
-data-preservation design.
+**A hard aggregate WAL admission cap is now implemented.** The default limit is 100,000,000 bytes
+(decimal 100 MB), configured by `COLLECTOR_QUALITY_WAL_MAX_TOTAL_BYTES` as a positive base-10
+integer. The value is intentionally independent of the per-file rotation threshold (`max_bytes`).
+Every append sums all `.wal` file sizes in the WAL namespace and measures the candidate's UTF-8
+JSONL bytes including newline. If it cannot prove the candidate will fit, the append is refused
+before writing; admission latches closed until restart. A startup WAL already at/over the limit or
+an unmeasurable aggregate also latches admission closed. Invalid capacity configuration fails
+startup; it is never coerced.
 
-What bounds the damage is a continuous free-space control for both runners, on the filesystem(s)
-holding each runner's configured data directory and quality-WAL directory (worst free space wins):
+**No WAL evidence is deleted, truncated, rewritten, or moved to meet the limit.** Existing
+uncheckpointed records stay intact. Rejected events do not receive a WAL ID and do not enter the
+WAL-backed queue. Both runners use the existing direct fallback to synchronously write and
+force-publish quality Parquet. Those rows have a null `quality_event_id`; they count as durably
+published only when that publication succeeds. If the WAL is capped and the quality Parquet writer
+has failed too, existing lost/unconfirmed accounting applies: no durability is invented. The quality
+channel reports `quality_wal_capacity_exhausted`, reason and configured limit; storage status
+reports aggregate bytes, file count, limit and `wal_total_size_bounded` only when the observed
+aggregate is at or below that limit.
+
+The cap protects one correctly single-writer WAL directory, not total dataset or Parquet storage and
+not total inode count. Sustained cap mode can cause immediate quality-Parquet publication and thus
+many small segments; continuous free-space monitoring remains required. The independent disk
+pressure policy is unchanged:
 
 | state | free space (defaults) | action |
 |---|---|---|
@@ -138,17 +156,18 @@ any particular host is not assumed.
 
 `storage_pressure_status()` on each runner (read-only, separate from `quality_channel_status()` and
 its lost / unconfirmed / WAL-only counters): `severity` (UNKNOWN while the latest measurement is
-failing), `last_classified_severity` (the last successful classification, diagnostics only),
-`free_bytes` / `total_bytes` (`None`, never 0, when the measurement failed), `quality_wal_bytes`,
-`quality_wal_file_count` (`None` when unreadable), `quality_checkpoint_blocked` + reason,
-`last_monitor_error`, `consecutive_monitor_errors`, `monitor_failure_duration_s` (monotonic; `None`
-when not failing), `monitor_error_alerts`, `monitor_unavailable_latched`, `shutdown_reason`
-(`disk_emergency` / `disk_monitor_unavailable` / `None`), `last_transition`, `alerts_sent`, thresholds,
-`wal_total_size_bounded: false`.
+failing), `last_classified_severity`, `free_bytes` / `total_bytes` (`None`, never 0, when measurement
+failed), `quality_wal_bytes`, `quality_wal_file_count` (`None` when unreadable),
+`quality_wal_max_bytes`, `wal_total_size_bounded` (true only when measured bytes are at/below the
+known cap), `quality_checkpoint_blocked` + reason, `last_monitor_error`,
+`consecutive_monitor_errors`, `monitor_failure_duration_s`, `monitor_error_alerts`,
+`monitor_unavailable_latched`, `shutdown_reason`, `last_transition`, `alerts_sent`, thresholds.
+The quality-channel status separately reports capacity-latched state and reason.
 
 ## Not validated
 
 Real ENOSPC, real power loss and a live systemd unit were not exercised; tests inject the free-space
 reading (including probe failures and a fake monotonic clock) and checkpoint `os.replace` failures on
 scratch directories. The systemd behaviour for exit statuses 1 and 69 (start-limit containment, the `failed` state, restart-prevention) is derived from the unit text, `systemd-analyze verify` and arithmetic, not observed on a live host. Bybit has no repository-managed unit; whether any external supervisor restarts it, and how, is UNKNOWN.
-There is still no hard WAL cap.
+A per-file rotation threshold and an aggregate admission cap both exist now; the cap is not a total
+dataset-space/inode bound and does not make direct Parquet fallback immune to ENOSPC.
