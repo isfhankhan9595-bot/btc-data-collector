@@ -988,9 +988,13 @@ class Rehearsal:
         diff = snap["diff"]
         changed = [f"{kind}:{k}" for kind in ("added", "removed", "modified") for k in diff[kind]]
         rebuild_reasons = (["index missing, unreadable or older/other schema"] if schema_stale else []) + diverged
-        # Only markers whose state is KNOWN: an unreadable marker is never written (startup refuses instead).
-        markers_to_write = sum(t.count for k, t in self.marker_tallies.items() if k in ("absent", "absent_v1_hint", "invalid"))
+        # Markers of KNOWN state that startup would (re)write if it ran: absent, v1-hint and malformed ones.
+        markers_to_write_if_not_refused = sum(
+            t.count for k, t in self.marker_tallies.items() if k in ("absent", "absent_v1_hint", "invalid"))
         unreadable_markers = self.marker_tallies["unreadable"].count
+        # What startup will ACTUALLY write: startup_reconcile() aborts before any marker write while any marker is
+        # unreadable, so the planned count is 0 then; the conditional figure above stays visible separately.
+        markers_to_write = 0 if unreadable_markers else markers_to_write_if_not_refused
         refusal_reasons = [index["schema_problem"]] if future else []
         if unreadable_markers:
             refusal_reasons.append(
@@ -1065,6 +1069,11 @@ class Rehearsal:
                 "startup_refusal_reasons": refusal_reasons,
                 "segments_to_index_incrementally": (len(readable) if (not_indexed is None) else not_indexed),
                 "markers_to_write_by_startup_refsync": markers_to_write,
+                "markers_to_write_if_unreadable_markers_were_resolved": markers_to_write_if_not_refused,
+                "markers_to_write_note": (
+                    "markers_to_write_by_startup_refsync is what startup will actually write: 0 while any marker is "
+                    "unreadable (startup_reconcile() refuses first). markers_to_write_if_unreadable_markers_were_resolved "
+                    "counts absent, v1-hint and malformed markers and is conditional on that refusal being cleared"),
                 "evidence_files_to_write": evid_bad,
                 "measured_rate": "see run.read_throughput (this run performed an equivalent read of every segment)"},
             "warnings": self.warnings,
@@ -1099,9 +1108,12 @@ def format_summary(result: Dict[str, Any]) -> str:
         lines.append("  evidence: " + " ".join(f"{k}={e[k]['count']}" for k in ("ok", "missing", "invalid", "stale", "mismatch"))
                      + f" orphans={ev['orphan_evidence_files']['count']}")
     if r["markers"]["unreadable"]["count"]:
+        w0 = r["estimated_work"]
         lines.append(f"  MARKERS UNREADABLE: {r['markers']['unreadable']['count']} publication marker(s) could not be read "
                      f"(I/O error, contents unknown; not counted as malformed); startup would REFUSE (DedupStateError) "
-                     f"before changing any marker, segment or index")
+                     f"before changing any marker, segment or index: 0 markers will be written; "
+                     f"{w0['markers_to_write_if_unreadable_markers_were_resolved']} would need writing once the "
+                     f"unreadable ones are resolved")
     lg = r["legacy_parquet"]
     lines.append(f"  legacy parquet: {lg['legacy_hourly_files']} hourly files (NOT merged); hours with both legacy and "
                  f".seg: {lg['hours_with_both']}")
