@@ -9,8 +9,11 @@ QualityEventWAL/recover() call exactly as a restarted process would.
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
+import textwrap
 
 import pytest
 
@@ -279,20 +282,134 @@ def test_checkpoint_never_deletes_the_active_file_even_when_fully_covered(tmp_pa
 # ---------------------------------------------------------------------------
 
 
+_CONTAINER_NODES = (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)
+_CONTAINER_CALLS = {"list", "dict", "set", "deque", "defaultdict", "OrderedDict", "Counter", "bytearray"}
+_GROWTH_METHODS = {"append", "appendleft", "extend", "extendleft", "add", "update", "insert", "setdefault"}
+_EVENT_BUFFER_NAMES = {"_events", "_buffer", "_records"}
+
+
+def _self_attr(node):
+    """Return the attribute name for a ``self.<name>`` node, else None."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+        return node.attr
+    return None
+
+
+def _is_container_expr(node):
+    if isinstance(node, _CONTAINER_NODES):
+        return True
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        return name in _CONTAINER_CALLS
+    return False
+
+
+def _instance_retention_violations(func_source):
+    """Statically list ways a method could make the INSTANCE own a collection.
+
+    Flags, for ``self.<attr>`` only: assignment of a list/dict/set literal,
+    comprehension or container constructor; ``+=`` of such a value; item
+    assignment (``self.x[k] = ...``); growth-method calls
+    (``self.x.append(...)``); and the historical event-buffer attribute names.
+    Plain locals (``missing = []``) are never flagged: they die with the call
+    and cannot grow per event.
+    """
+    tree = ast.parse(textwrap.dedent(func_source))
+    found = []
+
+    def check_assignment(target, value, lineno):
+        if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple) \
+                and len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts):
+                check_assignment(t, v, lineno)
+            return
+        attr = _self_attr(target)
+        if attr is not None and value is not None and _is_container_expr(value):
+            found.append(f"line {lineno}: self.{attr} assigned a container")
+        if isinstance(target, ast.Subscript) and _self_attr(target.value) is not None:
+            found.append(f"line {lineno}: item assignment on self.{_self_attr(target.value)}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                check_assignment(target, node.value, node.lineno)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            check_assignment(node.target, node.value, node.lineno)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            owner = _self_attr(node.func.value)
+            if owner is not None and node.func.attr in _GROWTH_METHODS:
+                found.append(f"line {node.lineno}: self.{owner}.{node.func.attr}(...) grows instance state")
+        attr = _self_attr(node) if isinstance(node, ast.Attribute) else None
+        if attr in _EVENT_BUFFER_NAMES and isinstance(getattr(node, "ctx", None), ast.Store):
+            found.append(f"line {node.lineno}: self.{attr} is an event-buffer attribute")
+    return found
+
+
 def test_wal_object_retains_no_per_event_memory():
     """The instance itself must not accumulate a growing list/dict per
     event -- only a plain int counter (_seq) and one open file handle,
     both O(1) regardless of how many events have been appended.
-    recover()'s own local list (a return value built once per call, not
-    instance state) is a different, unrelated thing and is not what this
-    checks."""
-    import inspect
+
+    Checked structurally on the AST of ``__init__`` and ``append``: only
+    assignments to ``self.<attr>`` count. Function-local temporaries (e.g.
+    the ancestor list ``__init__`` builds to fsync parent directories, which
+    is discarded when the constructor returns) are not instance state and are
+    deliberately not flagged. recover()'s own local list is likewise
+    unrelated."""
     from collector.collector.quality_wal import QualityEventWAL
-    init_src = inspect.getsource(QualityEventWAL.__init__)
-    append_src = inspect.getsource(QualityEventWAL.append)
-    for forbidden in ("self._events", "self._buffer", "self._records", "= []", "= {}"):
-        assert forbidden not in init_src
-        assert forbidden not in append_src
+    for method in (QualityEventWAL.__init__, QualityEventWAL.append):
+        assert _instance_retention_violations(inspect.getsource(method)) == [], method.__qualname__
+
+
+@pytest.mark.parametrize("statement", [
+    "self._events = []",
+    "self._cache = {}",
+    "self._pending = set()",
+    "self._pending = list()",
+    "self._cache = dict()",
+    "self._pending = deque()",
+    "self._pending = collections.deque(maxlen=None)",
+    "self._cache = defaultdict(list)",
+    "self._pending = [e for e in ()]",
+    "self._pending: list = []",
+    "self._pending, self._count = [], 0",
+    "self._pending += [event]",
+    "self._cache[event['seq']] = event",
+    "self._pending.append(event)",
+    "self._pending.extend([event])",
+    "self._seen.add(event['seq'])",
+    "self._buffer = None",
+])
+def test_instance_retention_guard_rejects_instance_owned_collections(statement):
+    """The structural check must still catch a regression that makes the WAL
+    instance retain events, in the forms a regression would plausibly take."""
+    source = f"def append(self, event):\n    {statement}\n"
+    assert _instance_retention_violations(source), statement
+
+
+def test_instance_retention_guard_ignores_temporary_locals():
+    """A throwaway local collection is not retained state and must not be
+    falsely flagged -- this is exactly the shape that tripped the old
+    substring check (``missing_directories = []`` in ``__init__``)."""
+    source = (
+        "def __init__(self, wal_dir):\n"
+        "    self.wal_dir = wal_dir\n"
+        "    missing_directories = []\n"
+        "    lookup = {}\n"
+        "    seen = set()\n"
+        "    candidate = self.wal_dir\n"
+        "    while candidate:\n"
+        "        missing_directories.append(candidate)\n"
+        "        lookup[candidate] = True\n"
+        "        seen.add(candidate)\n"
+        "        candidate = None\n"
+        "    self._seq = 0\n"
+        "    self._seq += 1\n"
+        "    self._handle = open(wal_dir)\n"
+        "    self._depth = len(missing_directories)\n"
+    )
+    assert _instance_retention_violations(source) == []
 
 
 def test_large_burst_round_trips_without_loss(tmp_path):
