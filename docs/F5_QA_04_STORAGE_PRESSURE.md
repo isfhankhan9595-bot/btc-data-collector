@@ -109,16 +109,28 @@ any particular host is not assumed.
   Precedence when several are latched: 70 > 1 > 69. Futures `main()` returns `app.exit_code`; Bybit's
   `_run_supervised` returns the supervisor's non-zero status unchanged and maps a clean stop to
   `app.exit_code`. No `sys.exit` / `os._exit` is called from the monitor.
-* **Futures under systemd (template unchanged).** `Restart=always`, `RestartSec=5`,
-  `StartLimitBurst=5` per 300 s restart any exit, including 1 and 69. Under a persistent EMERGENCY each
-  restart fails at once at the startup gate, so the start limit is reached quickly (inference from the
-  unit settings, **not verified on a real host**). Under a persistently failing probe each cycle takes
-  about grace + RestartSec = 65 s, so only about 4–5 starts fall inside any 300 s window and the start
-  limit may never trip: by inference the unit would keep cycling roughly every 65 s, never ingesting,
-  and each new process alerts again (the 900 s alert rate limit is per process). This is a known
-  residual risk, not a verified behaviour. A restart with free space above the threshold and a working
-  probe replays the uncheckpointed quality events (at-least-once) and, if the earlier checkpoint fault
-  was transient, catches the checkpoint up.
+* **Futures under systemd.** The unit keeps `Restart=always`, `RestartSec=5`, `StartLimitIntervalSec=300`,
+  `StartLimitBurst=5` and adds **`RestartPreventExitStatus=69`** (only 69).
+  * *Why (arithmetic on systemd's documented start-limit semantics, not measured on a host):* containment
+    needs a 6th start inside the 300 s window, i.e. a restart cycle <= 300 / 5 = 60 s. A confirmed
+    emergency (exit 1) exits within seconds, so its cycle is about 7 s and the 6th start is refused at
+    roughly 35 s: the start limit contains it, unchanged. A persistently unmeasurable disk (exit 69)
+    spends the whole 60 s grace before exiting, so its cycle is at least 60 + 5 = 65 s (startup and
+    shutdown only lengthen it): starts land at 0, 65, 130, 195, 260, 325 s and the 6th falls outside the
+    window, so the limit never trips (fixed and sliding window models agree). Without the directive the
+    unit would cycle forever without ingesting and re-alert on every process. The 60 s grace was not
+    changed to hide this.
+  * *Behaviour (by systemd's documentation; **not verified on a real host**):* after exit 69 the unit is
+    left **`failed`** (`status=69` in `systemctl status`) and is not restarted automatically. Exit 1
+    (confirmed disk emergency) and 70 (fatal storage) are not prevented and restart as before, still
+    protected by the start limit. Every other exit still restarts.
+  * *Operator action:* fix the monitor / filesystem problem (probe errors are in the log and the alert's
+    `last error`), then run `sudo systemctl restart btc-collector`. A restart replays any uncheckpointed
+    quality events (at-least-once); nothing was deleted. If `systemctl status` ever reports
+    `start-limit-hit` (a different failure), `sudo systemctl reset-failed btc-collector` is additionally
+    required (standard systemd behaviour, also unverified for this unit).
+  * A restart with free space above the threshold and a working probe resumes normally and, if the earlier
+    checkpoint fault was transient, catches the checkpoint up.
 * **Bybit.** There is no systemd unit for this runner. After an emergency stop it stays stopped unless
   an external supervisor is configured.
 
@@ -138,5 +150,5 @@ when not failing), `monitor_error_alerts`, `monitor_unavailable_latched`, `shutd
 
 Real ENOSPC, real power loss and a live systemd unit were not exercised; tests inject the free-space
 reading (including probe failures and a fake monotonic clock) and checkpoint `os.replace` failures on
-scratch directories. The restart cadence under systemd for exit status 69 is inferred, not observed.
+scratch directories. The systemd behaviour for exit statuses 1 and 69 (start-limit containment, the `failed` state, restart-prevention) is derived from the unit text, `systemd-analyze verify` and arithmetic, not observed on a live host. Bybit has no repository-managed unit; whether any external supervisor restarts it, and how, is UNKNOWN.
 There is still no hard WAL cap.

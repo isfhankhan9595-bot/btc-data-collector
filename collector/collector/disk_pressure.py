@@ -102,6 +102,8 @@ EXIT_DISK_PRESSURE = 1
 #: from 70. 69 is sysexits ``EX_UNAVAILABLE`` and is unused elsewhere in this repository
 #: (existing statuses: 0, 1 = run task crashed / disk emergency, 70 = fatal raw-evidence storage).
 #: Precedence when several are latched: 70 > 1 (confirmed emergency) > 69.
+#: ``btc-collector.service`` sets ``RestartPreventExitStatus=69`` (and only 69): a persistently
+#: unmeasurable disk leaves the Futures unit ``failed`` instead of cycling every ~65 s.
 EXIT_DISK_MONITOR_UNAVAILABLE = 69
 
 ENV_WARNING_GIB = "COLLECTOR_DISK_WARNING_GIB"

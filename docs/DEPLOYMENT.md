@@ -50,10 +50,16 @@ Not in the unit. `EnvironmentFile=/etc/btc-collector.env` (root-owned, 0600) sup
   `COLLECTOR_DISK_*`). **UNKNOWN fails closed:** ingestion does not start until one valid measurement
   exists, and storage that cannot be measured for `COLLECTOR_DISK_UNKNOWN_GRACE_S` (default 60 s,
   consecutive) ends in the controlled shutdown with exit status **69** (distinct from the disk emergency
-  1; **70** keeps priority). There is no hard WAL size cap. The unit file is unchanged; `Restart=always`
-  restarts 1 and 69 too, and a persistently failing probe cycles about every 65 s (grace + `RestartSec`),
-  which by inference may stay under `StartLimitBurst` (not verified on a real host). Bybit has no unit, so
-  it stays stopped after either stop unless an external supervisor is configured. See
+  1; **70** keeps priority: 70 > 1 > 69). There is no hard WAL size cap.
+- **Restart policy for exit 69:** the unit sets `RestartPreventExitStatus=69` (only 69) next to the
+  unchanged `Restart=always` / `RestartSec=5` / `StartLimitBurst=5` per 300 s. A persistently unmeasurable
+  disk would otherwise cycle about every 65 s (60 s grace + 5 s), too slowly for the start limit to ever
+  trip. After exit 69 the unit stays **`failed`** for an operator: fix the monitor / filesystem problem,
+  then `sudo systemctl restart btc-collector` (add `systemctl reset-failed btc-collector` only if status
+  shows `start-limit-hit`). Exit 1 and 70 still restart as before. This behaviour follows systemd's
+  documentation and `systemd-analyze verify`; it is **not verified on a real host**.
+- **Bybit** has no repository-managed unit: after either disk stop it stays stopped unless an external
+  supervisor is configured, and what such a supervisor would do is UNKNOWN. See
   `F5_QA_04_STORAGE_PRESSURE.md`.
 
 ## Runner coverage (repository evidence, P0-12 finalization)
