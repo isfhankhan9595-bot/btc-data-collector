@@ -617,6 +617,7 @@ class CollectorApp:
         self._quality_checkpoint_blocked = False
         self._quality_checkpoint_block_reason = None
         self._quality_checkpoint_block_alerted = False   # one operator alert per process, set BEFORE sending
+        self._quality_wal_capacity_alerted = False      # one operator alert for the aggregate hard cap
         self._quality_wal_inflight = set()
         self._quality_segment_seqs = set()
         self._quality_published_hwm = None
@@ -699,7 +700,11 @@ class CollectorApp:
         * ``quality_events_wal_only`` -- the WAL record is established and will be replayed."""
         self._ensure_quality_state()
         record = getattr(self, "quality_degraded", None)
+        wal = getattr(self, "_quality_wal", None)
         return {"quality_degraded": record is not None,
+                "quality_wal_capacity_exhausted": bool(getattr(wal, "capacity_exhausted", False)),
+                "quality_wal_capacity_reason": getattr(wal, "capacity_reason", None),
+                "quality_wal_max_bytes": getattr(wal, "max_total_bytes", None),
                 "quality_events_wal_only": self._quality_events_wal_only,
                 "quality_events_wal_unconfirmed": self._quality_events_wal_unconfirmed,
                 "quality_events_lost": self._quality_events_unrecorded,
@@ -867,6 +872,10 @@ class CollectorApp:
                 # Parquet path; no unbounded queue and no false WAL-backed ID.
                 if getattr(wal, "capacity_exhausted", False):
                     event["_wal_capacity_exhausted"] = True
+                    self._note_quality_wal_capacity_exhausted(
+                        reason=wal.capacity_reason,
+                        current_bytes=getattr(wal, "_capacity_current_bytes", None),
+                        limit_bytes=wal.max_total_bytes)
                     self._persist_quality_event(event)
                     return
                 event_type_value = event_type.value if isinstance(event_type, QualityEventType) else event_type
@@ -876,10 +885,9 @@ class CollectorApp:
                 # attach an ID or seq: only the direct, forced Parquet publish
                 # can establish its durability now.
                 event["_wal_capacity_exhausted"] = True
-                if wal_exc.newly_exhausted:
-                    logger.error("quality_wal_capacity_exhausted",
-                                 reason=wal_exc.reason, current_bytes=wal_exc.current_bytes,
-                                 requested_bytes=wal_exc.requested_bytes, limit_bytes=wal_exc.max_total_bytes)
+                self._note_quality_wal_capacity_exhausted(
+                    reason=wal_exc.reason, current_bytes=wal_exc.current_bytes,
+                    requested_bytes=wal_exc.requested_bytes, limit_bytes=wal_exc.max_total_bytes)
                 try:
                     self._persist_quality_event(event)
                 except Exception:  # noqa: BLE001
@@ -962,6 +970,28 @@ class CollectorApp:
                 logger.error("quality_overflow_summary_persist_failed")
                 self._block_quality_checkpoint("overflow_summary_persist_failed")
 
+    def _note_quality_wal_capacity_exhausted(self, *, reason, current_bytes=None,
+                                             requested_bytes=None, limit_bytes=None) -> None:
+        """Report aggregate WAL admission closure once, without re-entering quality persistence."""
+        self._ensure_quality_state()
+        if getattr(self, "_quality_wal_capacity_alerted", False):
+            return
+        self._quality_wal_capacity_alerted = True  # set before logger/alert callbacks
+        try:
+            logger.error("quality_wal_capacity_exhausted", reason=reason,
+                         current_bytes=current_bytes, requested_bytes=requested_bytes,
+                         limit_bytes=limit_bytes)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            send_telegram_alert(
+                "QUALITY WAL CAPACITY EXHAUSTED [FUTURES]: aggregate WAL admission is closed "
+                f"(reason={reason}, limit_bytes={limit_bytes}, current_bytes={current_bytes}). "
+                "Uncheckpointed WAL evidence is preserved. New quality events are force-published "
+                "to Parquet without a WAL ID; inspect/recover the WAL and restart after correction.")
+        except Exception:  # noqa: BLE001 - alerting cannot affect market-data capture
+            pass
+
     def _persist_quality_event(self, event: dict):
         """Single choke point for EVERY quality event (~14 direct call sites,
         the queue loop, recovery replay).
@@ -982,6 +1012,13 @@ class CollectorApp:
         wal_seq = event.get("_wal_seq")
         wal_protected = wal is not None and wal_seq is not None
         capacity_fallback = bool(event.get("_wal_capacity_exhausted", False))
+        if (wal is not None and wal_seq is None and not capacity_fallback
+                and getattr(wal, "capacity_exhausted", False)):
+            capacity_fallback = True
+            event = {**event, "_wal_capacity_exhausted": True}
+            self._note_quality_wal_capacity_exhausted(
+                reason=wal.capacity_reason, current_bytes=getattr(wal, "_capacity_current_bytes", None),
+                limit_bytes=wal.max_total_bytes)
         if wal is not None and wal_seq is None and not capacity_fallback:
             event_type_for_wal = event.get("event_type", QualityEventType.ERROR.value)
             if isinstance(event_type_for_wal, QualityEventType):
@@ -991,10 +1028,10 @@ class CollectorApp:
                                       | {"event_type": event_type_for_wal})
             except QualityWALCapacityExceeded as exc:
                 capacity_fallback = True
-                if exc.newly_exhausted:
-                    logger.error("quality_wal_capacity_exhausted",
-                                 reason=exc.reason, current_bytes=exc.current_bytes,
-                                 requested_bytes=exc.requested_bytes, limit_bytes=exc.max_total_bytes)
+                event = {**event, "_wal_capacity_exhausted": True}
+                self._note_quality_wal_capacity_exhausted(
+                    reason=exc.reason, current_bytes=exc.current_bytes,
+                    requested_bytes=exc.requested_bytes, limit_bytes=exc.max_total_bytes)
             except Exception as exc:  # noqa: BLE001
                 logger.error("quality_event_wal_append_failed_in_persist", reason=event.get("reason"))
                 failed_id = getattr(exc, "quality_event_id", None)
