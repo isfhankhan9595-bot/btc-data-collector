@@ -39,7 +39,7 @@ partly written and the assigned ID is attached to the error so an uncertain dupl
 correlated. The WAL instance then refuses later appends until restart/recovery, preventing a new
 valid JSON record from being appended behind a possible partial tail. Checkpoint replacement syncs
 the parent directory before in-memory checkpoint advancement or deletion of covered WAL files;
-WAL create/rotation also syncs the parent directory. Unsupported directory-sync operations fail
+WAL create/rotation also syncs the parent directory, and WAL namespace creation syncs each newly-created directory's parent. Unsupported directory-sync operations fail
 closed rather than being reported as durable.
 
 `storage_pressure_status()` exposes `quality_wal_max_bytes` and reports
