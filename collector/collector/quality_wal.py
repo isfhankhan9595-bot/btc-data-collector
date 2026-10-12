@@ -568,7 +568,7 @@ def _safe_max_seq_in_file(wal_file: Path) -> Optional[int]:
     try:
         with wal_file.open("rb") as handle:
             for raw_line in handle:
-                if not raw_line.endswith(b"\\n"):
+                if not raw_line.endswith(b"\n"):
                     return None
                 try:
                     line = raw_line.decode("utf-8", errors="strict").strip()
