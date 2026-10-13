@@ -28,10 +28,14 @@ import time
 
 from collector.collector.quality_events import BookQuality
 from collector.run_bybit_collector import BybitCollectorApp, _topics
+from collector.tests._bybit_quality_fixtures import one_row_bybit_quality_segments
 
 
 def _app(tmp_path):
-    return BybitCollectorApp(data_dir=str(tmp_path))
+    # P0-3: Bybit batches in production; these tests want one-row segments, set BEFORE construction.
+    # Batched behaviour: test_bybit_quality_batching.py
+    with one_row_bybit_quality_segments():
+        return BybitCollectorApp(data_dir=str(tmp_path))
 
 
 class _FakeSocket:

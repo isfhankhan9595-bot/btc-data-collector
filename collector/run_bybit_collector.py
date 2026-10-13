@@ -111,6 +111,19 @@ def _topics() -> list[str]:
     ]
 
 
+#: P0-3 quality-event batching for the Bybit quality writer. These deliberately
+#: equal ``run_collector.QUALITY_SEGMENT_ROWS`` / ``QUALITY_SEGMENT_SECONDS`` (the
+#: Futures reference; a test pins the equality) but are defined here so this runner
+#: does not import the Futures runner. Was segment_rows=1 / segment_seconds=1 = one
+#: Parquet file per quality event.
+QUALITY_SEGMENT_ROWS = 500
+QUALITY_SEGMENT_SECONDS = 30.0
+#: How often the idle publisher looks for a due batch. ``segment_seconds`` is only
+#: evaluated inside ``ParquetWriter.write()``, so a quiet stream needs this tick.
+#: Worst-case publication delay of a buffered event = SECONDS + this tick.
+QUALITY_IDLE_TICK_SECONDS = 1.0
+
+
 class BybitCollectorApp:
     def __init__(self, data_dir: str = "data", url: str = BYBIT_PUBLIC_WS_URL,
                 enable_segment_dedup: bool = True) -> None:
@@ -120,14 +133,22 @@ class BybitCollectorApp:
         # checkpoint advances only from on_segment_durable, i.e. after the
         # segment holding the event is published (fsync + rename + directory
         # fsync). The state is set up BEFORE the writer exists because the
-        # writer's hook references it. Segmenting is deliberately UNCHANGED
-        # (segment_rows=1 / segment_seconds=1): P0-3 batching is not part of
-        # this change, so each write() still publishes its own segment.
+        # writer's hook references it.
+        #
+        # P0-3: batched (was segment_rows=1 / segment_seconds=1 = one Parquet
+        # file per event). Batching means write() no longer implies "durable",
+        # which is safe ONLY because every WAL-protected event is appended to the
+        # WAL before it is buffered and the checkpoint advances solely from
+        # on_segment_durable. ``age_from_first_row`` makes the time threshold run
+        # from the first buffered row, and ``_quality_idle_task`` (started in
+        # run()) publishes a quiet tail via ``publish_if_due()``.
         self._init_quality_durability_state()
+        self._quality_idle_task = None
         self.quality_writer = ParquetWriter(
             "bybit_quality_events", QUALITY_EVENTS_SCHEMA, base_dir=data_dir,
-            exchange="BYBIT", segment_rows=1, segment_seconds=1,
-            on_segment_durable=self._on_quality_segment_durable)
+            exchange="BYBIT", segment_rows=QUALITY_SEGMENT_ROWS,
+            segment_seconds=QUALITY_SEGMENT_SECONDS,
+            on_segment_durable=self._on_quality_segment_durable, age_from_first_row=True)
         # Replays anything a previous process left un-checkpointed. Needs only
         # quality_writer, which exists now. It must run before the other writers
         # are built: their constructors can report orphan recovery through
@@ -717,6 +738,103 @@ class BybitCollectorApp:
                                                      record_admitted=True)
                 raise
 
+    def _quality_publish_if_due(self) -> None:
+        """Idle tick (parity with run_collector.CollectorApp._quality_publish_if_due).
+
+        ``segment_seconds`` is only evaluated inside ``write()``, so a stream that goes
+        quiet would otherwise keep its tail in RAM. A publish failure is never turned
+        into success: the checkpoint is latched closed (the buffered events stay in the
+        WAL, uncheckpointed, for the next start to replay) and a typed fatal of this
+        runner's quality channel degrades it, exactly as a failing write() does.
+
+        Once the channel is latched degraded the writer is terminally FAILED
+        (``ParquetWriter._storage_failure`` is never cleared; only a restart resolves it) and
+        ``publish_if_due()`` can only raise again. Asking it every tick would re-run the failure
+        handling below once per second: ``_block_quality_checkpoint`` logs on every call (only its
+        operator alert is one-time). The failure has already been latched, reported and alerted by the
+        first tick, and the buffered events are in the WAL, so later ticks return here -- the same
+        condition ``_persist_quality_event`` uses to stop calling the failed writer. The guard is
+        keyed on ``quality_degraded`` (the writer's terminal failure) and NOT on a blocked checkpoint:
+        those are independent (see ``quality_channel_status``), and a healthy writer whose checkpoint
+        is blocked must keep publishing."""
+        policy = getattr(self, "failure_policy", None)
+        if policy is not None and policy.quality_degraded is not None:
+            return
+        try:
+            self.quality_writer.publish_if_due()
+        except Exception as exc:  # noqa: BLE001
+            self._block_quality_checkpoint(f"idle_publish_failed:{type(exc).__name__}")
+            self._note_quality_writer_failure(exc)
+
+    async def _quality_idle_publish_loop(self) -> None:
+        """Background tick: call ``_quality_publish_if_due`` every
+        ``QUALITY_IDLE_TICK_SECONDS`` while the app runs. Everything the tick does is
+        synchronous (no await between reading and publishing), so it cannot interleave
+        with ``_persist_quality_event``. A failure never ends the loop; cancellation does."""
+        while self.running:
+            await asyncio.sleep(QUALITY_IDLE_TICK_SECONDS)
+            try:
+                self._quality_publish_if_due()
+            except Exception as exc:  # noqa: BLE001 - the tick must outlive any single failure
+                logger.error("bybit_quality_idle_publish_tick_failed",
+                             error=f"{type(exc).__name__}: {exc}")
+
+    def _start_quality_idle_publisher(self) -> None:
+        task = getattr(self, "_quality_idle_task", None)
+        if task is None or task.done():
+            self._quality_idle_task = asyncio.create_task(self._quality_idle_publish_loop())
+
+    def _request_quality_idle_publisher_stop(self) -> None:
+        """Retire the idle publisher WITHOUT suspending: request its cancellation and return.
+
+        An earlier revision awaited the task's retirement. On the production path ``client.stop()`` is a
+        plain method, so that await was the only suspension point ``shutdown()`` gained, and a
+        ``CancelledError`` delivered there skipped every writer close. This request has no suspension point.
+
+        Not waiting for the task to finish is safe, and relies on two facts verified against this code:
+
+        * The idle task and ``shutdown()`` run on the SAME event loop. The task is created by
+          ``asyncio.create_task`` in ``run()``; ``shutdown()`` is awaited from the supervisor's main task on
+          that loop; and the only thread use in this package is the read-only disk-pressure poll
+          (``asyncio.to_thread``), which touches no writer or WAL. Nothing runs the tick body
+          concurrently with ``shutdown()``.
+        * The tick body (``_quality_publish_if_due``) is synchronous, so the idle task is only ever
+          suspended at its ``await asyncio.sleep(...)``, never inside a publication.
+
+        ``Task.cancel()`` therefore guarantees the tick body cannot run again: a task suspended in its
+        sleep has ``CancelledError`` thrown in, and a task whose wake-up is already queued has its
+        cancellation flagged, so asyncio throws ``CancelledError`` at that ``await`` instead of resuming
+        it. No statement after the sleep executes. Everything ``shutdown()`` does afterwards (the writer
+        closes and the WAL close) is synchronous, so the loop cannot run the idle task part-way through
+        it either. Hence no idle publication can happen after shutdown begins or after any writer closes,
+        and there is nothing to await.
+
+        Observability: the task's outcome is retrieved by ``_report_quality_idle_task_result`` -- now if
+        it has already finished, otherwise from a done-callback -- so a failure is logged and is never an
+        unobserved task exception. Cancellation is the expected outcome and is silent."""
+        task = getattr(self, "_quality_idle_task", None)
+        self._quality_idle_task = None
+        if task is None:
+            return
+        if task.done():
+            self._report_quality_idle_task_result(task)
+            return
+        task.cancel()
+        task.add_done_callback(self._report_quality_idle_task_result)
+
+    def _report_quality_idle_task_result(self, task) -> None:
+        """Retrieve the finished idle task's outcome (marking it observed) and log a failure. Never raises:
+        it runs inside ``shutdown()`` and as a loop callback."""
+        try:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error("bybit_quality_idle_publisher_failed",
+                             error=f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - observing the task must never raise into shutdown
+            pass
+
     def _note_quality_writer_failure(self, exc: BaseException) -> None:
         """Latch the quality channel degraded when ITS writer raised a typed fatal.
 
@@ -1066,11 +1184,18 @@ class BybitCollectorApp:
     async def run(self) -> None:
         self.running = True
         self._disk_task = asyncio.create_task(self._storage_pressure_loop())
+        self._start_quality_idle_publisher()
         await self.client.start()
 
     async def shutdown(self) -> None:
         self.running = False
-        # F5-QA-04: stop the (read-only) monitor first; it touches no writer or WAL.
+        # P0-3: request retirement of the quality idle publisher NOW, before this coroutine can suspend
+        # and before any writer is closed, so it can publish nothing once shutdown has begun. It is a
+        # plain cancellation request (no await): see ``_request_quality_idle_publisher_stop`` for why
+        # that is sufficient on this event loop. The final partial batch is published by the
+        # quality_writer close below.
+        self._request_quality_idle_publisher_stop()
+        # F5-QA-04: stop the (read-only) monitor next; it touches no writer or WAL.
         task = getattr(self, "_disk_task", None)
         if task is not None and not task.done():
             task.cancel()
@@ -1084,6 +1209,10 @@ class BybitCollectorApp:
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("bybit_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
+        # If shutdown() is cancelled while awaiting an asynchronous ``client.stop()``, the
+        # ``CancelledError`` (not an ``Exception``) skips the ``except`` above and propagates: the
+        # writers and the WAL stay open and the WAL remains the recovery source. The idle publisher's
+        # cancellation was already requested at the top, so it cannot publish after shutdown raised.
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")

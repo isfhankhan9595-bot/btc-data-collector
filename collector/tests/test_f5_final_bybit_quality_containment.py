@@ -47,6 +47,7 @@ from collector.collector.quality_events import BookQuality
 from collector.collector.standalone_failure_policy import EXIT_FATAL_STORAGE, supervise_standalone_runner
 from collector.collector.storage_errors import FatalStorageError
 from collector.run_bybit_collector import BybitCollectorApp
+from collector.tests._bybit_quality_fixtures import one_row_bybit_quality_segments
 from collector.tests.test_bybit_quality_wal import (
     _Unhandled, _crash, _disk_ckpt, _fail_wal_fsync, _pending, _rows, _wal_records)
 from collector.tests.test_f5_final_quality_writer_latch import (
@@ -68,7 +69,9 @@ def alerts():
 
 # --------------------------------------------------------------------------- helpers
 def _app(tmp_path) -> BybitCollectorApp:
-    return BybitCollectorApp(data_dir=str(tmp_path))
+    # P0-3: Bybit batches in production; one-row segments set BEFORE construction (see test_bybit_quality_batching.py)
+    with one_row_bybit_quality_segments():
+        return BybitCollectorApp(data_dir=str(tmp_path))
 
 
 def _ob_frame(typ: str, update_id: int, seq: int, *, bid: str = "1.0", ts: int | None = None) -> str:

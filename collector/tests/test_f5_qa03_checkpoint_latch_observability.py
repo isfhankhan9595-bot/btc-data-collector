@@ -45,6 +45,7 @@ from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.quality_wal import CHECKPOINT_FILENAME, QualityEventWAL
 from collector.run_bybit_collector import BybitCollectorApp
+from collector.tests._bybit_quality_fixtures import one_row_bybit_quality_segments
 from collector.tests.test_bybit_quality_wal import _crash as _bybit_crash
 from collector.tests.test_quality_wal_collector_integration import _minimal_app
 
@@ -85,7 +86,10 @@ class Rig:
     # -- construction / restart
     def _new_app(self):
         if self.kind == "bybit":
-            app = BybitCollectorApp(data_dir=str(self.root))      # real constructor + real recovery
+            # real constructor + real recovery; P0-3: one-row segments set BEFORE construction so they
+            # govern replay too (Bybit batches in production; see test_bybit_quality_batching.py)
+            with one_row_bybit_quality_segments():
+                app = BybitCollectorApp(data_dir=str(self.root))
         else:
             app = _minimal_app(self.root)
         self._apps.append(app)

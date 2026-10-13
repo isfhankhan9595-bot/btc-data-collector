@@ -39,6 +39,7 @@ from collector.collector.disk_pressure import (
 from collector.collector.failure_topology import EXIT_FATAL_STORAGE
 from collector.collector.quality_wal import QualityEventWAL
 from collector.tests.test_f5_qa03_checkpoint_latch_observability import Rig
+from collector.tests._bybit_quality_fixtures import one_row_bybit_quality_segments
 
 DEFAULT = DiskPressureConfig()
 
@@ -607,7 +608,8 @@ class _StubBybitClient:
 
 
 def _real_bybit(tmp_path):
-    app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
+    with one_row_bybit_quality_segments():      # P0-3: Bybit batches in production; one-row set BEFORE construction
+        app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
     app.client = _StubBybitClient()
     return app
 
@@ -754,7 +756,8 @@ class Harness:
             self.app = _real_futures(tmp_path, monkeypatch)
             _stub_futures_network(self.app, self.events)
         else:
-            self.app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
+            with one_row_bybit_quality_segments():      # P0-3: set BEFORE construction
+                self.app = rbc.BybitCollectorApp(data_dir=str(tmp_path))
             self.app.client = _StubBybitClient(self.events)
         self.app.storage_pressure._usage = self.disk
         self.app.storage_pressure._clock = self.clock
