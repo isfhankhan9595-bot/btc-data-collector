@@ -784,3 +784,242 @@ def test_mutation_M9_zero_maxsize_validation_is_load_bearing():
         "which exercises the actual runtime behavior, not just presence "
         "of a string in the source"
     )
+
+
+# ---------------------------------------------------------------------------
+# Shutdown ordering: the runner closes storage while the ingest worker is alive.
+#
+# The runner owns the start() task. Its real shutdown (CollectorApp.
+# _async_shutdown -> shutdown()) calls client.stop(), cancels that task and
+# closes every writer synchronously. start()'s normal tail,
+# _drain_and_stop_worker(), only runs when the receive loop ends on its own, so
+# a cancelled start() skips it -- and the worker is a separate task that is not
+# in the runner's task list, so nothing cancels or awaits it either.
+#
+# These tests drive the REAL CollectorApp, the REAL WebSocketClient.start() task
+# and the REAL _async_shutdown. The only injected seam is a gate around
+# on_message that delegates to the real handler, to hold one frame in flight
+# (the Binance handler's own suspension point is the book-snapshot lock).
+# ---------------------------------------------------------------------------
+
+
+class _HeldOpenConnection:
+    """Stands in for websockets.connect(url): yields its frames, then stays open
+    and quiet until `hold` is set (a quiet socket never ends the receive loop)."""
+
+    def __init__(self, frames, hold):
+        self._frames, self._hold = frames, hold
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send(self, _):
+        return None
+
+    def __aiter__(self):
+        frames, hold = self._frames, self._hold
+
+        async def gen():
+            for frame in frames:
+                yield frame
+            await hold.wait()
+        return gen()
+
+
+async def _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypatch, *, callback_wedged=False):
+    """Four frames reach the real receive loop; the worker dequeues the first and
+    is held inside on_message (in flight) while three more sit in the queue. The
+    runner's real signal-path shutdown then runs.
+
+    Default: the in-flight callback becomes runnable on the next loop turn after
+    client.stop() is called (as it would be once a cancelled recovery releases the
+    snapshot lock), so a correct shutdown can let it finish and a defective one
+    cannot. ``callback_wedged=True``: it never becomes runnable (a stuck
+    downstream write); the drain timeout is shortened so a correct shutdown that
+    waits for the drain still finishes promptly.
+
+    Returns what actually happened, measured with the production counters."""
+    import json
+    import signal
+    from types import SimpleNamespace
+
+    import pyarrow.parquet as pq
+    from collector import run_collector as rc
+
+    (tmp_path / "data").mkdir()
+    monkeypatch.chdir(tmp_path)
+    app = rc.CollectorApp()
+    client = app.ws_clients[0]
+    real_handler = app.handle_message
+    in_flight, resume = asyncio.Event(), asyncio.Event()
+    calls, handler_errors, closed_when_resumed = [], [], []
+
+    async def gated_on_message(msg, local_receive_ts, connection_id=None):
+        frame_id = msg["data"]["a"]
+        calls.append(frame_id)
+        if len(calls) == 1:
+            in_flight.set()
+            await resume.wait()
+            closed_when_resumed.append(app.raw_trades_writer._closed)
+        try:
+            await real_handler(msg, local_receive_ts, connection_id=connection_id)
+        except Exception as exc:  # noqa: BLE001 - record, then let the worker handle it unchanged
+            handler_errors.append((frame_id, type(exc).__name__, str(exc)))
+            raise
+
+    client.on_message = gated_on_message
+    client._on_message_takes_connection = True
+
+    real_stop = client.stop
+
+    def stop_then_unblock_next_turn():
+        real_stop()
+        if not callback_wedged:
+            asyncio.get_running_loop().call_soon(resume.set)
+    client.stop = stop_then_unblock_next_turn
+    if callback_wedged:
+        client.shutdown_drain_timeout_s = 0.05
+
+    drain_calls = []
+    real_drain = client._drain_and_stop_worker
+
+    async def counting_drain():
+        drain_calls.append(1)
+        await real_drain()
+    client._drain_and_stop_worker = counting_drain
+
+    frames = [json.dumps({"stream": "btcusdt@aggTrade",
+                          "data": {"E": 1_780_000_000_000, "a": n, "p": "100", "q": "1", "m": False}})
+              for n in range(1, 5)]
+    hold = asyncio.Event()
+    start_task = None
+    worker = None
+    try:
+        with patch("collector.collector.websocket_client.websockets.connect",
+                   new=lambda url, **k: _HeldOpenConnection(frames, hold)):
+            start_task = asyncio.create_task(client.start())
+            app.tasks.append(start_task)           # exactly what CollectorApp.start() does
+            await asyncio.wait_for(in_flight.wait(), timeout=5)
+
+            async def all_enqueued():
+                while client.frames_enqueued < len(frames):
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(all_enqueued(), timeout=5)
+            assert client._ingest_queue.qsize() == len(frames) - 1   # one in flight, rest queued
+
+            await asyncio.wait_for(app._async_shutdown(signal.SIGTERM), timeout=10)
+            await asyncio.wait_for(asyncio.gather(start_task, return_exceptions=True), timeout=10)
+            worker = client._worker_task
+            worker_alive_after_start_exit = worker is not None and not worker.done()
+
+            if not callback_wedged:
+                # Let whatever work is still pending finish, so the counters are final.
+                resume.set()
+                await asyncio.wait_for(client._ingest_queue.join(), timeout=10)
+
+        raw_wire_rows = sum(pq.read_table(path).num_rows
+                            for path in sorted(app.raw_wire_writer.stream_dir.glob("*.seg")))
+        return SimpleNamespace(
+            drain_calls=len(drain_calls),
+            worker_alive_after_start_exit=worker_alive_after_start_exit,
+            writer_closed_when_inflight_frame_resumed=closed_when_resumed[0] if closed_when_resumed else None,
+            handler_errors=handler_errors,
+            frames_received=client.frames_received,
+            frames_enqueued=client.frames_enqueued,
+            frames_processed=client.frames_processed,
+            processing_errors=client.processing_errors,
+            frames_abandoned_at_shutdown=client.frames_abandoned_at_shutdown,
+            raw_wire_rows=raw_wire_rows,
+        )
+    finally:
+        for task in (worker, client._worker_task, start_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        hold.set()
+        resume.set()
+        if getattr(app, "segment_dedup", None) is not None:
+            app.segment_dedup.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_never_lets_the_ingest_worker_use_a_writer_after_it_was_closed(tmp_path, monkeypatch):
+    obs = await _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypatch)
+    assert obs.handler_errors == [], (
+        "frames were processed against writers the runner's shutdown had already closed "
+        f"(writer closed when the in-flight frame resumed: {obs.writer_closed_when_inflight_frame_resumed}): "
+        f"{obs.handler_errors}")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_does_not_leave_the_ingest_worker_running_behind_a_wedged_callback(tmp_path, monkeypatch):
+    obs = await _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypatch, callback_wedged=True)
+    assert not obs.worker_alive_after_start_exit, (
+        "start() was cancelled by the runner's shutdown but the ingest worker task is still running "
+        f"(_drain_and_stop_worker calls: {obs.drain_calls})")
+
+
+@pytest.mark.asyncio
+async def test_every_enqueued_frame_is_processed_or_counted_abandoned_at_shutdown(tmp_path, monkeypatch):
+    obs = await _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypatch)
+    assert obs.processing_errors == 0, (
+        f"{obs.processing_errors} frame(s) failed in processing during shutdown: {obs.handler_errors}")
+    assert obs.frames_processed + obs.frames_abandoned_at_shutdown == obs.frames_enqueued, (
+        f"enqueued={obs.frames_enqueued} processed={obs.frames_processed} "
+        f"abandoned_at_shutdown={obs.frames_abandoned_at_shutdown} processing_errors={obs.processing_errors}")
+
+
+@pytest.mark.asyncio
+async def test_raw_evidence_for_every_received_frame_is_durable_after_shutdown(tmp_path, monkeypatch):
+    """Control, not a defect assertion: raw capture precedes the enqueue, so the
+    shutdown ordering problem concerns normalized processing, never raw evidence."""
+    obs = await _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypatch)
+    assert obs.frames_received == 4
+    assert obs.raw_wire_rows == obs.frames_received
+
+
+@pytest.mark.asyncio
+async def test_cancelling_start_during_the_shutdown_drain_does_not_orphan_the_worker():
+    """The runner cancels start() tasks. A cancellation that lands while start() is
+    inside _drain_and_stop_worker() (waiting on a wedged callback) must not leave
+    the worker task running behind it."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    draining = asyncio.Event()
+
+    async def wedged_on_message(data, local_receive_ts, connection_id=None):
+        entered.set()
+        await release.wait()
+
+    client = WebSocketClient("ws://localhost:9999", wedged_on_message, ingest_queue_maxsize=10)
+    real_drain = client._drain_and_stop_worker
+
+    async def announcing_drain():
+        draining.set()
+        await real_drain()
+    client._drain_and_stop_worker = announcing_drain
+
+    connection = _FakeConnection(['{"n":1}', '{"n":2}', '{"n":3}'],
+                                 on_exhausted=lambda: setattr(client, "running", False))
+    start_task = None
+    worker = None
+    try:
+        with patch("collector.collector.websocket_client.websockets.connect", new=lambda url, **k: connection):
+            start_task = asyncio.create_task(client.start())
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await asyncio.wait_for(draining.wait(), timeout=5)   # start() is now parked in the drain
+            start_task.cancel()                                  # what the runner's shutdown does
+            await asyncio.wait_for(asyncio.gather(start_task, return_exceptions=True), timeout=5)
+            worker = client._worker_task
+            assert worker is None or worker.done(), (
+                "start() was cancelled inside the drain but the ingest worker task is still running "
+                f"with {client._ingest_queue.qsize()} queued frame(s) and "
+                f"frames_abandoned_at_shutdown={client.frames_abandoned_at_shutdown}")
+    finally:
+        release.set()
+        for task in (worker, start_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
