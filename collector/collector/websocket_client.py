@@ -68,6 +68,60 @@ CONNECTION_PHASE_SLACK_S = 2.0
 FINALIZATION_RESERVE_S = 7.0
 
 
+class _ResumedAwaitable:
+    """Continue a coroutine that was already stepped once by hand (``yield from`` delegation).
+
+    Re-yields what the coroutine yielded (the future the event loop must wait on), then feeds
+    its result -- or exception, cancellation included -- back in until it returns."""
+
+    def __init__(self, coro, yielded):
+        self._coro, self._yielded = coro, yielded
+
+    def __await__(self):
+        coro, to_yield = self._coro, self._yielded
+        while True:
+            try:
+                sent = yield to_yield
+            except GeneratorExit:
+                coro.close()
+                raise
+            except BaseException as exc:  # noqa: BLE001 - forwarded into the coroutine verbatim
+                try:
+                    to_yield = coro.throw(exc)
+                except StopIteration as stop:
+                    return stop.value
+            else:
+                try:
+                    to_yield = coro.send(sent)
+                except StopIteration as stop:
+                    return stop.value
+
+
+def _start_receive_without_eager_tasks(coro, loop):
+    """Python < 3.12 equivalent of ``Task(coro, eager_start=True)``.
+
+    Steps ``coro`` once by hand: if it finishes without ever suspending (a frame is already
+    available) the returned future is already done, so the receive loop does not yield to the
+    event loop between buffered frames -- exactly what the plain ``async for`` it replaced did,
+    and what lets a burst fill the bounded queue and register backpressure. If it suspends, the
+    rest runs in an ordinary task. (``ensure_future`` instead costs one loop turn per frame,
+    which changes that scheduling: the burst/backpressure tests fail on 3.11 with it.)"""
+    try:
+        yielded = coro.send(None)
+    except StopIteration as done:
+        future = loop.create_future()
+        future.set_result(done.value)
+        return future
+    except Exception as exc:  # noqa: BLE001 - surfaced through the future, as a Task would
+        future = loop.create_future()
+        future.set_exception(exc)
+        return future
+
+    async def _rest():
+        return await _ResumedAwaitable(coro, yielded)
+    return loop.create_task(_rest())
+
+
 async def _anext_or_end(iterator):
     """One ``__anext__`` of ``iterator``; ``_STREAM_END`` instead of raising
     ``StopAsyncIteration`` (which must not travel through a Task)."""
@@ -641,16 +695,17 @@ class WebSocketClient:
         completes without suspending and the loop does not yield to the event
         loop between buffered frames -- the same behaviour as the plain
         ``async for`` this replaced, which is what lets a burst fill the bounded
-        queue and register backpressure. On older interpreters the receive is an
-        ordinary task and costs one loop turn per frame.
+        queue and register backpressure. On older interpreters (3.11) the same is achieved by
+        stepping the receive once by hand (``_start_receive_without_eager_tasks``).
         """
         if self._stop_requested:
             return _STREAM_END
         coro = _anext_or_end(iterator)
+        loop = asyncio.get_running_loop()
         try:
-            receive = asyncio.Task(coro, loop=asyncio.get_running_loop(), eager_start=True)
+            receive = asyncio.Task(coro, loop=loop, eager_start=True)
         except TypeError:                      # Python < 3.12: no eager tasks
-            receive = asyncio.ensure_future(coro)
+            receive = _start_receive_without_eager_tasks(coro, loop)
         if not receive.done():
             stop = self._stop_signal()
             try:

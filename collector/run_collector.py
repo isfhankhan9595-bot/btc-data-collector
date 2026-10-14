@@ -115,6 +115,8 @@ class CollectorApp:
         self.binance_book = LocalBook("BINANCE")
         self._book_snapshot_lock = asyncio.Lock()
         self._recovery_task = None
+        self._startup_recovery_task = None   # the inline start() recovery, tracked as a REST producer
+        self._oi_task = None
         # One gap must not become hundreds of REST snapshot requests.
         self.recovery_controller = RecoveryController(
             name="binance_orderbook", min_interval_s=1.0, max_per_window=5,
@@ -1710,11 +1712,15 @@ class CollectorApp:
             connected = await ws_client.wait_connected(timeout_seconds=30.0)
             if not connected:
                 logger.warning("ws_client_pre_connect_timeout", url=ws_client.url)
-        await self._recover_binance_book("startup")
-        self.tasks.append(asyncio.create_task(self.health_monitor.start()))
-        self._oi_task = asyncio.create_task(self._poll_openinterest())
-        self.tasks.append(self._oi_task)
-        self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
+        await self._run_startup_recovery()
+        if not getattr(self, "_recovery_closed", False):
+            self.tasks.append(asyncio.create_task(self.health_monitor.start()))
+            self._oi_task = asyncio.create_task(self._poll_openinterest())
+            self.tasks.append(self._oi_task)
+            self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
+        # else: shutdown began while start() was still starting up. Every REST producer has been (or
+        # is being) cancelled and writers are being closed, so nothing new may be started; the
+        # gather below returns at once on the cancelled tasks and the finally block finishes.
         try:
             await asyncio.gather(*self.tasks)
         except asyncio.CancelledError:
@@ -1752,11 +1758,56 @@ class CollectorApp:
             finally:
                 try:
                     # Same ordering as _async_shutdown: clients retire first.
+                    await self._stop_rest_producers(WS_FALLBACK_SLACK_S)
                     await self._stop_ws_clients()
                 except Exception as exc:  # noqa: BLE001
                     logger.error("shutdown_ws_clients_stop_failed", error=f"{type(exc).__name__}: {exc}")
                 finally:
                     self.shutdown()
+
+    async def _run_startup_recovery(self) -> None:
+        """Run the startup book recovery as a TRACKED task, so shutdown can cancel it and prove it ended.
+
+        It used to be awaited inline in start()'s own task: a REST producer (HTTP snapshot, then
+        ``_capture_rest`` -> ``raw_rest_writer``) that was neither ``_recovery_task`` (set only by
+        ``_schedule_recovery``) nor in ``self.tasks``, and that ``_async_shutdown`` (a different
+        task) could not cancel -- so ``raw_rest_writer`` was closed while its request was in
+        flight and the late response was captured into a closed writer. The producer's whole
+        lifetime is the task's lifetime, so ``_rest_producers_stopped()`` can now prove it.
+
+        Behaviour outside shutdown is unchanged: start() still waits for the recovery to finish and
+        an exception from it still propagates out of start().
+        """
+        task = asyncio.create_task(self._recover_binance_book("startup"))
+        self._startup_recovery_task = task
+        try:
+            await asyncio.wait({task})
+        except BaseException:               # start() itself was cancelled: do not leave the producer behind
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if not task.cancelled():
+            task.result()                   # re-raise exactly what the inline await raised
+
+    def _rest_producer_tasks(self):
+        """Every task that can reach ``raw_rest_writer`` / ``oi_writer`` (REST capture)."""
+        return [t for t in (getattr(self, "_recovery_task", None),
+                            getattr(self, "_startup_recovery_task", None),
+                            getattr(self, "_oi_task", None)) if t is not None]
+
+    def _cancel_rest_producers(self) -> None:
+        for task in self._rest_producer_tasks():
+            if not task.done():
+                task.cancel()
+
+    async def _stop_rest_producers(self, bound_s: float) -> bool:
+        """Cancel every REST producer and wait (at most ``bound_s``) until each has ended."""
+        live = [t for t in self._rest_producer_tasks() if not t.done()]
+        for task in live:
+            task.cancel()
+        if live:
+            await asyncio.wait(live, timeout=bound_s)
+        return self._rest_producers_stopped()
 
     async def _poll_openinterest(self):
         import aiohttp
@@ -1900,8 +1951,7 @@ class CollectorApp:
         for task in self.tasks:          # bounded fallback: start()'s finally retires the worker
             task.cancel()
         bound = max([getattr(c, "worker_retire_timeout_s", 5.0) for c in clients] or [5.0]) + WS_FALLBACK_SLACK_S
-        rest = [t for t in (self._recovery_task, getattr(self, "_oi_task", None))
-                if t is not None and not t.done()]
+        rest = [t for t in self._rest_producer_tasks() if not t.done()]
         for task in rest:
             task.cancel()
 
@@ -1925,6 +1975,10 @@ class CollectorApp:
             logger.info("Received signal, initiating async shutdown", signum=signum)
         self.running = False
         self._recovery_closed = True       # no new REST producer from here on (see _schedule_recovery)
+        # Cancel every existing REST producer now (synchronously). The clients' graceful stop that
+        # follows takes many loop turns, so a well-behaved producer has ended long before
+        # shutdown() asks _rest_producers_stopped(); one that ignores the cancel is then reported.
+        self._cancel_rest_producers()
         # F5: exception-safe. Quality reporting is telemetry and must never be a
         # precondition of the terminal path: when the quality writer is the thing
         # that failed, its first persist raises, and this method used to abort
@@ -2121,8 +2175,18 @@ class CollectorApp:
         # which PUBLISHES the final partial segment and thereby checkpoints
         # its WAL seqs -> only then close the WAL (the publish hook needs it).
         self._shutdown_step("quality_queue_drain", self._drain_quality_queue_sync)
+        # raw_rest_writer / oi_writer are closed only once every REST producer is PROVEN ended
+        # (the async callers cancel them and let them run to completion before this point). A
+        # producer that ignored its cancel keeps these two open: closing beneath it would lose its
+        # in-flight response's evidence, so fail explicitly instead.
+        rest_unproven = not self._rest_producers_stopped()
+        if rest_unproven:
+            self._record_shutdown_failure("rest_producer_not_stopped")
+            logger.error("shutdown_raw_rest_and_oi_writers_left_open_rest_producer_alive")
         for writer_name in ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
                             "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer", "raw_rest_writer"):
+            if rest_unproven and writer_name in ("oi_writer", "raw_rest_writer"):
+                continue
             self._close_writer_once(writer_name)
         if not self._close_writer_once("quality_writer"):
             # Final segment not published: its events stay in the WAL,
@@ -2135,6 +2199,8 @@ class CollectorApp:
                 wal.close()
             except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
                 logger.error("quality_wal_close_failed", error=str(exc))
+        if rest_unproven:
+            return              # not "done": a later call (once the producer ends) closes the two writers
         self._shutdown_done = True
 
     def _ws_clients_idle(self) -> bool:
@@ -2149,9 +2215,8 @@ class CollectorApp:
         return all(getattr(client, "ingress_stopped", True) for client in getattr(self, "ws_clients", ()))
 
     def _rest_producers_stopped(self) -> bool:
-        """True when neither the recovery task nor the OI poller is still running."""
-        return all(task is None or task.done()
-                   for task in (getattr(self, "_recovery_task", None), getattr(self, "_oi_task", None)))
+        """True when no REST producer (recovery, startup recovery, OI poller) is still running."""
+        return all(task.done() for task in self._rest_producer_tasks())
 
     def _record_shutdown_failure(self, reason: str) -> None:
         """Latch an explicit terminal shutdown failure (first reason wins). It is
