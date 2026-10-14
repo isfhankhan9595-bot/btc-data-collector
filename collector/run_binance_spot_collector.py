@@ -575,6 +575,11 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
     # -- recovery -------------------------------------------------------------
 
     def _schedule_recovery(self, reason: str) -> bool:
+        if getattr(self, "_recovery_closed", False):
+            # Shutdown has begun. The ingest worker stays alive while it drains and this is on
+            # its on_message path: a recovery started now would be a REST producer that
+            # nothing cancels and that reaches raw_rest_writer.
+            return False
         if self.failure_policy.terminal_failure is not None or \
                 self.failure_policy.route_is_isolated("orderbook"):
             # F5: a recovery only feeds the order-book route. With that route cut
@@ -708,6 +713,7 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         await self.client.start()
 
     async def shutdown(self) -> None:
+        self._recovery_closed = True       # before anything awaits: no new REST producer
         # Every step is guarded: none may stop the writer closes below, which
         # are what make buffered rows durable. ``WebSocketClient.stop()`` is a
         # plain method returning ``None``; awaiting it unconditionally raised
@@ -727,10 +733,19 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         # coroutine returns -- so the clients must be waited for here, before any
         # writer their worker can reach is closed.
         client_idle = await await_client_idle(self.client, self.failure_policy)
-        # The raw-evidence writers' users are the receive loop and REST capture, not on_message,
-        # so they are closed either way.
-        self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
-        self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
+        # Each raw writer is closed when ITS producers are stopped -- independent of the worker:
+        #   raw_wire_writer: the receive loop only -> ingress stopped.
+        #   raw_rest_writer: the recovery task only. ``_recovery_closed`` (set above) means none
+        #       can start any more, and the one cancelled above is awaited, so it is stopped
+        #       unless that task is somehow still running.
+        if getattr(self.client, "ingress_stopped", True):
+            self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
+        else:
+            logger.error("spot_raw_wire_writer_left_open_ingress_not_stopped")
+        if self._recovery_task is None or self._recovery_task.done():
+            self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
+        else:
+            logger.error("spot_raw_rest_writer_left_open_recovery_alive")
         if not client_idle:
             # A worker is still alive: the market-data and quality writers stay open; the failure
             # is latched and the exit status is non-zero.
