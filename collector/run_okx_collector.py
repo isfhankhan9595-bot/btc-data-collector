@@ -498,8 +498,9 @@ class OKXCollectorApp(DegradedQualityLossReporting):
         # cancelled until this coroutine returns). Wait for it before closing any
         # writer the worker can reach.
         client_idle = await await_client_idle(self.client, self.failure_policy)
-        # The raw wire writer's only user is the receive loop, so it is closed either way.
-        self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "OKX")
+        # The raw wire writer's only user is the receive loop: closed whenever ingress is stopped,
+        # whatever the worker's state (OKX has no REST producer and no raw_rest writer).
+        self._close_raw_wire_writer_if_ingress_stopped()
         if not client_idle:
             # A worker is still alive: everything the worker can reach stays open.
             return
@@ -513,6 +514,12 @@ class OKXCollectorApp(DegradedQualityLossReporting):
         self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "OKX")
         # Last, so the counts include anything the closes above reported. Cannot raise.
         self._report_quality_channel_final()
+
+    def _close_raw_wire_writer_if_ingress_stopped(self) -> None:
+        if getattr(self.client, "ingress_stopped", True):
+            self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "OKX")
+        else:
+            logger.error("okx_raw_wire_writer_left_open_ingress_not_stopped")
 
     def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> None:
         """Close one writer; on failure, report it and still return.
