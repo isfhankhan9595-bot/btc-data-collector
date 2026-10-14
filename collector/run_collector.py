@@ -60,6 +60,10 @@ from collector.collector.websocket_client import WebSocketClient
 from collector.collector.standalone_failure_policy import EXIT_RUN_TASK_CRASHED
 
 STREAM_INACTIVE_STARTUP_SECONDS = 60
+#: Extra wait, after the hard-cancel fallback, for a client's tail to retire its worker
+#: (``worker_retire_timeout_s`` + this). Part of the shutdown budget (see
+#: websocket_client.FINALIZATION_RESERVE_S).
+WS_FALLBACK_SLACK_S = 1.0
 RAW_LOG_LIMIT = 20
 OI_POLL_INTERVAL_S = 3.0
 OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
@@ -1234,6 +1238,11 @@ class CollectorApp:
         Suppressed requests are counted by the controller and surfaced as
         transition events, not one event per suppressed gap.
         """
+        if getattr(self, "_recovery_closed", False):
+            # Shutdown has begun. The ingest worker stays alive while it drains, and this
+            # is on its on_message path: a recovery started now would be a REST producer
+            # that nobody cancels and that reaches raw_rest_writer.
+            return False
         controller = getattr(self, "recovery_controller", None)
         if controller is None:
             if self._recovery_task is None or self._recovery_task.done():
@@ -1258,6 +1267,8 @@ class CollectorApp:
         return True
 
     async def _recover_binance_book(self, reason: str):
+        if getattr(self, "_recovery_closed", False):
+            return False        # shutdown began before this recovery did anything
         async with self._book_snapshot_lock:
             self.binance_book.state.resync()
             self._record_book_quality(QualityEventType.RESYNC, reason)
@@ -1701,7 +1712,8 @@ class CollectorApp:
                 logger.warning("ws_client_pre_connect_timeout", url=ws_client.url)
         await self._recover_binance_book("startup")
         self.tasks.append(asyncio.create_task(self.health_monitor.start()))
-        self.tasks.append(asyncio.create_task(self._poll_openinterest()))
+        self._oi_task = asyncio.create_task(self._poll_openinterest())
+        self.tasks.append(self._oi_task)
         self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
         try:
             await asyncio.gather(*self.tasks)
@@ -1712,6 +1724,7 @@ class CollectorApp:
             # path. Quality reporting is telemetry: a failing quality writer here
             # used to raise out of this block, skip ``shutdown()`` (all writers
             # left unclosed) and turn the intended exit 70 into a traceback.
+            self._recovery_closed = True
             try:
                 try:
                     if self._recovery_task is not None and not self._recovery_task.done():
@@ -1721,7 +1734,13 @@ class CollectorApp:
                     logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
                 self._drain_integrity_quality_events_safely()
                 try:
-                    await self._quality_queue.join()
+                    # join() only returns once a CONSUMER has marked every item done. After a
+                    # controlled shutdown the persistence loop has already exited, and when
+                    # shutdown() took its fail-closed branch it did not drain the queue
+                    # either, so with no live consumer this wait could never end and the
+                    # process would sit until systemd's SIGKILL instead of exiting non-zero.
+                    if self._quality_task is not None and not self._quality_task.done():
+                        await self._quality_queue.join()
                 except Exception as exc:  # noqa: BLE001
                     logger.error("shutdown_quality_queue_join_failed", error=f"{type(exc).__name__}: {exc}")
                 self.running = False
@@ -1880,9 +1899,20 @@ class CollectorApp:
                      results=[repr(r) for r in results])
         for task in self.tasks:          # bounded fallback: start()'s finally retires the worker
             task.cancel()
+        bound = max([getattr(c, "worker_retire_timeout_s", 5.0) for c in clients] or [5.0]) + WS_FALLBACK_SLACK_S
+        rest = [t for t in (self._recovery_task, getattr(self, "_oi_task", None))
+                if t is not None and not t.done()]
+        for task in rest:
+            task.cancel()
+
+        async def _rest_done() -> bool:
+            # Concurrent with the client waits, so it adds nothing to the budget.
+            if rest:
+                await asyncio.wait(rest, timeout=bound)
+            return True
         results = await asyncio.gather(
-            *(_wait(c, getattr(c, "worker_retire_timeout_s", 5.0) + 1.0) for c in clients),
-            return_exceptions=True)
+            *(_wait(c, getattr(c, "worker_retire_timeout_s", 5.0) + WS_FALLBACK_SLACK_S) for c in clients),
+            _rest_done(), return_exceptions=True)
         return all(result is True for result in results)
 
     async def _async_shutdown(self, signum: int, terminal: bool = False, reason: Optional[str] = None):
@@ -1894,6 +1924,7 @@ class CollectorApp:
         else:
             logger.info("Received signal, initiating async shutdown", signum=signum)
         self.running = False
+        self._recovery_closed = True       # no new REST producer from here on (see _schedule_recovery)
         # F5: exception-safe. Quality reporting is telemetry and must never be a
         # precondition of the terminal path: when the quality writer is the thing
         # that failed, its first persist raises, and this method used to abort
@@ -2035,6 +2066,7 @@ class CollectorApp:
         if getattr(self, "_shutdown_done", False):
             return
         self._closed = True
+        self._recovery_closed = True
         if not hasattr(self, "_writer_close_results"):
             self._writer_close_results = {}
         logger.info("Shutting down Collector Application...", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
@@ -2060,8 +2092,19 @@ class CollectorApp:
             # start replays it. ``_shutdown_done`` is deliberately NOT set, so a
             # later call (once the worker has ended) finishes the remaining closes.
             self._record_shutdown_failure("ws_client_worker_not_retired")
-            for writer_name in ("raw_wire_writer", "raw_rest_writer"):
-                self._close_writer_once(writer_name)
+            # Each raw writer is closed only when ITS producers are proven stopped, which is
+            # not implied by the worker being alive (or dead):
+            #   raw_wire_writer: only the receive loop -> ingress stopped for every client.
+            #   raw_rest_writer: recovery task and OI poller (a live worker can start a
+            #       recovery; that is latched off above, so only the existing tasks count).
+            if self._ws_clients_ingress_stopped():
+                self._close_writer_once("raw_wire_writer")
+            else:
+                logger.error("shutdown_raw_wire_writer_left_open_ingress_not_stopped")
+            if self._rest_producers_stopped():
+                self._close_writer_once("raw_rest_writer")
+            else:
+                logger.error("shutdown_raw_rest_writer_left_open_rest_producer_alive")
             return
         # Hostile-audit finding (this session): none of these close() calls
         # were guarded. _close_segment's flush/pyarrow-close/fsync/rename have
@@ -2099,6 +2142,16 @@ class CollectorApp:
         worker, no start() mid-tail). A client without the attribute (a test
         double) counts as idle."""
         return all(getattr(client, "lifecycle_idle", True) for client in getattr(self, "ws_clients", ()))
+
+    def _ws_clients_ingress_stopped(self) -> bool:
+        """True when no websocket receive loop can still capture a raw frame. A client
+        without the attribute (a test double) counts as stopped."""
+        return all(getattr(client, "ingress_stopped", True) for client in getattr(self, "ws_clients", ()))
+
+    def _rest_producers_stopped(self) -> bool:
+        """True when neither the recovery task nor the OI poller is still running."""
+        return all(task is None or task.done()
+                   for task in (getattr(self, "_recovery_task", None), getattr(self, "_oi_task", None)))
 
     def _record_shutdown_failure(self, reason: str) -> None:
         """Latch an explicit terminal shutdown failure (first reason wins). It is
