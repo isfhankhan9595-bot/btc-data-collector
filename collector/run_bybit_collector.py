@@ -1220,8 +1220,9 @@ class BybitCollectorApp:
         # which the supervisor does not cancel until this coroutine returns. Wait for it here, before
         # closing any writer the worker can reach. The same CancelledError rule applies to this wait.
         client_idle = await await_client_idle(self.client, self.failure_policy)
-        # The raw wire writer's only user is the receive loop, so it is closed either way.
-        self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
+        # The raw wire writer's only user is the receive loop: closed whenever ingress is stopped,
+        # whatever the worker's state (Bybit has no REST producer and no raw_rest writer).
+        self._close_raw_wire_writer_if_ingress_stopped()
         if not client_idle:
             # A worker is still alive: market-data and quality writers stay open and the WAL
             # remains the recovery source; the failure is latched and the exit status non-zero.
@@ -1245,6 +1246,12 @@ class BybitCollectorApp:
                 wal.close()
             except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
                 logger.error("bybit_quality_wal_close_failed", error=str(exc))
+
+    def _close_raw_wire_writer_if_ingress_stopped(self) -> None:
+        if getattr(self.client, "ingress_stopped", True):
+            self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
+        else:
+            logger.error("bybit_raw_wire_writer_left_open_ingress_not_stopped")
 
     def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> bool:
         """Close one writer; on failure, report it and still return.
