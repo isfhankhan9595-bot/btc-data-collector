@@ -73,25 +73,48 @@ All of them now exit `70` on a terminal (raw-evidence) storage failure and `1` i
 task crashed of an ordinary exception, so any supervisor that restarts on non-zero will treat both
 as failures; see `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
-## Shutdown contract (offline analysis only -- NOT VERIFIED LIVE)
-
-Traced from source, not assumed:
+## Shutdown contract (traced from source and exercised with fake sockets -- NOT VERIFIED LIVE)
 
 ```
 SIGTERM -> CollectorApp._async_shutdown()
-  -> self.running = False
+  -> running = False; recovery latch set (no new REST producer can start)
   -> cancel + await the recovery task
   -> drain integrity quality events, await the quality-queue task
-  -> self.shutdown(): ws_client.stop() for each client, then cancel every task in self.tasks
+  -> _stop_ws_clients(): client.stop() for each client, then wait (NOT cancel) for each
+       client's start() tail: receive loop ended -> ingest queue drained -> worker retired
+  -> shutdown(): every writer closed, quality writer last, then the WAL
 ```
 
-`self.tasks` includes each `WebSocketClient.start()` coroutine -- the one that contains
-P0-1's own graceful drain (`await asyncio.wait_for(self._ingest_queue.join(), timeout=30.0)`).
-`shutdown()` cancels that task immediately after calling `ws_client.stop()`, so static
-reading does not show the 30s drain being awaited to completion in this path before
-cancellation reaches it. `TimeoutStopSec=60` is kept as generous margin, not as a
-proven wait for that drain -- whether it completes in practice depends on asyncio task
-scheduling this analysis cannot settle without running it. **NOT VERIFIED LIVE.**
+If a client is not idle after its own bound, the runner hard-cancels the tasks, waits once
+more, and then **fails closed**: the exit status is non-zero, the market-data writers, the
+quality writer, the quality queue and the WAL are left untouched (the WAL is the recovery
+source), and each raw writer is closed only when its own producers are stopped:
+`raw_wire_writer` <- receive loop only (ingress stopped); `raw_rest_writer` <- recovery task
+and OI poller (stopped, and none can start once shutdown began).
+
+### Stop budget vs `TimeoutStopSec=60`
+
+| Step | Bound | Source |
+|---|---|---|
+| opening handshake in progress when stop lands | 0 (cancelled by `stop()`) | `_connect_or_stop` |
+| close handshake + subscribe/quality-event slack | 10 + 2 s | websockets `close_timeout` default (pinned by a test), `CONNECTION_PHASE_SLACK_S` |
+| ingest-queue drain | 30 s | `shutdown_drain_timeout_s` |
+| worker retirement | 5 s | `worker_retire_timeout_s` |
+| **client graceful bound** (`shutdown_deadline_s`) | **47 s** | sum of the above |
+| hard-cancel fallback, only if the graceful bound was exceeded | +6 s | `worker_retire_timeout_s + WS_FALLBACK_SLACK_S` |
+| **bounded websocket part, worst case** | **53 s** | |
+| left for everything else | **7 s** (`FINALIZATION_RESERVE_S`) | |
+
+The "everything else" is NOT bounded by code and has not been measured: the quality-queue
+drain, finalization (flush, fsync, rename, directory fsync) of about ten Parquet writers, the
+WAL close and interpreter teardown. 7 s is the arithmetic remainder, not a demonstrated
+sufficient margin. A test fails if any client timeout is raised without raising
+`TimeoutStopSec`. Measure writer finalization on the real host before relying on it; if it
+can exceed ~7 s, lower `shutdown_drain_timeout_s` (30 s -> 20 s buys 10 s) rather than
+raising `TimeoutStopSec`.
+
+The standalone runners (Spot, Bybit, OKX) have no systemd unit in this repository, so no
+stop budget is defined for them. Their wait for the client is the same 47 s bound.
 
 ## Telegram credentials
 
