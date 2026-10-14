@@ -909,11 +909,15 @@ async def _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypa
                     await asyncio.sleep(0)
             await asyncio.wait_for(all_enqueued(), timeout=5)
             assert client._ingest_queue.qsize() == len(frames) - 1   # one in flight, rest queued
+            # Hold the worker by reference BEFORE shutdown: a fix that clears
+            # ``client._worker_task`` while the task still runs must not be able to
+            # make the "worker is gone" assertion pass vacuously.
+            worker = client._worker_task
+            assert worker is not None and not worker.done()
 
             await asyncio.wait_for(app._async_shutdown(signal.SIGTERM), timeout=10)
             await asyncio.wait_for(asyncio.gather(start_task, return_exceptions=True), timeout=10)
-            worker = client._worker_task
-            worker_alive_after_start_exit = worker is not None and not worker.done()
+            worker_alive_after_start_exit = not worker.done()
 
             if not callback_wedged:
                 # Let whatever work is still pending finish, so the counters are final.
@@ -973,9 +977,15 @@ async def test_every_enqueued_frame_is_processed_or_counted_abandoned_at_shutdow
 
 
 @pytest.mark.asyncio
-async def test_raw_evidence_for_every_received_frame_is_durable_after_shutdown(tmp_path, monkeypatch):
+async def test_raw_wire_rows_for_every_received_frame_are_published_after_orderly_shutdown(tmp_path, monkeypatch):
     """Control, not a defect assertion: raw capture precedes the enqueue, so the
-    shutdown ordering problem concerns normalized processing, never raw evidence."""
+    shutdown ordering problem concerns normalized processing, never raw evidence.
+
+    Scope of the claim: after the runner's ORDERLY shutdown (writers closed in
+    order, final segment published) every received frame has a row in a
+    published raw_wire segment readable back with pyarrow. This does NOT prove
+    power-loss or kill -9 durability (fsync/rename behaviour under a crash), and
+    no live exchange or systemd path is involved."""
     obs = await _shutdown_with_one_inflight_and_three_queued_frames(tmp_path, monkeypatch)
     assert obs.frames_received == 4
     assert obs.raw_wire_rows == obs.frames_received
@@ -1010,10 +1020,11 @@ async def test_cancelling_start_during_the_shutdown_drain_does_not_orphan_the_wo
             start_task = asyncio.create_task(client.start())
             await asyncio.wait_for(entered.wait(), timeout=5)
             await asyncio.wait_for(draining.wait(), timeout=5)   # start() is now parked in the drain
+            worker = client._worker_task                         # by reference, before the cancel
+            assert worker is not None and not worker.done()
             start_task.cancel()                                  # what the runner's shutdown does
             await asyncio.wait_for(asyncio.gather(start_task, return_exceptions=True), timeout=5)
-            worker = client._worker_task
-            assert worker is None or worker.done(), (
+            assert worker.done(), (
                 "start() was cancelled inside the drain but the ingest worker task is still running "
                 f"with {client._ingest_queue.qsize()} queued frame(s) and "
                 f"frames_abandoned_at_shutdown={client.frames_abandoned_at_shutdown}")

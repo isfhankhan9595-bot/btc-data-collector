@@ -106,6 +106,7 @@ from collector.collector.recovery_control import RecoveryController
 from collector.collector.standalone_failure_policy import (
     DegradedQualityLossReporting,
     StandaloneFailurePolicy,
+    await_client_idle,
     build_stream_table,
     supervise_standalone_runner,
     tag_route,
@@ -720,8 +721,20 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         if self._recovery_task is not None and not self._recovery_task.done():
             self._recovery_task.cancel()
             await asyncio.gather(self._recovery_task, return_exceptions=True)
+        # ``stop()`` only REQUESTS shutdown. The receive loop, the queue drain and
+        # the ingest worker's retirement all finish inside the client's own
+        # start() task (this app's run_task), which is not cancelled until this
+        # coroutine returns -- so the clients must be waited for here, before any
+        # writer their worker can reach is closed.
+        client_idle = await await_client_idle(self.client, self.failure_policy)
+        # The raw-evidence writers' users are the receive loop and REST capture, not on_message,
+        # so they are closed either way.
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
         self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
+        if not client_idle:
+            # A worker is still alive: the market-data and quality writers stay open; the failure
+            # is latched and the exit status is non-zero.
+            return
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BINANCE_SPOT")
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BINANCE_SPOT")
         self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BINANCE_SPOT")

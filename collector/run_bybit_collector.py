@@ -83,6 +83,7 @@ from collector.collector.quality_wal import QualityEventWAL, QualityWALCapacityE
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
 from collector.collector.standalone_failure_policy import (
     StandaloneFailurePolicy,
+    await_client_idle,
     build_stream_table,
     supervise_standalone_runner,
     tag_route,
@@ -1213,7 +1214,18 @@ class BybitCollectorApp:
         # ``CancelledError`` (not an ``Exception``) skips the ``except`` above and propagates: the
         # writers and the WAL stay open and the WAL remains the recovery source. The idle publisher's
         # cancellation was already requested at the top, so it cannot publish after shutdown raised.
+        #
+        # ``stop()`` only REQUESTS shutdown: the receive loop, the queue drain and the ingest
+        # worker's retirement finish inside the client's own start() task (this app's run_task),
+        # which the supervisor does not cancel until this coroutine returns. Wait for it here, before
+        # closing any writer the worker can reach. The same CancelledError rule applies to this wait.
+        client_idle = await await_client_idle(self.client, self.failure_policy)
+        # The raw wire writer's only user is the receive loop, so it is closed either way.
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BYBIT")
+        if not client_idle:
+            # A worker is still alive: market-data and quality writers stay open and the WAL
+            # remains the recovery source; the failure is latched and the exit status non-zero.
+            return
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")
         self._close_writer_reporting_failure(self.mark_writer, "mark_writer", "BYBIT")

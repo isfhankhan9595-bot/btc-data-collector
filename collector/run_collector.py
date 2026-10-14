@@ -57,6 +57,7 @@ from collector.collector.failure_topology import (
     classify_stream,
 )
 from collector.collector.websocket_client import WebSocketClient
+from collector.collector.standalone_failure_policy import EXIT_RUN_TASK_CRASHED
 
 STREAM_INACTIVE_STARTUP_SECONDS = 60
 RAW_LOG_LIMIT = 20
@@ -251,6 +252,8 @@ class CollectorApp:
             return EXIT_DISK_PRESSURE          # 1: confirmed disk-pressure emergency stop (F5-QA-04)
         if getattr(self, "_disk_monitor_unavailable", None) is not None:
             return EXIT_DISK_MONITOR_UNAVAILABLE   # 69: storage could not be measured (fail closed)
+        if getattr(self, "shutdown_failure", None) is not None:
+            return EXIT_RUN_TASK_CRASHED           # 1: shutdown could not retire a websocket worker
         return 0
 
     def _on_fatal_storage(self, exc, origin: str = "handler") -> str:
@@ -1728,7 +1731,13 @@ class CollectorApp:
                 except Exception as exc:  # noqa: BLE001
                     logger.error("shutdown_quality_task_failed", error=f"{type(exc).__name__}: {exc}")
             finally:
-                self.shutdown()
+                try:
+                    # Same ordering as _async_shutdown: clients retire first.
+                    await self._stop_ws_clients()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("shutdown_ws_clients_stop_failed", error=f"{type(exc).__name__}: {exc}")
+                finally:
+                    self.shutdown()
 
     async def _poll_openinterest(self):
         import aiohttp
@@ -1840,6 +1849,42 @@ class CollectorApp:
             raise RuntimeError(msg)
         logger.info("Startup stream verification passed", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
 
+    async def _stop_ws_clients(self) -> bool:
+        """Request every websocket client's shutdown and wait (bounded) for it to
+        finish: receive loop ended, ingest queue drained, worker retired.
+
+        This is the step that has to precede any writer close. The previous
+        shutdown cancelled the ``start()`` tasks and closed every writer in one
+        synchronous pass, so the separate ingest worker -- which ``start()``'s
+        skipped drain tail would have stopped -- kept running against closed
+        writers. Here the clients are asked to stop first, are NOT cancelled while
+        they drain, and only an overrun of their own documented bound triggers the
+        hard fallback (cancel the tasks; ``start()``'s ``finally`` then still
+        retires the worker). Returns True only when every client is fully idle.
+        Idempotent: an already-stopped client answers immediately.
+        """
+        clients = list(getattr(self, "ws_clients", ()))
+        for client in clients:
+            self._shutdown_step("ws_client_stop", client.stop)
+
+        async def _wait(client, bound: float) -> bool:
+            waiter = getattr(client, "wait_stopped", None)
+            return True if waiter is None else bool(await waiter(bound))
+
+        results = await asyncio.gather(
+            *(_wait(c, getattr(c, "shutdown_deadline_s", 60.0)) for c in clients),
+            return_exceptions=True)
+        if all(result is True for result in results):
+            return True
+        logger.error("ws_client_graceful_stop_incomplete",
+                     results=[repr(r) for r in results])
+        for task in self.tasks:          # bounded fallback: start()'s finally retires the worker
+            task.cancel()
+        results = await asyncio.gather(
+            *(_wait(c, getattr(c, "worker_retire_timeout_s", 5.0) + 1.0) for c in clients),
+            return_exceptions=True)
+        return all(result is True for result in results)
+
     async def _async_shutdown(self, signum: int, terminal: bool = False, reason: Optional[str] = None):
         if reason is not None:
             logger.error("Controlled shutdown requested", reason=reason)
@@ -1873,7 +1918,14 @@ class CollectorApp:
                 logger.error("shutdown_quality_task_failed", error=f"{type(exc).__name__}: {exc}")
         finally:
             try:
-                self.shutdown()
+                try:
+                    # Clients first: no writer is closed while a websocket worker
+                    # or callback can still use it (see _stop_ws_clients).
+                    await self._stop_ws_clients()
+                except Exception as exc:  # noqa: BLE001 - never a precondition of the writer closes
+                    logger.error("shutdown_ws_clients_stop_failed", error=f"{type(exc).__name__}: {exc}")
+                finally:
+                    self.shutdown()
             except Exception as exc:  # noqa: BLE001 - shutdown() is itself exception-safe; belt and braces
                 logger.error("shutdown_failed", error=f"{type(exc).__name__}: {exc}")
             finally:
@@ -1995,6 +2047,22 @@ class CollectorApp:
             self._shutdown_step("task_cancel", task.cancel)
         if self._recovery_task is not None and not self._recovery_task.done():
             self._shutdown_step("recovery_task_cancel", self._recovery_task.cancel)
+        if not self._ws_clients_idle():
+            # A websocket ingest worker (or a start() still inside its tail) is
+            # alive, so closing the writers it feeds would put storage beneath a
+            # live user -- the exact defect this ordering exists to prevent. Fail
+            # EXPLICITLY instead of reporting a clean shutdown. Only the raw
+            # evidence writers are closed (their users are the receive loop and
+            # the cancelled REST tasks, never the worker's on_message path), so
+            # received frames' raw capture is still published. Everything the
+            # worker can reach -- market-data writers, the quality writer and its
+            # WAL -- is left open: the WAL stays the recovery source and the next
+            # start replays it. ``_shutdown_done`` is deliberately NOT set, so a
+            # later call (once the worker has ended) finishes the remaining closes.
+            self._record_shutdown_failure("ws_client_worker_not_retired")
+            for writer_name in ("raw_wire_writer", "raw_rest_writer"):
+                self._close_writer_once(writer_name)
+            return
         # Hostile-audit finding (this session): none of these close() calls
         # were guarded. _close_segment's flush/pyarrow-close/fsync/rename have
         # no failure handling of their own (only the metadata sidecar step
@@ -2025,6 +2093,19 @@ class CollectorApp:
             except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
                 logger.error("quality_wal_close_failed", error=str(exc))
         self._shutdown_done = True
+
+    def _ws_clients_idle(self) -> bool:
+        """True when no websocket client can still touch storage (no live ingest
+        worker, no start() mid-tail). A client without the attribute (a test
+        double) counts as idle."""
+        return all(getattr(client, "lifecycle_idle", True) for client in getattr(self, "ws_clients", ()))
+
+    def _record_shutdown_failure(self, reason: str) -> None:
+        """Latch an explicit terminal shutdown failure (first reason wins). It is
+        reflected in ``exit_code``; it never raises."""
+        if getattr(self, "shutdown_failure", None) is None:
+            self.shutdown_failure = reason
+        logger.error("shutdown_terminal_failure", reason=reason, exit_status=EXIT_RUN_TASK_CRASHED)
 
     def _close_writer_once(self, writer_name: str) -> bool:
         """Attempt ``writer_name``'s close at most once per process; a repeat call

@@ -72,6 +72,7 @@ from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWire
 from collector.collector.standalone_failure_policy import (
     DegradedQualityLossReporting,
     StandaloneFailurePolicy,
+    await_client_idle,
     build_stream_table,
     supervise_standalone_runner,
     tag_route,
@@ -492,7 +493,16 @@ class OKXCollectorApp(DegradedQualityLossReporting):
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("okx_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
+        # ``stop()`` only REQUESTS shutdown; the drain and the worker's retirement
+        # finish inside the client's own start() task (this app's run_task, not
+        # cancelled until this coroutine returns). Wait for it before closing any
+        # writer the worker can reach.
+        client_idle = await await_client_idle(self.client, self.failure_policy)
+        # The raw wire writer's only user is the receive loop, so it is closed either way.
         self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "OKX")
+        if not client_idle:
+            # A worker is still alive: everything the worker can reach stays open.
+            return
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "OKX")
         self._close_writer_reporting_failure(self.trades_all_writer, "trades_all_writer", "OKX")
         self._close_writer_reporting_failure(self.mark_writer, "mark_writer", "OKX")
