@@ -52,6 +52,22 @@ class WorkerRetirementError(RuntimeError):
 _STREAM_END = object()
 
 
+#: Shutdown-budget inputs (see ``WebSocketClient.shutdown_deadline_s``).
+#: ``websockets`` closes a connection within its ``close_timeout``, which this
+#: client does not override: the library default (10 s, pinned by a test) is the
+#: bound. The opening handshake (``open_timeout``, also 10 s) is NOT part of the
+#: post-stop budget because stop() cancels it (``_connect_or_stop``).
+CLOSE_HANDSHAKE_S = 10.0
+#: Allowance for the quality-event / subscribe work around the close handshake.
+CONNECTION_PHASE_SLACK_S = 2.0
+#: What the 60 s systemd TimeoutStopSec leaves for everything the code does NOT
+#: bound (quality drain, ~10 writer finalizations incl. fsync, WAL close,
+#: interpreter teardown). It is TimeoutStopSec minus the bounded websocket part
+#: today (60 - 47 - 6): an allowance, NOT a measurement. Raising any client timeout
+#: without raising TimeoutStopSec fails test_ws_shutdown_producers.
+FINALIZATION_RESERVE_S = 7.0
+
+
 async def _anext_or_end(iterator):
     """One ``__anext__`` of ``iterator``; ``_STREAM_END`` instead of raising
     ``StopAsyncIteration`` (which must not travel through a Task)."""
@@ -402,7 +418,11 @@ class WebSocketClient:
             try:
                 connection = websockets.connect(self.url)
                 if hasattr(connection, "__await__"):
-                    connection = await connection
+                    # stop() must not wait out the opening handshake (open_timeout,
+                    # 10 s): that is time shutdown_deadline_s does not budget.
+                    connection = await self._connect_or_stop(connection)
+                    if connection is _STREAM_END:
+                        break
 
                 async with connection as ws:
                     if self._discard_mode:
@@ -645,6 +665,32 @@ class WebSocketClient:
         await asyncio.gather(receive, return_exceptions=True)
         return _STREAM_END
 
+    async def _connect_or_stop(self, pending):
+        """Await the opening handshake ``pending`` unless stop() lands first.
+
+        Returns the connection, or ``_STREAM_END`` when stop won (the handshake is
+        cancelled -- ``websockets`` aborts the transport on cancellation -- and
+        awaited, so nothing outlives the call). A connect error propagates exactly
+        as the plain ``await`` did. A connection that completed together with stop
+        is returned: the caller's ``async with`` closes it and its receive loop
+        consumes nothing because ingress is already stopped.
+        """
+        if self._stop_requested:
+            return _STREAM_END
+        attempt = asyncio.ensure_future(pending)
+        stop = self._stop_signal()
+        try:
+            await asyncio.wait({attempt, stop}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            attempt.cancel()
+            await asyncio.gather(attempt, return_exceptions=True)
+            raise
+        if attempt.done():
+            return attempt.result()
+        attempt.cancel()
+        await asyncio.gather(attempt, return_exceptions=True)
+        return _STREAM_END
+
     async def _interruptible_sleep(self, delay: float) -> None:
         """``asyncio.sleep(delay)`` that stop() can cut short (reconnect backoff
         can be up to a minute; shutdown must not wait it out)."""
@@ -666,6 +712,18 @@ class WebSocketClient:
         return worker is not None and not worker.done()
 
     @property
+    def ingress_stopped(self) -> bool:
+        """True when the receive loop can no longer call ``on_raw_frame`` -- the only
+        producer of the raw-wire writer. Independent of the worker and of whether
+        start() has finished: once stop() has returned (or start()'s lifecycle has
+        ended) no frame can be captured, because ``_consume`` has no ``await``
+        between its ``running`` check and the capture."""
+        if self._stop_requested:
+            return True
+        return bool(self._lifecycle_started and self._lifecycle_finished is not None
+                    and self._lifecycle_finished.is_set())
+
+    @property
     def lifecycle_idle(self) -> bool:
         """True when nothing of this client can still touch storage: start() is
         not mid-lifecycle (never entered, or its tail has finished) and no ingest
@@ -679,10 +737,12 @@ class WebSocketClient:
 
     @property
     def shutdown_deadline_s(self) -> float:
-        """Worst-case time start() needs after stop(): the connection's own close
-        handshake (``websockets`` bounds it at ~10 s) plus the bounded drain plus
-        bounded worker retirement. Runners use it as their wait bound."""
-        return 12.0 + self.shutdown_drain_timeout_s + self.worker_retire_timeout_s
+        """Worst-case time start() needs after stop(): the connection's close
+        handshake (websockets ``close_timeout``, 10 s) plus slack, the bounded
+        drain and the bounded worker retirement. The opening handshake is not
+        included because stop() cancels it. Runners use it as their wait bound."""
+        return (CLOSE_HANDSHAKE_S + CONNECTION_PHASE_SLACK_S
+                + self.shutdown_drain_timeout_s + self.worker_retire_timeout_s)
 
     async def wait_stopped(self, timeout_s: float) -> bool:
         """Wait (bounded) for this client's whole lifecycle to finish.
