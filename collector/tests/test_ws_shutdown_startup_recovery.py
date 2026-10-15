@@ -422,9 +422,10 @@ async def test_while_the_startup_recovery_ignores_cancel_start_is_parked_and_the
 
 
 @pytest.mark.asyncio
-async def test_when_the_ignoring_startup_recovery_ends_start_itself_finishes_the_deferred_close(
+async def test_when_the_ignoring_startup_recovery_ends_the_deferred_close_completes_without_a_manual_retry(
         tmp_path, monkeypatch):
-    """The parked start() is what completes shutdown once the producer ends: no manual retry."""
+    """No manual shutdown() call: once the producer ends, shutdown()'s late retry finalizes the rest
+    and the parked start() then resumes into a no-op tail and returns."""
     app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
     stubborn = _StubbornRecovery()
     spawned = []
@@ -441,7 +442,7 @@ async def test_when_the_ignoring_startup_recovery_ends_start_itself_finishes_the
         done, _ = await asyncio.wait({start_task}, timeout=10)
         assert done, "start() never resumed after the producer ended"
         assert start_task.exception() is None
-        assert getattr(app, "_shutdown_done", False), "start()'s tail did not finish the deferred close"
+        assert getattr(app, "_shutdown_done", False), "the deferred close never completed"
         for name in ("raw_rest_writer", "raw_book_writer", "quality_writer", "oi_writer", "trades_writer"):
             assert getattr(app, name)._closed, f"{name} still open after the producer ended"
         assert app.shutdown_failure == "rest_producer_not_stopped" and app.exit_code != 0   # still latched
@@ -507,7 +508,8 @@ async def test_an_exception_outside_shutdown_still_propagates_and_latches_nothin
     try:
         with pytest.raises(ValueError, match="snapshot parse failed"):
             await asyncio.wait_for(start_task, 10)
-        assert getattr(app, "shutdown_failure", None) is None and not getattr(app, "_recovery_closed", False)
+        # nothing latched; finalization ran (that is what sets _recovery_closed, so it is no longer asserted False)
+        assert getattr(app, "shutdown_failure", None) is None and getattr(app, "_shutdown_done", False)
         assert app._oi_task is None                      # no producer after a failed startup either
     finally:
         await _drain(app, start_task)
@@ -533,7 +535,9 @@ async def test_a_cancelled_startup_recovery_that_is_not_a_shutdown_does_not_let_
     try:
         done, _ = await asyncio.wait({start_task}, timeout=10)
         assert done and start_task.cancelled(), "start() carried on after its recovery was cancelled"
-        assert spawned == [] and app._oi_task is None and not getattr(app, "_recovery_closed", False)
+        # nothing started; finalization ran (it sets _recovery_closed, so that is no longer asserted False)
+        assert spawned == [] and app._oi_task is None
+        assert getattr(app, "shutdown_failure", None) is None and getattr(app, "_shutdown_done", False)
     finally:
         await _drain(app, start_task)
 

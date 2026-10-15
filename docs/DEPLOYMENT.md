@@ -98,8 +98,8 @@ and OI poller (stopped, and none can start once shutdown began).
 
 Traced from source and exercised with a coroutine that swallows every `CancelledError`, including
 in a child process running the real `main()` under a real SIGTERM
-(`tests/test_ws_shutdown_runner_exit.py`, `tests/test_ws_shutdown_startup_recovery.py`) -- NOT
-VERIFIED LIVE.
+(`tests/test_ws_shutdown_runner_exit.py`, `tests/test_ws_shutdown_late_producer.py`,
+`tests/test_ws_shutdown_startup_recovery.py`) -- NOT VERIFIED LIVE.
 
 What the application controls:
 
@@ -108,24 +108,33 @@ What the application controls:
 - Every tracked producer (startup recovery, recovery task, OI poller) is sent a cancel.
 - A producer that is still running keeps exactly the storage it can reach open
   (`REST_PRODUCER_REACH`): raw REST capture, reconstructed book rows (recovery) or `oi_writer`
-  (poller), and the quality writer + WAL. Everything else is finalised.
+  (poller), and the quality writer + WAL. Everything else is finalised. Nothing is ever closed
+  beneath a live producer, including by a later `shutdown()` call.
 - A non-zero status (`rest_producer_not_stopped`, 1) is latched in `CollectorApp.exit_code`.
+- Every exit from `start()` after the startup preflight reaches the same finalization: a normal
+  return, an exception from the startup recovery or any task (it is re-raised afterwards, so
+  `main()` still fails with its traceback), and the caller cancelling `start()` (finalization runs,
+  then the cancellation propagates). The wait for a recovery that ignores a cancel of `start()` is
+  bounded by `WS_FALLBACK_SLACK_S`.
+- If a producer that outlived `shutdown()` ends later, a done-callback retries `shutdown()`: it
+  drains the quality queue, closes the remaining writers once each, then `quality_writer`, then the
+  WAL. A late close is not a clean shutdown: the latched status stays non-zero.
 
 What it does not control:
 
 - Cancellation is a request. A coroutine that swallows it cannot be stopped by the application.
 - While such a task exists the process does not return the latched status. With a startup
-  recovery, `start()` stays parked in `_run_startup_recovery` (deliberately unbounded: that tail is
-  the only later retry of the close). With the OI poller, `start()` returns after its own bounded
-  waits, but `asyncio.run` then waits for the task in its teardown. Either way `main()` returns
-  only once the task ends.
+  recovery under SIGTERM, `start()` stays parked in `_run_startup_recovery`; with the OI poller,
+  `start()` returns after its own bounded waits, but `asyncio.run` then waits for the task in its
+  teardown. Either way `main()` returns only once the task ends.
 - A producer that never ends is ended only by process-level termination: systemd's SIGKILL at
-  `TimeoutStopSec`, which reports the kill, not the latched status. Nothing in the code guarantees
-  that shutdown completes within 60 s; the bounds in the next table cover the websocket part only.
-- If the producer does end later: after a startup recovery, `start()` resumes, closes every
-  remaining writer and the process exits with the latched status. After the OI poller the process
-  exits with the latched status but nothing retries `shutdown()`: `oi_writer`, `raw_rest_writer`
-  and the quality writer / WAL stay unfinalised (observed, not fixed here).
+  `TimeoutStopSec`, which reports the kill, not the latched status. Its reachable writers and the
+  quality WAL are then never finalised by this process (the WAL stays the recovery source for
+  quality events). Nothing in the code guarantees that shutdown completes within 60 s; the bounds in
+  the next table cover the websocket part only.
+- The late retry only runs while the event loop does. If the process is killed first, nothing runs.
+  It also does not retire a websocket worker that is still alive (`ws_client_worker_not_retired`
+  has its own, separate retry condition).
 
 ### Stop budget vs `TimeoutStopSec=60`
 

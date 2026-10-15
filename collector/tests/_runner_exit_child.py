@@ -3,7 +3,7 @@
 
 Only the network edge is replaced (websocket client double, producer, quiet neighbours); the
 signal handler, ``_async_shutdown``, ``start()`` and ``shutdown()`` are the production code.
-Usage: python _runner_exit_child.py <startup_recovery|oi_poller> <release-flag-path>
+Usage: python _runner_exit_child.py <startup_recovery|oi_poller|startup_recovery_raises> <release-flag-path>
 """
 import asyncio
 import os
@@ -68,22 +68,38 @@ def _factory():
     if MODE == "startup_recovery":
         app._recover_binance_book = _stubborn
         app._poll_openinterest = _quiet
+    elif MODE == "startup_recovery_raises":
+        async def failing(reason):
+            raise ValueError("startup snapshot parse failed")
+        app._recover_binance_book = failing
+        app._poll_openinterest = _quiet
     else:
         async def recovered(reason):
             return True
         app._recover_binance_book = recovered
         app._poll_openinterest = _stubborn
-    real_shutdown = app._async_shutdown
+    real_shutdown, real_start, progress = app._async_shutdown, app.start, {"start_done": False}
 
     async def reporting_shutdown(*args, **kwargs):
         await real_shutdown(*args, **kwargs)
-        starts = [t for t in asyncio.all_tasks() if t.get_coro().__qualname__.endswith("CollectorApp.start")]
-        print("SHUTDOWN_TASK_DONE start_done=%s %s" % (all(t.done() for t in starts), _states(app)), flush=True)
+        print("SHUTDOWN_TASK_DONE start_done=%s %s" % (progress["start_done"], _states(app)), flush=True)
     app._async_shutdown = reporting_shutdown        # looked up at signal time by the real handler
+
+    async def reporting_start():
+        try:
+            return await real_start()
+        finally:                                    # start() has exited; asyncio.run now tears the loop down
+            progress["start_done"] = True
+            print("START_RETURNED start_done=True %s" % _states(app), flush=True)
+    app.start = reporting_start
     _factory.app = app
     return app
 
 
-code = run_collector.main(_factory)
+try:
+    code = run_collector.main(_factory)
+except Exception as exc:                 # the real main() lets an unrelated crash keep its traceback
+    print("MAIN_RAISED type=%s %s" % (type(exc).__name__, _states(_factory.app)), flush=True)
+    raise
 print("MAIN_RETURNED code=%s %s" % (code, _states(_factory.app)), flush=True)
 sys.exit(code)
