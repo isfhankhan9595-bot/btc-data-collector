@@ -54,7 +54,7 @@ from .websocket_client import WorkerRetirementError
 __all__ = [
     "EXIT_FATAL_STORAGE", "EXIT_RUN_TASK_CRASHED", "SHUTDOWN_TASK_TIMEOUT_S",
     "DEDUP_DEFAULT_STREAM", "ROUTE_TAG_ATTRIBUTE", "tag_route", "build_stream_table",
-    "StandaloneFailurePolicy", "supervise_standalone_runner", "await_client_idle",
+    "StandaloneFailurePolicy", "supervise_standalone_runner", "await_client_idle", "cancel_and_wait", "REST_PRODUCER_CANCEL_BOUND_S",
     "NO_QUALITY_WAL_NOTE", "UNCONFIRMED_QUALITY_EVENT_NOTE", "is_bounded_report_point",
     "DegradedQualityLossReporting",
 ]
@@ -459,6 +459,29 @@ async def _bounded_wait(task: "asyncio.Future[Any]", timeout: float, what: str) 
     done, _ = await asyncio.wait({task}, timeout=timeout)
     if not done:
         logger.error("runner_task_did_not_stop_in_time", task=what, timeout_s=timeout)
+
+
+#: How long a runner waits for a REST producer (book-recovery task) to end after cancelling it. The
+#: same bound as run_collector.WS_FALLBACK_SLACK_S (tests/test_ws_rest_producer_reach.py asserts the
+#: two stay equal). A producer that outlives it is reported, never assumed gone.
+REST_PRODUCER_CANCEL_BOUND_S = 1.0
+
+
+async def cancel_and_wait(task: "Optional[asyncio.Future[Any]]", timeout: float, what: str) -> bool:
+    """Cancel ``task`` and wait (at most ``timeout``) for it; True iff it has ended.
+
+    Built on ``_bounded_wait`` so the existing "did not stop in time" logging is reused. It
+    never swallows a cancellation of the CALLER (``asyncio.wait`` re-raises it), and it never
+    returns True for a task that is still running -- a cancellation-resistant producer is the
+    caller's to report."""
+    if task is None:
+        return True
+    if not task.done():
+        task.cancel()
+        await _bounded_wait(task, timeout, what)
+    if task.done() and not task.cancelled():
+        task.exception()                    # mark retrieved: never an unobserved background failure
+    return task.done()
 
 
 async def supervise_standalone_runner(app: Any, stop: asyncio.Event, *,

@@ -320,6 +320,11 @@ async def test_usdm_raw_rest_writer_is_not_closed_while_a_recovery_producer_is_u
         await asyncio.sleep(0.02)
         assert not app._recovery_task.done(), "precondition: the producer survived its cancel"
         assert app.raw_rest_writer._closed is False
+        # The recovery can also persist reconstructed book rows and emit quality events, so what it
+        # can still reach beyond raw_rest must stay open too.
+        assert app.raw_book_writer._closed is False
+        assert app.quality_writer._closed is False
+        assert not getattr(app, "_quality_wal_closed", False)
         assert app.raw_wire_writer._closed is True       # receive loop stopped: safe either way
         assert app.shutdown_failure == "ws_client_worker_not_retired"
     finally:

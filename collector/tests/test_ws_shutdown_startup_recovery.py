@@ -225,7 +225,7 @@ async def _drain(app, *tasks):
 
 
 @pytest.mark.asyncio
-async def test_a_startup_recovery_that_ignores_cancel_keeps_raw_rest_and_oi_open_and_fails_explicitly(
+async def test_a_startup_recovery_that_ignores_cancel_keeps_its_reachable_storage_open_and_fails_explicitly(
         tmp_path, monkeypatch):
     app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -245,13 +245,19 @@ async def test_a_startup_recovery_that_ignores_cancel_keeps_raw_rest_and_oi_open
         shutdown_task = asyncio.create_task(app._async_shutdown(signal.SIGTERM))
         await asyncio.wait_for(shutdown_task, 10)
         assert app.shutdown_failure == "rest_producer_not_stopped" and app.exit_code != 0
-        assert app.raw_rest_writer._closed is False and app.oi_writer._closed is False
-        assert app.trades_writer._closed and app.quality_writer._closed      # unrelated writers finalized
+        # The startup recovery can still reach raw REST capture, reconstructed book rows and
+        # the quality writer + WAL (REST_PRODUCER_REACH["recovery"]): all stay open ...
+        for name in ("raw_rest_writer", "raw_book_writer", "quality_writer"):
+            assert getattr(app, name)._closed is False, f"{name} closed beneath a live startup recovery"
+        assert not getattr(app, "_quality_wal_closed", False)
+        # ... while storage it cannot reach (and the OI poller never started) is finalized.
+        assert app.oi_writer._closed and app.trades_writer._closed
         assert not getattr(app, "_shutdown_done", False)
         release.set()                                                         # the producer finally ends
         await asyncio.wait_for(asyncio.gather(start_task, return_exceptions=True), 10)
         app.shutdown()                                                        # retry now succeeds
-        assert app.raw_rest_writer._closed and app.oi_writer._closed and app._shutdown_done
+        assert app.raw_rest_writer._closed and app.raw_book_writer._closed and app.quality_writer._closed
+        assert app._shutdown_done
     finally:
         release.set()
         await _drain(app, start_task, shutdown_task)

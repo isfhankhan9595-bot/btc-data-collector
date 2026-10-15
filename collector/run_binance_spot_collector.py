@@ -106,8 +106,10 @@ from collector.collector.recovery_control import RecoveryController
 from collector.collector.standalone_failure_policy import (
     DegradedQualityLossReporting,
     StandaloneFailurePolicy,
+    REST_PRODUCER_CANCEL_BOUND_S,
     await_client_idle,
     build_stream_table,
+    cancel_and_wait,
     supervise_standalone_runner,
     tag_route,
 )
@@ -117,6 +119,12 @@ from collector.collector.utils import logger
 from collector.collector.websocket_client import WebSocketClient
 
 VENUE = "BINANCE_SPOT"
+
+
+#: Storage the Spot book recovery (``_recover_book``) can still write, traced through every method it
+#: calls (tests/test_ws_rest_producer_reach.py recomputes it with an AST closure): raw REST capture, the
+#: snapshot-derived orderbook rows, and quality events. A live recovery keeps exactly this open.
+SPOT_RECOVERY_REACH = frozenset({"raw_rest_writer", "ob_writer", "quality_writer"})
 
 
 class BinanceSpotCollectorApp(DegradedQualityLossReporting):
@@ -724,34 +732,43 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("spot_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
-        if self._recovery_task is not None and not self._recovery_task.done():
-            self._recovery_task.cancel()
-            await asyncio.gather(self._recovery_task, return_exceptions=True)
+        # Bounded: a recovery that ignores cancellation must not hang shutdown past the unit's
+        # TimeoutStopSec. Whether it ended is judged below (after the client is idle), never assumed.
+        await cancel_and_wait(self._recovery_task, REST_PRODUCER_CANCEL_BOUND_S, "spot_recovery_task")
         # ``stop()`` only REQUESTS shutdown. The receive loop, the queue drain and
         # the ingest worker's retirement all finish inside the client's own
         # start() task (this app's run_task), which is not cancelled until this
         # coroutine returns -- so the clients must be waited for here, before any
         # writer their worker can reach is closed.
         client_idle = await await_client_idle(self.client, self.failure_policy)
-        # Each raw writer is closed when ITS producers are stopped -- independent of the worker:
+        # The worker, alive during that wait, can start a new recovery (``_schedule_recovery`` is on its
+        # on_message path), and the first one may have ignored its cancel. Judge liveness NOW, after the
+        # clients are idle: cancel again (bounded) and, if a producer is still running, hold exactly the
+        # storage it can still write open (SPOT_RECOVERY_REACH) and make the failure visible.
+        recovery_ended = await cancel_and_wait(self._recovery_task, REST_PRODUCER_CANCEL_BOUND_S,
+                                               "spot_recovery_task")
+        held = frozenset() if recovery_ended else SPOT_RECOVERY_REACH
+        if held:
+            self.failure_policy.record_shutdown_failure("rest_producer_not_stopped")
+            logger.error("spot_storage_left_open_recovery_alive", held=sorted(held))
+        # Each writer is closed only when EVERY producer that can reach it is stopped:
         #   raw_wire_writer: the receive loop only -> ingress stopped.
-        #   raw_rest_writer: the recovery task only. ``_recovery_closed`` (set above) means none
-        #       can start any more, and the one cancelled above is awaited, so it is stopped
-        #       unless that task is somehow still running.
+        #   raw_rest_writer / ob_writer / quality_writer: the recovery task (+ the worker for ob/quality).
         if getattr(self.client, "ingress_stopped", True):
             self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
         else:
             logger.error("spot_raw_wire_writer_left_open_ingress_not_stopped")
-        if self._recovery_task is None or self._recovery_task.done():
+        if "raw_rest_writer" not in held:
             self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
-        else:
-            logger.error("spot_raw_rest_writer_left_open_recovery_alive")
         if not client_idle:
             # A worker is still alive: the market-data and quality writers stay open; the failure
             # is latched and the exit status is non-zero.
             return
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BINANCE_SPOT")
-        self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BINANCE_SPOT")
+        if "ob_writer" not in held:
+            self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BINANCE_SPOT")
+        if "quality_writer" in held:
+            return          # quality_writer outlives the live recovery; its events stay recoverable
         self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BINANCE_SPOT")
         # Last, so the counts include anything the closes above reported. Cannot raise.
         self._report_quality_channel_final()

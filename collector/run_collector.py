@@ -64,6 +64,20 @@ STREAM_INACTIVE_STARTUP_SECONDS = 60
 #: (``worker_retire_timeout_s`` + this). Part of the shutdown budget (see
 #: websocket_client.FINALIZATION_RESERVE_S).
 WS_FALLBACK_SLACK_S = 1.0
+
+#: Storage each REST producer can still write, from tracing the producer's coroutine through
+#: every method it calls (tests/test_ws_rest_producer_reach.py recomputes this with an AST
+#: closure, so a new write path cannot silently escape it). "quality_wal" is the quality
+#: writer's WAL. A producer that is still alive keeps exactly its own set open -- no broader
+#: guess about which writers are "probably safe".
+#:   recovery / startup recovery: raw REST capture, reconstructed book rows
+#:       (_persist_reconstructed_books), quality events (_record_book_quality ->
+#:       _persist_quality_event -> WAL + quality_writer).
+#:   open-interest poller: raw REST capture, oi_writer, quality events.
+REST_PRODUCER_REACH = {
+    "recovery": frozenset({"raw_rest_writer", "raw_book_writer", "quality_writer", "quality_wal"}),
+    "oi_poll": frozenset({"raw_rest_writer", "oi_writer", "quality_writer", "quality_wal"}),
+}
 RAW_LOG_LIMIT = 20
 OI_POLL_INTERVAL_S = 3.0
 OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
@@ -1992,7 +2006,10 @@ class CollectorApp:
             try:
                 if self._recovery_task is not None and not self._recovery_task.done():
                     self._recovery_task.cancel()
-                    await asyncio.gather(self._recovery_task, return_exceptions=True)
+                    # Bounded: a recovery that ignores cancellation must not hang shutdown past the
+                    # unit's TimeoutStopSec. Whether it ended is judged later, by
+                    # _storage_held_by_rest_producers(), never assumed from this wait returning.
+                    await asyncio.wait({self._recovery_task}, timeout=WS_FALLBACK_SLACK_S)
             except Exception as exc:  # noqa: BLE001
                 logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
             self._drain_integrity_quality_events_safely()
@@ -2155,7 +2172,7 @@ class CollectorApp:
                 self._close_writer_once("raw_wire_writer")
             else:
                 logger.error("shutdown_raw_wire_writer_left_open_ingress_not_stopped")
-            if self._rest_producers_stopped():
+            if "raw_rest_writer" not in self._storage_held_by_rest_producers():
                 self._close_writer_once("raw_rest_writer")
             else:
                 logger.error("shutdown_raw_rest_writer_left_open_rest_producer_alive")
@@ -2175,19 +2192,26 @@ class CollectorApp:
         # which PUBLISHES the final partial segment and thereby checkpoints
         # its WAL seqs -> only then close the WAL (the publish hook needs it).
         self._shutdown_step("quality_queue_drain", self._drain_quality_queue_sync)
-        # raw_rest_writer / oi_writer are closed only once every REST producer is PROVEN ended
-        # (the async callers cancel them and let them run to completion before this point). A
-        # producer that ignored its cancel keeps these two open: closing beneath it would lose its
-        # in-flight response's evidence, so fail explicitly instead.
-        rest_unproven = not self._rest_producers_stopped()
+        # A writer is closed only once every producer that can reach it is PROVEN ended (the async
+        # callers cancel the REST producers and let them run to completion before this point).
+        # A producer that ignored its cancel keeps exactly the storage it can still write open --
+        # see REST_PRODUCER_REACH: raw REST capture, reconstructed book rows, the oi_writer, and
+        # the quality writer + WAL (its recovery/poll events). The failure is explicit.
+        held = self._storage_held_by_rest_producers()
+        rest_unproven = bool(held)
         if rest_unproven:
             self._record_shutdown_failure("rest_producer_not_stopped")
-            logger.error("shutdown_raw_rest_and_oi_writers_left_open_rest_producer_alive")
+            logger.error("shutdown_storage_left_open_rest_producer_alive", held=sorted(held))
         for writer_name in ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
                             "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer", "raw_rest_writer"):
-            if rest_unproven and writer_name in ("oi_writer", "raw_rest_writer"):
+            if writer_name in held:
                 continue
             self._close_writer_once(writer_name)
+        if "quality_writer" in held or "quality_wal" in held:
+            # quality_writer must outlive the live producer and its WAL must outlive quality_writer
+            # (the publish hook checkpoints through it): neither is closed. Un-published events
+            # stay in the WAL, which the next startup replays.
+            return
         if not self._close_writer_once("quality_writer"):
             # Final segment not published: its events stay in the WAL,
             # uncheckpointed, and are replayed by the next startup.
@@ -2199,8 +2223,6 @@ class CollectorApp:
                 wal.close()
             except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
                 logger.error("quality_wal_close_failed", error=str(exc))
-        if rest_unproven:
-            return              # not "done": a later call (once the producer ends) closes the two writers
         self._shutdown_done = True
 
     def _ws_clients_idle(self) -> bool:
@@ -2213,6 +2235,16 @@ class CollectorApp:
         """True when no websocket receive loop can still capture a raw frame. A client
         without the attribute (a test double) counts as stopped."""
         return all(getattr(client, "ingress_stopped", True) for client in getattr(self, "ws_clients", ()))
+
+    def _storage_held_by_rest_producers(self) -> frozenset:
+        """The storage a still-running REST producer can write (empty when all have ended)."""
+        producers = {"recovery": (getattr(self, "_recovery_task", None), getattr(self, "_startup_recovery_task", None)),
+                     "oi_poll": (getattr(self, "_oi_task", None),)}
+        held = set()
+        for name, tasks in producers.items():
+            if any(task is not None and not task.done() for task in tasks):
+                held |= REST_PRODUCER_REACH[name]
+        return frozenset(held)
 
     def _rest_producers_stopped(self) -> bool:
         """True when no REST producer (recovery, startup recovery, OI poller) is still running."""
