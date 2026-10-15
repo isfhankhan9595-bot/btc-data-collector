@@ -78,7 +78,9 @@ as failures; see `F5_FATAL_STORAGE_TOPOLOGY.md`.
 ```
 SIGTERM -> CollectorApp._async_shutdown()
   -> running = False; recovery latch set (no new REST producer can start)
-  -> cancel + await the recovery task
+  -> cancel every REST producer (startup recovery, recovery task, OI poller); wait at most
+       WS_FALLBACK_SLACK_S (1 s) for the recovery task. Whether any producer ENDED is judged
+       later from its task state by shutdown(), never from a wait having returned
   -> drain integrity quality events, await the quality-queue task
   -> _stop_ws_clients(): client.stop() for each client, then wait (NOT cancel) for each
        client's start() tail: receive loop ended -> ingest queue drained -> worker retired
@@ -91,6 +93,39 @@ quality writer, the quality queue and the WAL are left untouched (the WAL is the
 source), and each raw writer is closed only when its own producers are stopped:
 `raw_wire_writer` <- receive loop only (ingress stopped); `raw_rest_writer` <- recovery task
 and OI poller (stopped, and none can start once shutdown began).
+
+### A REST producer that ignores cancellation
+
+Traced from source and exercised with a coroutine that swallows every `CancelledError`, including
+in a child process running the real `main()` under a real SIGTERM
+(`tests/test_ws_shutdown_runner_exit.py`, `tests/test_ws_shutdown_startup_recovery.py`) -- NOT
+VERIFIED LIVE.
+
+What the application controls:
+
+- No REST producer starts once shutdown began. The latch is set before anything is cancelled, and
+  the startup recovery, `_schedule_recovery` and the OI poller start are all gated by it.
+- Every tracked producer (startup recovery, recovery task, OI poller) is sent a cancel.
+- A producer that is still running keeps exactly the storage it can reach open
+  (`REST_PRODUCER_REACH`): raw REST capture, reconstructed book rows (recovery) or `oi_writer`
+  (poller), and the quality writer + WAL. Everything else is finalised.
+- A non-zero status (`rest_producer_not_stopped`, 1) is latched in `CollectorApp.exit_code`.
+
+What it does not control:
+
+- Cancellation is a request. A coroutine that swallows it cannot be stopped by the application.
+- While such a task exists the process does not return the latched status. With a startup
+  recovery, `start()` stays parked in `_run_startup_recovery` (deliberately unbounded: that tail is
+  the only later retry of the close). With the OI poller, `start()` returns after its own bounded
+  waits, but `asyncio.run` then waits for the task in its teardown. Either way `main()` returns
+  only once the task ends.
+- A producer that never ends is ended only by process-level termination: systemd's SIGKILL at
+  `TimeoutStopSec`, which reports the kill, not the latched status. Nothing in the code guarantees
+  that shutdown completes within 60 s; the bounds in the next table cover the websocket part only.
+- If the producer does end later: after a startup recovery, `start()` resumes, closes every
+  remaining writer and the process exits with the latched status. After the OI poller the process
+  exits with the latched status but nothing retries `shutdown()`: `oi_writer`, `raw_rest_writer`
+  and the quality writer / WAL stay unfinalised (observed, not fixed here).
 
 ### Stop budget vs `TimeoutStopSec=60`
 

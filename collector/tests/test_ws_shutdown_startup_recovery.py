@@ -319,3 +319,243 @@ async def test_normal_startup_still_recovers_then_starts_the_poller(tmp_path, mo
         assert app._oi_task is not None and not app._oi_task.done()
     finally:
         await _drain(app, start_task)
+
+
+# ================================================================================================
+# Final audit: startup-recovery lifecycle. What does the PARENT start() task do, and what does the
+# shutdown task do, while the startup recovery is (a) cancelled, (b) cancellation-resistant, (c)
+# ended by an exception, (d) cancelled for a reason that is not a shutdown?
+#
+# The cancellation-resistant cases hold the producer alive for the whole assertion block: it is
+# released only AFTER the state under test has been asserted. Nothing here claims the application
+# can stop such a coroutine; it states what the application does while one exists.
+# ================================================================================================
+
+def _await_chain(task):
+    """Names of the coroutines a suspended task is awaiting, outermost first (exact, not timed)."""
+    names, coro = [], task.get_coro()
+    while coro is not None:
+        code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+        if code is None:
+            break
+        names.append(code.co_name)
+        coro = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+    return names
+
+
+class _StubbornRecovery:
+    """A startup recovery that swallows every cancel and ends only when ``release`` is set."""
+
+    def __init__(self, on_release="return"):
+        self.entered, self.cancel_swallowed, self.release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        self.swallowed, self.on_release = 0, on_release
+
+    async def __call__(self, reason):
+        self.entered.set()
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.swallowed += 1
+                self.cancel_swallowed.set()
+        if self.on_release == "raise":
+            raise RuntimeError("startup recovery failed after it had ignored the cancel")
+
+
+async def _sigterm_while_stubborn(app, monkeypatch, stubborn):
+    """Start the real start(), wait until the stubborn recovery is running, run the real
+    _async_shutdown to completion, and wait until the producer has demonstrably swallowed the
+    cancel. The producer is NOT released here."""
+    monkeypatch.setattr(app, "_recover_binance_book", stubborn)
+    monkeypatch.setattr(run_collector, "WS_FALLBACK_SLACK_S", 0.05)      # bound waits, not the logic
+    start_task = asyncio.create_task(app.start())
+    await asyncio.wait_for(stubborn.entered.wait(), 10)
+    shutdown_task = asyncio.create_task(app._async_shutdown(signal.SIGTERM))
+    await asyncio.wait_for(shutdown_task, 10)
+    await asyncio.wait_for(stubborn.cancel_swallowed.wait(), 10)
+    for _ in range(50):                      # give start() every loop turn it could use to move on
+        await asyncio.sleep(0)
+    return start_task, shutdown_task
+
+
+@pytest.mark.asyncio
+async def test_while_the_startup_recovery_ignores_cancel_start_is_parked_and_the_failure_is_latched(
+        tmp_path, monkeypatch):
+    """Nothing is released before these assertions."""
+    app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
+    stubborn = _StubbornRecovery()
+    spawned = []
+
+    async def poll():
+        spawned.append("oi_poll")
+        await _quiet()
+    monkeypatch.setattr(app, "_poll_openinterest", poll)
+    monkeypatch.setattr(app.health_monitor, "start", lambda: spawned.append("health_monitor") or _quiet())
+    start_task = shutdown_task = None
+    try:
+        start_task, shutdown_task = await _sigterm_while_stubborn(app, monkeypatch, stubborn)
+        producer = app._startup_recovery_task
+        # shutdown task: finished, without an exception, having latched an explicit non-zero status
+        assert shutdown_task.done() and shutdown_task.exception() is None
+        assert app.shutdown_failure == "rest_producer_not_stopped"
+        assert app.exit_code == run_collector.EXIT_RUN_TASK_CRASHED != 0
+        # the producer received the cancel, ignored it, and is alive
+        assert stubborn.swallowed >= 1 and not producer.done()
+        # the PARENT start() task has NOT returned: it is suspended inside _run_startup_recovery
+        assert not start_task.done()
+        assert "_run_startup_recovery" in _await_chain(start_task), _await_chain(start_task)
+        # ... which is why a runner (asyncio.run) cannot return the latched status: a task still exists
+        assert producer in asyncio.all_tasks()
+        # shutdown did not complete; exactly the storage the producer can reach is still open
+        assert not getattr(app, "_shutdown_done", False)
+        for name in ("raw_rest_writer", "raw_book_writer", "quality_writer"):
+            assert getattr(app, name)._closed is False, f"{name} closed beneath a live startup recovery"
+        assert not getattr(app, "_quality_wal_closed", False)
+        assert app.oi_writer._closed and app.trades_writer._closed       # unreachable by that producer
+        # no new producer was started after shutdown began, and every ordinary task is gone
+        assert spawned == [] and app._oi_task is None
+        assert all(t.done() for t in app.tasks)
+        assert app.running is False and app._recovery_closed is True
+    finally:
+        stubborn.release.set()
+        await _drain(app, start_task, shutdown_task)
+
+
+@pytest.mark.asyncio
+async def test_when_the_ignoring_startup_recovery_ends_start_itself_finishes_the_deferred_close(
+        tmp_path, monkeypatch):
+    """The parked start() is what completes shutdown once the producer ends: no manual retry."""
+    app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
+    stubborn = _StubbornRecovery()
+    spawned = []
+
+    async def poll():
+        spawned.append("oi_poll")
+        await _quiet()
+    monkeypatch.setattr(app, "_poll_openinterest", poll)
+    start_task = shutdown_task = None
+    try:
+        start_task, shutdown_task = await _sigterm_while_stubborn(app, monkeypatch, stubborn)
+        assert not start_task.done() and not getattr(app, "_shutdown_done", False)     # state first ...
+        stubborn.release.set()                                                         # ... then release
+        done, _ = await asyncio.wait({start_task}, timeout=10)
+        assert done, "start() never resumed after the producer ended"
+        assert start_task.exception() is None
+        assert getattr(app, "_shutdown_done", False), "start()'s tail did not finish the deferred close"
+        for name in ("raw_rest_writer", "raw_book_writer", "quality_writer", "oi_writer", "trades_writer"):
+            assert getattr(app, name)._closed, f"{name} still open after the producer ended"
+        assert app.shutdown_failure == "rest_producer_not_stopped" and app.exit_code != 0   # still latched
+        assert spawned == [] and app._oi_task is None          # resuming did not start a poller
+    finally:
+        stubborn.release.set()
+        await _drain(app, start_task, shutdown_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", [
+    pytest.param("raises_instead_of_cancelling", id="raises-when-cancelled"),
+    pytest.param("ignores_cancel_then_raises", id="ignores-cancel-then-raises"),
+])
+async def test_a_startup_recovery_that_fails_after_shutdown_began_cannot_skip_the_close(
+        tmp_path, monkeypatch, how):
+    """An exception from the recovery used to propagate out of start() BEFORE its try/finally, so a
+    producer that ended with an error after shutdown began left the storage it had held open for
+    good. The failure is still reported (non-zero status) but start() reaches its tail."""
+    app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_collector, "WS_FALLBACK_SLACK_S", 0.05)
+    entered = asyncio.Event()
+    start_task = shutdown_task = None
+    stubborn = _StubbornRecovery(on_release="raise")
+
+    async def raises_on_cancel(reason):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("cleanup failed after the cancel")
+    try:
+        if how == "ignores_cancel_then_raises":
+            start_task, shutdown_task = await _sigterm_while_stubborn(app, monkeypatch, stubborn)
+            assert not start_task.done()
+            stubborn.release.set()
+        else:
+            monkeypatch.setattr(app, "_recover_binance_book", raises_on_cancel)
+            start_task = asyncio.create_task(app.start())
+            await asyncio.wait_for(entered.wait(), 10)
+            shutdown_task = asyncio.create_task(app._async_shutdown(signal.SIGTERM))
+            await asyncio.wait_for(shutdown_task, 10)
+        done, _ = await asyncio.wait({start_task}, timeout=10)
+        assert done, "start() never returned"
+        assert not start_task.cancelled() and start_task.exception() is None
+        assert getattr(app, "_shutdown_done", False), "writers left open although every producer had ended"
+        assert app.raw_rest_writer._closed and app.raw_book_writer._closed and app.quality_writer._closed
+        assert app.exit_code != 0 and getattr(app, "shutdown_failure", None) is not None   # not hidden
+        assert app._oi_task is None
+    finally:
+        stubborn.release.set()
+        await _drain(app, start_task, shutdown_task)
+
+
+@pytest.mark.asyncio
+async def test_an_exception_outside_shutdown_still_propagates_and_latches_nothing(tmp_path, monkeypatch):
+    app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
+
+    async def boom(reason):
+        raise ValueError("snapshot parse failed")
+    monkeypatch.setattr(app, "_recover_binance_book", boom)
+    start_task = asyncio.create_task(app.start())
+    try:
+        with pytest.raises(ValueError, match="snapshot parse failed"):
+            await asyncio.wait_for(start_task, 10)
+        assert getattr(app, "shutdown_failure", None) is None and not getattr(app, "_recovery_closed", False)
+        assert app._oi_task is None                      # no producer after a failed startup either
+    finally:
+        await _drain(app, start_task)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_startup_recovery_that_is_not_a_shutdown_does_not_let_startup_continue(
+        tmp_path, monkeypatch):
+    """Before this PR the inline await let a CancelledError from the recovery cancel start(). A task
+    that merely ended 'cancelled' must not be read as 'recovery finished' unless shutdown began."""
+    app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
+    spawned = []
+
+    async def poll():
+        spawned.append("oi_poll")
+        await _quiet()
+    monkeypatch.setattr(app, "_poll_openinterest", poll)
+
+    async def cancelled_for_its_own_reasons(reason):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(app, "_recover_binance_book", cancelled_for_its_own_reasons)
+    start_task = asyncio.create_task(app.start())
+    try:
+        done, _ = await asyncio.wait({start_task}, timeout=10)
+        assert done and start_task.cancelled(), "start() carried on after its recovery was cancelled"
+        assert spawned == [] and app._oi_task is None and not getattr(app, "_recovery_closed", False)
+    finally:
+        await _drain(app, start_task)
+
+
+@pytest.mark.asyncio
+async def test_no_startup_recovery_task_is_created_when_shutdown_began_before_it(tmp_path, monkeypatch):
+    app = _app_with_stubbed_neighbours(tmp_path, monkeypatch)
+    gate, calls = asyncio.Event(), []
+    app.ws_clients = [_FakeWs(gate)]
+
+    async def recover(reason):
+        calls.append(reason)
+    monkeypatch.setattr(app, "_recover_binance_book", recover)
+    start_task = asyncio.create_task(app.start())
+    try:
+        while len(app.tasks) < 3:                               # start() is parked in wait_connected
+            await asyncio.sleep(0)
+        await asyncio.wait_for(asyncio.create_task(app._async_shutdown(signal.SIGTERM)), 10)
+        gate.set()                                              # start() resumes AFTER shutdown began
+        done, _ = await asyncio.wait({start_task}, timeout=10)
+        assert done and start_task.exception() is None
+        assert calls == [] and app._startup_recovery_task is None and app._oi_task is None
+    finally:
+        gate.set()
+        await _drain(app, start_task)

@@ -1732,9 +1732,11 @@ class CollectorApp:
             self._oi_task = asyncio.create_task(self._poll_openinterest())
             self.tasks.append(self._oi_task)
             self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
-        # else: shutdown began while start() was still starting up. Every REST producer has been (or
-        # is being) cancelled and writers are being closed, so nothing new may be started; the
-        # gather below returns at once on the cancelled tasks and the finally block finishes.
+        # else: shutdown began while start() was still starting up, so nothing new may be started.
+        # start() only gets here once the startup recovery TASK has ended. A recovery that swallows
+        # its cancel keeps start() parked inside _run_startup_recovery(): _async_shutdown has by then
+        # latched the failure and left that producer's storage open, and it is this tail that
+        # finishes the close once the producer ends (see _run_startup_recovery).
         try:
             await asyncio.gather(*self.tasks)
         except asyncio.CancelledError:
@@ -1789,9 +1791,26 @@ class CollectorApp:
         flight and the late response was captured into a closed writer. The producer's whole
         lifetime is the task's lifetime, so ``_rest_producers_stopped()`` can now prove it.
 
-        Behaviour outside shutdown is unchanged: start() still waits for the recovery to finish and
-        an exception from it still propagates out of start().
+        Outcomes (``_recovery_closed`` is set by every shutdown path before it cancels anything):
+
+        * shutdown already began      -> no task is created: no producer starts after shutdown began.
+        * finishes normally           -> returns; start() goes on to start the other tasks.
+        * raises, shutdown NOT begun  -> the exception propagates out of start(), as the inline await did.
+        * cancelled, shutdown NOT begun -> CancelledError propagates, as the inline await did; a
+          cancelled task is only read as "stopped by shutdown" when shutdown actually began.
+        * cancelled / raises after shutdown began -> returns, so start() reaches its tail (it starts
+          nothing: ``_recovery_closed``). An error is logged and latched as a shutdown failure
+          (non-zero status) rather than raised, because raising here would skip that tail.
+        * start() itself cancelled    -> the producer is cancelled and awaited, then CancelledError.
+        * IGNORES its cancel          -> this wait does not end. start() stays parked here and so does
+          any runner (``asyncio.run``) around it; ``_async_shutdown`` has already latched
+          ``rest_producer_not_stopped`` and ``shutdown()`` keeps open exactly the storage the producer
+          can reach. When the producer does end, start() resumes and its tail finishes the close. The
+          application cannot stop such a coroutine; see docs/DEPLOYMENT.md "A REST producer that
+          ignores cancellation". The wait is deliberately NOT bounded: that tail is the only later retry.
         """
+        if getattr(self, "_recovery_closed", False):
+            return
         task = asyncio.create_task(self._recover_binance_book("startup"))
         self._startup_recovery_task = task
         try:
@@ -1800,8 +1819,17 @@ class CollectorApp:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             raise
-        if not task.cancelled():
-            task.result()                   # re-raise exactly what the inline await raised
+        shutting_down = getattr(self, "_recovery_closed", False)
+        if task.cancelled():
+            if not shutting_down:
+                raise asyncio.CancelledError()
+            return
+        error = task.exception()
+        if error is not None and shutting_down:
+            logger.error("startup_recovery_failed_during_shutdown", error=f"{type(error).__name__}: {error}")
+            self._record_shutdown_failure("startup_recovery_failed_during_shutdown")
+            return
+        task.result()                       # re-raise exactly what the inline await raised
 
     def _rest_producer_tasks(self):
         """Every task that can reach ``raw_rest_writer`` / ``oi_writer`` (REST capture)."""
