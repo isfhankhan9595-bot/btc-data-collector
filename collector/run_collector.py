@@ -1759,9 +1759,23 @@ class CollectorApp:
             self._recovery_closed = True
             try:
                 try:
-                    if self._recovery_task is not None and not self._recovery_task.done():
-                        self._recovery_task.cancel()
-                        await asyncio.gather(self._recovery_task, return_exceptions=True)
+                    recovery = self._recovery_task
+                    if recovery is not None and not recovery.done():
+                        recovery.cancel()
+                        # Bounded, like _async_shutdown and _stop_rest_producers: a recovery that
+                        # swallows its cancel must not hold this finalizer (and so shutdown())
+                        # hostage. Whether it ended is judged later by
+                        # _storage_held_by_rest_producers(), never assumed from this wait returning:
+                        # a survivor stays tracked, shutdown() keeps its reachable storage open,
+                        # latches rest_producer_not_stopped and arms the late retry.
+                        await asyncio.wait({recovery}, timeout=WS_FALLBACK_SLACK_S)
+                        if not recovery.done():
+                            logger.error("recovery_task_ignored_cancel", bound_s=WS_FALLBACK_SLACK_S)
+                    if recovery is not None and recovery.done() and not recovery.cancelled():
+                        error = recovery.exception()   # retrieved, never "never retrieved"; not a clean-up
+                        if error is not None:
+                            logger.error("recovery_task_failed_during_shutdown",
+                                         error=f"{type(error).__name__}: {error}")
                 except Exception as exc:  # noqa: BLE001
                     logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
                 self._drain_integrity_quality_events_safely()
