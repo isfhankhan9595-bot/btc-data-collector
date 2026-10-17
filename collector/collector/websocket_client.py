@@ -1094,8 +1094,6 @@ class WebSocketClient:
             return
 
         if self._on_message_takes_connection:
-            import dataclasses as _dc
-            item = _dc.replace(item, local_receive_ts=capture_receive_stamp().wall_ms)
             await self.on_message(item.data, item.local_receive_ts, connection_id=item.connection_id)
         else:
             await self.on_message(item.data, item.local_receive_ts)
