@@ -145,8 +145,11 @@ What it does not control:
   quality events). Nothing in the code guarantees that shutdown completes within 60 s; the bounds in
   the next table cover the websocket part only.
 - The late retry only runs while the event loop does. If the process is killed first, nothing runs.
-  It also does not retire a websocket worker that is still alive (`ws_client_worker_not_retired`
-  has its own, separate retry condition).
+  It does not retire a websocket worker: it cannot make a worker that ignores cancellation end. It
+  only reacts when one ends. Each client's `start()` task and live ingest worker carry the same
+  done-callback, which retries `shutdown()` only once every websocket client is idle
+  (`lifecycle_idle`), every REST producer has ended and the quality loop has ended. A late close after
+  `ws_client_worker_not_retired` keeps that failure latched (non-zero status): it is not a clean shutdown.
 
 ### Stop budget vs `TimeoutStopSec=60`
 
@@ -192,7 +195,11 @@ against a live exchange, under power loss, or within the 60 s stop budget.
   advances only then. "Drained" is therefore not "durable".
 - A websocket worker that is still alive when `shutdown()` runs (`ws_client_worker_not_retired`) leaves the
   queue undrained and the quality writer and WAL open. The events are WAL-retained and replayed at the
-  next start; nothing retries this by itself (see above).
+  next start. If that worker ends later while the process is still running, the late retry (see above)
+  finalises the held writers and then the WAL; if it never ends, they stay open until process-level
+  termination, which cannot guarantee that buffered Parquet segments are finalised. Not changed or
+  tested here: the standalone Spot/Bybit/OKX runners, which have their own `shutdown()` and no
+  late-finalization callback for a worker that ends after it returned.
 - A quality-writer failure that the loop survives (`quality_checkpoint_blocked`) does not change the exit
   status: the events stay in the WAL (replayed, possibly as duplicate rows with the same
   `quality_event_id`). The operator signal is the alert and `quality_channel_status()`.

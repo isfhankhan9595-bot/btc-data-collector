@@ -1738,7 +1738,9 @@ class CollectorApp:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._async_shutdown(s)))
             for ws_client in self.ws_clients:
-                self.tasks.append(asyncio.create_task(ws_client.start()))
+                ws_task = asyncio.create_task(ws_client.start())
+                self.tasks.append(ws_task)
+                self._ws_lifecycle_tasks().append(ws_task)   # a user of the writers until its tail has finished
             for ws_client in self.ws_clients:
                 connected = await ws_client.wait_connected(timeout_seconds=30.0)
                 if not connected:
@@ -2425,23 +2427,46 @@ class CollectorApp:
         consumer = getattr(self, "_quality_task", None)
         if consumer is not None:
             tasks.append(consumer)          # the quality loop is a user of quality_writer / its WAL too
+        tasks.extend(self._ws_lifecycle_live_tasks())   # ... and so is every websocket client's lifecycle
         for task in tasks:
             if not task.done() and task not in armed:
                 armed.add(task)
                 task.add_done_callback(self._on_rest_producer_ended_late)
 
+    def _ws_lifecycle_tasks(self) -> list:
+        """The ``start()`` tasks of the websocket clients, as created by ``start()`` (a list, created lazily)."""
+        return self.__dict__.setdefault("_ws_lifecycle_task_list", [])
+
+    def _ws_lifecycle_live_tasks(self) -> list:
+        """Every websocket task that can still reach storage: each client's ``start()`` task (drain + worker
+        retirement tail) and each client's live ingest worker, which can outlive ``start()``. A client double
+        without ``live_lifecycle_tasks`` has only its ``start()`` task."""
+        live = [t for t in self._ws_lifecycle_tasks() if not t.done()]
+        for client in getattr(self, "ws_clients", ()):
+            getter = getattr(client, "live_lifecycle_tasks", None)
+            if getter is not None:
+                live.extend(t for t in getter() if not t.done())
+        return live
+
     def _on_rest_producer_ended_late(self, task) -> None:
+        """Done-callback shared by every late user of the writers: REST producers, the quality loop and the
+        websocket lifecycle (start() task, ingest worker). It only calls ``shutdown()``, which re-checks every
+        user itself and closes each writer at most once; it never runs while another one is alive."""
         if not task.cancelled():
             error = task.exception()        # retrieved here; reported instead of lost
             if error is not None:
-                logger.error("quality_consumer_failed_after_shutdown_began"
-                             if task is getattr(self, "_quality_task", None)
-                             else "rest_producer_failed_after_shutdown_began",
-                             error=f"{type(error).__name__}: {error}")
+                if task is getattr(self, "_quality_task", None):
+                    event = "quality_consumer_failed_after_shutdown_began"
+                elif task in self._ws_lifecycle_tasks():
+                    event = "ws_lifecycle_task_failed_after_shutdown_began"
+                else:
+                    event = "rest_producer_failed_after_shutdown_began"
+                logger.error(event, error=f"{type(error).__name__}: {error}")
         if getattr(self, "_shutdown_done", False) or not getattr(self, "_closed", False):
             return
-        if not self._rest_producers_stopped() or not self._quality_consumer_stopped():
-            return                          # another producer / the quality loop is alive: ITS end retries
+        if not self._rest_producers_stopped() or not self._quality_consumer_stopped() or not self._ws_clients_idle():
+            return                          # another user (REST producer, quality loop, websocket client) is alive:
+                                            # ITS end retries; shutdown() would only re-latch and keep storage open
         logger.info("late_shutdown_retry", reason="rest_producer_ended_after_shutdown")
         self._shutdown_step("late_shutdown_retry", self.shutdown)
 

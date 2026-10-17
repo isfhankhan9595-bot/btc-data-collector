@@ -760,6 +760,14 @@ class WebSocketClient:
                 sleeper.cancel()
                 await asyncio.gather(sleeper, return_exceptions=True)
 
+    def live_lifecycle_tasks(self) -> list:
+        """Tasks that keep ``lifecycle_idle`` False without being the ``start()`` task itself: the ingest
+        worker while it is alive. A worker that survived its bounded retirement outlives ``start()``, so
+        its end is the only event that makes the client idle again; a caller that must act then (the
+        runner's late finalization) registers a done-callback on it. Empty when nothing is alive."""
+        worker = self._worker_task
+        return [worker] if worker is not None and not worker.done() else []
+
     @property
     def worker_active(self) -> bool:
         """True while an ingest worker task exists and has not ended."""
@@ -1086,6 +1094,8 @@ class WebSocketClient:
             return
 
         if self._on_message_takes_connection:
+            import dataclasses as _dc
+            item = _dc.replace(item, local_receive_ts=capture_receive_stamp().wall_ms)
             await self.on_message(item.data, item.local_receive_ts, connection_id=item.connection_id)
         else:
             await self.on_message(item.data, item.local_receive_ts)
