@@ -119,6 +119,18 @@ What the application controls:
 - If a producer that outlived `shutdown()` ends later, a done-callback retries `shutdown()`: it
   drains the quality queue, closes the remaining writers once each, then `quality_writer`, then the
   WAL. A late close is not a clean shutdown: the latched status stays non-zero.
+- The quality persistence loop is waited for within fixed bounds, never without a deadline
+  (`_stop_quality_consumer`, used by `start()`'s finalization and by `_async_shutdown`): up to
+  `QUALITY_DRAIN_BOUND_S` (1 s) for it to hand every queued event to the quality writer, up to
+  `QUALITY_CONSUMER_STOP_BOUND_S` (0.5 s) for it to leave on its own, then it is told to leave and
+  cancelled (`WS_FALLBACK_SLACK_S`, 1 s). A timeout is logged (`quality_queue_drain_incomplete`), never
+  read as a completed drain, and loses no event: every queued event already has a WAL record that holds
+  the checkpoint back, `shutdown()` drains what is left synchronously once no websocket client can still
+  enqueue, and anything not drained stays in the WAL for the next start. A loop that still has not ended
+  is a user of the quality writer like a REST producer: `shutdown()` keeps that writer and the WAL open,
+  closes everything else, latches `quality_consumer_not_stopped` (status 1) and the late retry finalizes
+  both once the loop ends. The loop's own exception is logged and never replaces the caller's
+  cancellation or the original exception of `start()`.
 
 What it does not control:
 
@@ -149,9 +161,16 @@ What it does not control:
 | **bounded websocket part, worst case** | **53 s** | |
 | left for everything else | **7 s** (`FINALIZATION_RESERVE_S`) | |
 
-The "everything else" is NOT bounded by code and has not been measured: the quality-queue
-drain, finalization (flush, fsync, rename, directory fsync) of about ten Parquet writers, the
-WAL close and interpreter teardown. 7 s is the arithmetic remainder, not a demonstrated
+The "everything else" is NOT bounded by code and has not been measured: finalization (flush,
+fsync, rename, directory fsync) of about ten Parquet writers, the WAL close and interpreter
+teardown. The one wait inside it that has a code bound is the stop of the quality persistence
+loop: at most `QUALITY_DRAIN_BOUND_S` + `QUALITY_CONSUMER_STOP_BOUND_S` + `WS_FALLBACK_SLACK_S`
+= 2.5 s, reached only when the loop is stalled, dead or outpaced (normally milliseconds), and
+chosen, not measured on the host. It is spent BEFORE the websocket stop, so it comes out of the
+7 s reserve. A full-queue drain through a slow `fsync` can exceed `QUALITY_DRAIN_BOUND_S`
+(1000 queued events took about 2.3 s on the development sandbox, two segment publishes; that is
+not host data): the drain then finishes in `shutdown()`'s synchronous pass instead, with the same
+total work. 7 s is the arithmetic remainder, not a demonstrated
 sufficient margin. A test fails if any client timeout is raised without raising
 `TimeoutStopSec`. Measure writer finalization on the real host before relying on it; if it
 can exceed ~7 s, lower `shutdown_drain_timeout_s` (30 s -> 20 s buys 10 s) rather than
@@ -159,6 +178,29 @@ raising `TimeoutStopSec`.
 
 The standalone runners (Spot, Bybit, OKX) have no systemd unit in this repository, so no
 stop budget is defined for them. Their wait for the client is the same 47 s bound.
+
+### Quality queue: verified limitations
+
+Reproduced with `tests/test_quality_queue_shutdown_bounds.py` (real `start()` / `_async_shutdown()` /
+`shutdown()`, only the network edge and the websocket clients faked) -- not verified on a live host,
+against a live exchange, under power loss, or within the 60 s stop budget.
+
+- Only websocket-client events use the queue (`_websocket_quality_event`). Events from REST producers
+  and handlers are persisted synchronously and never queued.
+- `task_done()` means the loop handled the event (handed it to the quality writer), not that it is in a
+  published segment: publication happens at 500 rows, 30 s idle or writer close, and the WAL checkpoint
+  advances only then. "Drained" is therefore not "durable".
+- A websocket worker that is still alive when `shutdown()` runs (`ws_client_worker_not_retired`) leaves the
+  queue undrained and the quality writer and WAL open. The events are WAL-retained and replayed at the
+  next start; nothing retries this by itself (see above).
+- A quality-writer failure that the loop survives (`quality_checkpoint_blocked`) does not change the exit
+  status: the events stay in the WAL (replayed, possibly as duplicate rows with the same
+  `quality_event_id`). The operator signal is the alert and `quality_channel_status()`.
+- If the loop is cancelled or dies, the `quality_queue_overflow:total=...` summary row it writes on exit is
+  not written. The overflowed events themselves were each persisted directly (or WAL-retained); only the
+  aggregate record is skipped.
+- Nothing can bound a loop that blocks the event loop itself (a synchronous call that never returns):
+  every deadline here is an event-loop timer.
 
 ## Telegram credentials
 

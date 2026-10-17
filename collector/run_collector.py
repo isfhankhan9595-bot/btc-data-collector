@@ -64,6 +64,16 @@ STREAM_INACTIVE_STARTUP_SECONDS = 60
 #: (``worker_retire_timeout_s`` + this). Part of the shutdown budget (see
 #: websocket_client.FINALIZATION_RESERVE_S).
 WS_FALLBACK_SLACK_S = 1.0
+#: Deadlines for the quality persistence loop's part of shutdown (``_stop_quality_consumer``). They come
+#: out of the "everything else" reserve in docs/DEPLOYMENT.md, are chosen here, and are NOT measured on
+#: the production host. The quality queue is telemetry: waiting on it must never stand between a stop
+#: request and the finalization of the market-data writers. A timeout loses nothing: every queued event
+#: already has a WAL record, ``shutdown()`` drains what is left synchronously, and an event nobody drained
+#: stays in the WAL for the next start.
+#:   QUALITY_DRAIN_BOUND_S          wait for the loop to hand every queued event to the writer
+#:   QUALITY_CONSUMER_STOP_BOUND_S  then, after asking it to stop, wait for it to end before cancelling it
+QUALITY_DRAIN_BOUND_S = 1.0
+QUALITY_CONSUMER_STOP_BOUND_S = 0.5
 
 #: Storage each REST producer can still write, from tracing the producer's coroutine through
 #: every method it calls (tests/test_ws_rest_producer_reach.py recomputes this with an AST
@@ -139,6 +149,7 @@ class CollectorApp:
             quality_sink=self._emit_quality_event)
         self._quality_queue = asyncio.Queue(maxsize=1024)
         self._quality_task = None
+        self._quality_loop_stop = False   # set by _stop_quality_consumer: leave the loop even if events are queued
         self._quality_overflow = 0
 
         # P0-3: batched (was segment_rows=1 / segment_seconds=1 = one Parquet
@@ -959,10 +970,11 @@ class CollectorApp:
 
     async def _quality_persistence_loop(self):
         """Drain the queue into Parquet. Must survive any single bad event: a
-        dead loop leaves the queue undrained and makes shutdown's
-        queue.join() hang. Checkpointing is NOT done here -- it happens only
+        dead loop leaves the queue undrained (shutdown no longer waits for it
+        without a deadline -- _stop_quality_consumer -- and drains what is
+        left synchronously). Checkpointing is NOT done here -- it happens only
         in _on_quality_segment_durable, after a segment is published."""
-        while self.running or not self._quality_queue.empty():
+        while (self.running or not self._quality_queue.empty()) and not getattr(self, "_quality_loop_stop", False):
             try:
                 event = await asyncio.wait_for(self._quality_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
@@ -1780,21 +1792,15 @@ class CollectorApp:
                     logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
                 self._drain_integrity_quality_events_safely()
                 try:
-                    # join() only returns once a CONSUMER has marked every item done. After a
-                    # controlled shutdown the persistence loop has already exited, and when
-                    # shutdown() took its fail-closed branch it did not drain the queue
-                    # either, so with no live consumer this wait could never end and the
-                    # process would sit until systemd's SIGKILL instead of exiting non-zero.
-                    if self._quality_task is not None and not self._quality_task.done():
-                        await self._quality_queue.join()
+                    # Bounded (see _stop_quality_consumer): the wait for the persistence loop used to be
+                    # unbounded and ended only if a live loop kept finishing events -- not when it died
+                    # while join() waited, stalled, or (3.11) was outpaced by a live producer. Nothing
+                    # here is raised out of the finalization: the caller's cancellation or the original
+                    # exception must stay what start() ends with.
+                    await self._stop_quality_consumer(drain=True)
                 except Exception as exc:  # noqa: BLE001
-                    logger.error("shutdown_quality_queue_join_failed", error=f"{type(exc).__name__}: {exc}")
+                    logger.error("shutdown_quality_consumer_stop_failed", error=f"{type(exc).__name__}: {exc}")
                 self.running = False
-                try:
-                    if self._quality_task is not None:
-                        await self._quality_task
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("shutdown_quality_task_failed", error=f"{type(exc).__name__}: {exc}")
             finally:
                 try:
                     # Same ordering as _async_shutdown: clients retire first.
@@ -1997,6 +2003,84 @@ class CollectorApp:
             raise RuntimeError(msg)
         logger.info("Startup stream verification passed", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
 
+    def _quality_consumer_stopped(self) -> bool:
+        """True when no quality persistence loop can still write ``quality_writer`` or its WAL: none was
+        started, or it has ended (cleanly, with an exception, or cancelled)."""
+        task = getattr(self, "_quality_task", None)
+        return task is None or task.done()
+
+    async def _stop_quality_consumer(self, *, drain: bool) -> bool:
+        """End the quality persistence loop within fixed bounds. True only when it has ended.
+
+        The loop used to be waited for without a deadline (``queue.join()`` and ``await _quality_task``,
+        in ``start()``'s finalization and in ``_async_shutdown``), before any websocket client was asked to
+        stop and before any writer was closed. Three things reproduced a wait that never ends, each leaving
+        every writer -- market data included -- unclosed and the exit status unlatched until systemd's
+        SIGKILL: the loop dying while ``join()`` waited (the ``done()`` check was made once, before the
+        wait); a loop that is alive but not finishing events; and, on Python 3.11, a producer that keeps
+        emitting so the queue never empties (``wait_for`` costs the loop about three event-loop turns per
+        event there; 3.12 never yields while events are queued, so it did not show on 3.12 -- scheduling,
+        not a guarantee). The quality queue is telemetry and cannot stand in front of that finalization.
+
+        Sequence, each wait bounded:
+
+        1. drain: ``drain=True`` waits until the loop has marked every queued event done OR the loop ended,
+           at most ``QUALITY_DRAIN_BOUND_S``; ``drain=False`` (``_async_shutdown``) only waits for the
+           loop to end by itself. A timeout is reported (``quality_queue_drain_incomplete``), never read as
+           success.
+        2. ``running`` is cleared; the loop gets ``QUALITY_CONSUMER_STOP_BOUND_S`` to leave on its own.
+        3. Still alive: the loop is told to leave even though events are queued, and is cancelled
+           (``WS_FALLBACK_SLACK_S``). Cancelling loses nothing: its only await is ``queue.get()`` (an event
+           it has not taken stays queued; one it has taken is handled before its next await).
+        4. Still alive after that: it can still write the quality writer, so ``shutdown()`` keeps that
+           writer and its WAL open (see there), the failure ``quality_consumer_not_stopped`` is latched
+           (non-zero ``exit_code``) and the late retry finalizes them when the loop does end.
+
+        Events left in the queue are not dropped by a timeout or a stop: each has a WAL record and holds
+        the checkpoint back, ``shutdown()`` drains them synchronously once no producer can still enqueue,
+        and ones nobody drains stay in the WAL for the next start. The loop's own failure (an exception, or
+        a ``BaseException`` that killed it) is read from the task and logged, never re-raised here: raising
+        it out of a ``finally`` would replace the caller's cancellation or the original exception.
+        ``CancelledError`` of the CURRENT task is not caught.
+        """
+        consumer = getattr(self, "_quality_task", None)
+        if consumer is None:
+            self.running = False
+            return True
+        if not consumer.done():
+            if drain:
+                joiner = asyncio.ensure_future(self._quality_queue.join())
+                try:
+                    await asyncio.wait({joiner, consumer}, timeout=QUALITY_DRAIN_BOUND_S,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                    drained = joiner.done()
+                finally:
+                    if not joiner.done():
+                        joiner.cancel()
+                if not drained and not consumer.done():
+                    logger.error("quality_queue_drain_incomplete", bound_s=QUALITY_DRAIN_BOUND_S,
+                                 queued=self._quality_queue.qsize())
+            else:
+                self.running = False
+                await asyncio.wait({consumer}, timeout=QUALITY_DRAIN_BOUND_S)
+        self.running = False
+        if not consumer.done():
+            await asyncio.wait({consumer}, timeout=QUALITY_CONSUMER_STOP_BOUND_S)
+        if not consumer.done():
+            logger.error("quality_consumer_stop_timeout_cancelling", queued=self._quality_queue.qsize())
+            self._quality_loop_stop = True
+            consumer.cancel()
+            await asyncio.wait({consumer}, timeout=WS_FALLBACK_SLACK_S)
+        if not consumer.done():
+            logger.error("quality_consumer_not_stopped", queued=self._quality_queue.qsize())
+            self._record_shutdown_failure("quality_consumer_not_stopped")
+            return False
+        if not consumer.cancelled():
+            error = consumer.exception()            # retrieved here; never raised into the caller
+            if error is not None:
+                logger.error("shutdown_quality_task_failed", error=f"{type(error).__name__}: {error}")
+        return True
+
     async def _stop_ws_clients(self) -> bool:
         """Request every websocket client's shutdown and wait (bounded) for it to
         finish: receive loop ended, ingest queue drained, worker retired.
@@ -2078,10 +2162,11 @@ class CollectorApp:
                 logger.error("shutdown_recovery_cancel_failed", error=f"{type(exc).__name__}: {exc}")
             self._drain_integrity_quality_events_safely()
             try:
-                if self._quality_task is not None:
-                    await self._quality_task
+                # Bounded for the same reason as in start(): this wait precedes _stop_ws_clients() and
+                # shutdown(), and a producer that keeps the queue non-empty kept the loop alive forever.
+                await self._stop_quality_consumer(drain=False)
             except Exception as exc:  # noqa: BLE001
-                logger.error("shutdown_quality_task_failed", error=f"{type(exc).__name__}: {exc}")
+                logger.error("shutdown_quality_consumer_stop_failed", error=f"{type(exc).__name__}: {exc}")
         finally:
             try:
                 try:
@@ -2269,6 +2354,16 @@ class CollectorApp:
         if rest_unproven:
             self._record_shutdown_failure("rest_producer_not_stopped")
             logger.error("shutdown_storage_left_open_rest_producer_alive", held=sorted(held))
+        if not self._quality_consumer_stopped():
+            # The quality persistence loop is a user of quality_writer and its WAL exactly like a REST
+            # producer, and a shutdown that could not end it (_stop_quality_consumer, or no caller got
+            # that far) must not close either beneath it: it would write a closed writer, and a WAL
+            # closed under the publish hook cannot checkpoint. Everything it cannot reach is finalized
+            # above/below as usual. Events not yet published stay in the WAL (the recovery source) and
+            # the next start replays them. The late retry (armed above) finalizes both once it ends.
+            held = held | frozenset({"quality_writer", "quality_wal"})
+            self._record_shutdown_failure("quality_consumer_not_stopped")
+            logger.error("shutdown_quality_writer_left_open_consumer_alive")
         for writer_name in ("ob_writer", "raw_book_writer", "trades_writer", "raw_trades_writer",
                             "mark_writer", "oi_writer", "liq_writer", "raw_wire_writer", "raw_rest_writer"):
             if writer_name in held:
@@ -2326,7 +2421,11 @@ class CollectorApp:
         not a clean shutdown (``exit_code`` stays non-zero).
         """
         armed = self.__dict__.setdefault("_late_retry_armed", set())
-        for task in self._rest_producer_tasks():
+        tasks = list(self._rest_producer_tasks())
+        consumer = getattr(self, "_quality_task", None)
+        if consumer is not None:
+            tasks.append(consumer)          # the quality loop is a user of quality_writer / its WAL too
+        for task in tasks:
             if not task.done() and task not in armed:
                 armed.add(task)
                 task.add_done_callback(self._on_rest_producer_ended_late)
@@ -2335,12 +2434,14 @@ class CollectorApp:
         if not task.cancelled():
             error = task.exception()        # retrieved here; reported instead of lost
             if error is not None:
-                logger.error("rest_producer_failed_after_shutdown_began",
+                logger.error("quality_consumer_failed_after_shutdown_began"
+                             if task is getattr(self, "_quality_task", None)
+                             else "rest_producer_failed_after_shutdown_began",
                              error=f"{type(error).__name__}: {error}")
         if getattr(self, "_shutdown_done", False) or not getattr(self, "_closed", False):
             return
-        if not self._rest_producers_stopped():
-            return                          # another producer is alive: ITS end retries
+        if not self._rest_producers_stopped() or not self._quality_consumer_stopped():
+            return                          # another producer / the quality loop is alive: ITS end retries
         logger.info("late_shutdown_retry", reason="rest_producer_ended_after_shutdown")
         self._shutdown_step("late_shutdown_retry", self.shutdown)
 
