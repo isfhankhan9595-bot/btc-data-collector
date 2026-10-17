@@ -790,7 +790,10 @@ def test_typed_fatal_branches_precede_the_generic_exception_handlers():
         return source.index(typed) < source.index(generic)
     assert order(_source(WebSocketClient._process_queue), "except FatalStorageError", "except Exception")
     assert order(_source(WebSocketClient._consume), "except FatalStorageError", "except Exception as exc")
-    assert order(_source(WebSocketClient.start), "except FatalStorageError", "except Exception as e:\n")
+    # The connection loop (and its handlers) moved from start() into _run_connection_loop()
+    # when start() gained its try/finally shutdown tail; the property is asserted on the code
+    # that now holds those handlers.
+    assert order(_source(WebSocketClient._run_connection_loop), "except FatalStorageError", "except Exception as e:\n")
     assert order(_source(RawCapture.capture_wire), "except FatalStorageError", "except Exception")
     assert order(_source(RawCapture.capture_rest), "except FatalStorageError", "except Exception")
     assert order(_source(rc.CollectorApp._handle_liquidation), "except FatalStorageError", "except Exception")

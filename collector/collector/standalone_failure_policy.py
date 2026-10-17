@@ -49,11 +49,12 @@ from .failure_topology import (
 )
 from .storage_errors import FatalStorageError
 from .utils import logger, send_telegram_alert
+from .websocket_client import WorkerRetirementError
 
 __all__ = [
     "EXIT_FATAL_STORAGE", "EXIT_RUN_TASK_CRASHED", "SHUTDOWN_TASK_TIMEOUT_S",
     "DEDUP_DEFAULT_STREAM", "ROUTE_TAG_ATTRIBUTE", "tag_route", "build_stream_table",
-    "StandaloneFailurePolicy", "supervise_standalone_runner",
+    "StandaloneFailurePolicy", "supervise_standalone_runner", "await_client_idle", "cancel_and_wait", "REST_PRODUCER_CANCEL_BOUND_S",
     "NO_QUALITY_WAL_NOTE", "UNCONFIRMED_QUALITY_EVENT_NOTE", "is_bounded_report_point",
     "DegradedQualityLossReporting",
 ]
@@ -158,12 +159,26 @@ class StandaloneFailurePolicy:
         #: Set the moment a TERMINATE verdict latches; the supervisor waits on it.
         self.terminal_event = asyncio.Event()
         self._reporting = False
+        #: First explicit shutdown failure (a websocket ingest worker that could
+        #: not be retired). Distinct from ``terminal_failure``: no storage verdict
+        #: was reached, but a shutdown that could not run its ordering must never
+        #: exit 0.
+        self.shutdown_failure: Optional[str] = None
+
+    def record_shutdown_failure(self, reason: str) -> None:
+        """Latch a terminal shutdown failure (first reason wins). Never raises."""
+        if self.shutdown_failure is None:
+            self.shutdown_failure = reason
+        logger.error("runner_shutdown_terminal_failure", venue=self.venue, reason=reason,
+                     exit_status=EXIT_RUN_TASK_CRASHED)
 
     # -- classification ------------------------------------------------------
 
     @property
     def exit_code(self) -> int:
-        return EXIT_FATAL_STORAGE if self.terminal_failure is not None else 0
+        if self.terminal_failure is not None:
+            return EXIT_FATAL_STORAGE
+        return EXIT_RUN_TASK_CRASHED if self.shutdown_failure is not None else 0
 
     def on_fatal(self, exc: BaseException, origin: str = "handler", *,
                  route: Optional[str] = None) -> str:
@@ -408,6 +423,34 @@ class DegradedQualityLossReporting:
             pass
 
 
+async def await_client_idle(client: Any, policy: "StandaloneFailurePolicy") -> bool:
+    """Wait (bounded) until ``client`` can no longer touch storage.
+
+    Call it AFTER ``client.stop()`` and BEFORE closing any writer the client's
+    ingest worker or callbacks can reach. ``stop()`` only requests the shutdown;
+    the receive loop, the queue drain and the worker's retirement all happen in
+    the client's own ``start()`` task, which the supervisor does not cancel until
+    ``shutdown()`` has returned -- so closing writers straight after ``stop()``
+    put storage beneath a still-live worker. Returns False (and latches an
+    explicit ``shutdown_failure`` on ``policy``, which makes the exit status
+    non-zero) when the client is not idle within its own documented bound; the
+    caller must then NOT close those writers. A client double without
+    ``wait_stopped`` counts as idle. Never raises.
+    """
+    waiter = getattr(client, "wait_stopped", None)
+    if waiter is None:
+        return True
+    try:
+        idle = bool(await waiter(getattr(client, "shutdown_deadline_s", 60.0)))
+    except Exception as exc:  # noqa: BLE001 - a broken wait must fail CLOSED, not skip the check
+        logger.error("runner_client_wait_failed", venue=policy.venue,
+                     error=f"{type(exc).__name__}: {exc}")
+        idle = False
+    if not idle:
+        policy.record_shutdown_failure("ws_client_worker_not_retired")
+    return idle
+
+
 async def _bounded_wait(task: "asyncio.Future[Any]", timeout: float, what: str) -> None:
     """Wait for ``task`` without ever blocking forever, and retrieve its outcome
     so it can never become an unobserved background task."""
@@ -416,6 +459,29 @@ async def _bounded_wait(task: "asyncio.Future[Any]", timeout: float, what: str) 
     done, _ = await asyncio.wait({task}, timeout=timeout)
     if not done:
         logger.error("runner_task_did_not_stop_in_time", task=what, timeout_s=timeout)
+
+
+#: How long a runner waits for a REST producer (book-recovery task) to end after cancelling it. The
+#: same bound as run_collector.WS_FALLBACK_SLACK_S (tests/test_ws_rest_producer_reach.py asserts the
+#: two stay equal). A producer that outlives it is reported, never assumed gone.
+REST_PRODUCER_CANCEL_BOUND_S = 1.0
+
+
+async def cancel_and_wait(task: "Optional[asyncio.Future[Any]]", timeout: float, what: str) -> bool:
+    """Cancel ``task`` and wait (at most ``timeout``) for it; True iff it has ended.
+
+    Built on ``_bounded_wait`` so the existing "did not stop in time" logging is reused. It
+    never swallows a cancellation of the CALLER (``asyncio.wait`` re-raises it), and it never
+    returns True for a task that is still running -- a cancellation-resistant producer is the
+    caller's to report."""
+    if task is None:
+        return True
+    if not task.done():
+        task.cancel()
+        await _bounded_wait(task, timeout, what)
+    if task.done() and not task.cancelled():
+        task.exception()                    # mark retrieved: never an unobserved background failure
+    return task.done()
 
 
 async def supervise_standalone_runner(app: Any, stop: asyncio.Event, *,
@@ -489,7 +555,9 @@ async def supervise_standalone_runner(app: Any, stop: asyncio.Event, *,
             elif late is not None:
                 logger.error("runner_task_failed_during_shutdown", venue=policy.venue,
                              error=f"{type(late).__name__}: {late}")
+                if isinstance(late, WorkerRetirementError):
+                    policy.record_shutdown_failure("ws_client_worker_not_retired")
         await asyncio.gather(stop_task, terminal_task, return_exceptions=True)
     if policy.terminal_failure is not None:
         return EXIT_FATAL_STORAGE
-    return EXIT_RUN_TASK_CRASHED if crashed else 0
+    return EXIT_RUN_TASK_CRASHED if (crashed or policy.shutdown_failure is not None) else 0

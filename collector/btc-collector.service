@@ -39,8 +39,10 @@ RestartSec=5
 # storage), and Restart=always still applies to every other exit.
 RestartPreventExitStatus=69
 # The collector handles SIGTERM itself (asyncio signal handler). Stop must
-# outlast the websocket ingest-queue drain (30 s, websocket_client.start)
-# plus quality-queue flush and Parquet close, or systemd SIGKILLs mid-flush.
+# outlast the websocket client's bounded shutdown (47 s graceful: close handshake
+# 10+2, ingest-queue drain 30, worker retirement 5; +6 s hard-cancel fallback = 53 s)
+# plus quality-queue flush and Parquet finalization (NOT bounded by code, ~7 s left),
+# or systemd SIGKILLs mid-flush. See docs/DEPLOYMENT.md "Stop budget".
 KillSignal=SIGTERM
 TimeoutStopSec=60
 # Nothing here needs privilege escalation.
