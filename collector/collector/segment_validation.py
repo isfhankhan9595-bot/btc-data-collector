@@ -30,6 +30,7 @@ from .marker_validation import (
 from .source_catalog import (
     RAW_DIRNAME,
     DiscoveryResult,
+    MarkerPresence,
     SourceRecord,
     TrustState,
     _resolve_root,
@@ -103,10 +104,22 @@ def _marker_evidence(rec: SourceRecord, marker: MarkerValidation):
     """Only validated schema-2 marker content is a usable declaration."""
     if marker.status is not MarkerValidationStatus.VALID_V2:
         return None
+    if marker.marker_presence is not MarkerPresence.REGULAR_FILE:
+        raise ValueError(
+            f"VALID_V2 marker for {rec.relative_path!r} has inconsistent marker presence"
+        )
+    if "MARKER_SCHEMA_2_VALID" not in marker.reasons:
+        raise ValueError(
+            f"VALID_V2 marker for {rec.relative_path!r} lacks schema-validation evidence"
+        )
     evidence = marker.evidence
     if evidence is None:
         raise ValueError(
             f"VALID_V2 marker for {rec.relative_path!r} is missing declared evidence"
+        )
+    if evidence.schema != 2:
+        raise ValueError(
+            f"VALID_V2 marker for {rec.relative_path!r} declares a non-v2 schema"
         )
     split = _split_record_path(rec)
     if split is None or rec.kind is not SegmentKind.SEGMENT or evidence.segment != split[1]:

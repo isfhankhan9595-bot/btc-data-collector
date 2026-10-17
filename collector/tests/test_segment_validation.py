@@ -253,6 +253,26 @@ def test_marker_validation_cannot_supply_schema2_evidence_for_a_legacy_file(tmp_
         verify_segment_bytes(tmp_path, discovery, markers)
 
 
+
+def test_v2_evidence_cannot_be_fabricated_for_an_absent_marker_path(tmp_path):
+    _put(tmp_path, marker=False)
+    discovery = discover_sources(tmp_path)
+    markers = list(validate_markers(tmp_path, discovery))
+    markers[0] = type(markers[0])(
+        relative_path=markers[0].relative_path,
+        marker_presence=markers[0].marker_presence,
+        status=MarkerValidationStatus.VALID_V2,
+        reasons=("MARKER_SCHEMA_2_VALID", "SEGMENT_BYTES_NOT_VERIFIED"),
+        evidence=DeclaredMarkerEvidence(
+            segment=SEG, schema=2, state="PUBLICATION_CONFIRMED", confirmed_by="writer",
+            legacy=False, size_bytes=1, sha256="0" * 64, record_count=0,
+            first_record_ts=None, last_record_ts=None,
+        ),
+    )
+    with pytest.raises(ValueError, match="inconsistent marker presence"):
+        verify_segment_bytes(tmp_path, discovery, markers)
+
+
 def test_unsupported_safe_open_fails_closed_for_valid_candidates(tmp_path, monkeypatch):
     _put(tmp_path, marker=False)
     discovery = discover_sources(tmp_path)
