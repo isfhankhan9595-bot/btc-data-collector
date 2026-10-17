@@ -21,11 +21,19 @@ from enum import Enum
 from typing import Optional, Sequence, Tuple, Union
 
 from .marker_validation import (
+    DeclaredMarkerEvidence,
     MarkerValidation,
     MarkerValidationStatus,
     _SAFE_FLAGS,
     _errno_name,
     _stable_identity,
+)
+from .publication import (
+    ALLOWED_CONFIRMED_BY,
+    MARKER_SCHEMA,
+    STATE_CONFIRMED,
+    _SHA256,
+    _is_int,
 )
 from .source_catalog import (
     RAW_DIRNAME,
@@ -100,15 +108,53 @@ def _split_record_path(rec: SourceRecord) -> Optional[Tuple[str, str]]:
     return parts[1], filename
 
 
+def _check_declared_fields(rec: SourceRecord, evidence: DeclaredMarkerEvidence) -> None:
+    """Re-check the declared fields this module consumes against the marker contract.
+
+    The rules are those of publication.parse_marker_bytes (the single authority for what a
+    schema-2 marker looks like) and use its own constants, so evidence produced by the real
+    marker validator always passes and the two cannot drift apart. They are deliberately no
+    stricter: ``legacy=True`` is a legitimate declaration (startup refsync writes it when it
+    confirms a pre-existing segment), so only its type is checked. The ValueError names the
+    offending field, never its value.
+    """
+    problems = []
+    if not _is_int(evidence.schema) or evidence.schema != MARKER_SCHEMA:
+        problems.append("schema")
+    if evidence.state != STATE_CONFIRMED:
+        problems.append("state")
+    if not isinstance(evidence.confirmed_by, str) or evidence.confirmed_by not in ALLOWED_CONFIRMED_BY:
+        problems.append("confirmed_by")
+    if not isinstance(evidence.legacy, bool):
+        problems.append("legacy")
+    if not _is_int(evidence.size_bytes) or evidence.size_bytes < 0:
+        problems.append("size_bytes")
+    if not isinstance(evidence.sha256, str) or not _SHA256.match(evidence.sha256):
+        problems.append("sha256")
+    if problems:
+        raise ValueError(
+            f"VALID_V2 marker for {rec.relative_path!r} declares invalid "
+            + ", ".join(problems)
+        )
+
+
 def _marker_evidence(rec: SourceRecord, marker: MarkerValidation):
-    """Only validated schema-2 marker content is a usable declaration."""
+    """Only validated schema-2 marker content is a usable declaration.
+
+    Raises ValueError for any inconsistent or fabricated marker result. This runs for every
+    record before any file is opened, so a rejected input never yields partial results.
+    """
     if marker.status is not MarkerValidationStatus.VALID_V2:
+        if marker.evidence is not None:
+            raise ValueError(
+                f"marker evidence for {rec.relative_path!r} is attached to a non-VALID_V2 result"
+            )
         return None
     if marker.marker_presence is not MarkerPresence.REGULAR_FILE:
         raise ValueError(
             f"VALID_V2 marker for {rec.relative_path!r} has inconsistent marker presence"
         )
-    if "MARKER_SCHEMA_2_VALID" not in marker.reasons:
+    if not isinstance(marker.reasons, tuple) or "MARKER_SCHEMA_2_VALID" not in marker.reasons:
         raise ValueError(
             f"VALID_V2 marker for {rec.relative_path!r} lacks schema-validation evidence"
         )
@@ -117,10 +163,11 @@ def _marker_evidence(rec: SourceRecord, marker: MarkerValidation):
         raise ValueError(
             f"VALID_V2 marker for {rec.relative_path!r} is missing declared evidence"
         )
-    if evidence.schema != 2:
+    if not isinstance(evidence, DeclaredMarkerEvidence):
         raise ValueError(
-            f"VALID_V2 marker for {rec.relative_path!r} declares a non-v2 schema"
+            f"VALID_V2 marker for {rec.relative_path!r} carries evidence of an unexpected type"
         )
+    _check_declared_fields(rec, evidence)
     split = _split_record_path(rec)
     if split is None or rec.kind is not SegmentKind.SEGMENT or evidence.segment != split[1]:
         raise ValueError(
@@ -289,6 +336,14 @@ def verify_segment_bytes(
     same discovery result. Only VALID_V2 entries supply declaration comparisons.
     Unmarked sources and legacy hourly Parquet are still hashed, but declaration
     comparisons remain None rather than being inferred.
+
+    Raises ValueError, before any filesystem access and without producing partial
+    results, if marker_validations is misaligned with discovery or holds an
+    inconsistent or fabricated entry (wrong presence, missing schema-validation
+    reason, evidence on a non-VALID_V2 result, or declared fields that violate the
+    schema-2 marker contract). These checks establish internal consistency only:
+    a caller-built MarkerValidation cannot be authenticated, so a stable hash says
+    nothing about whether the supplied marker claims are authentic.
 
     Files are opened relative to no-follow directory descriptors. Hashing uses
     fixed-size reads, reads the initially observed size plus at most one extra
