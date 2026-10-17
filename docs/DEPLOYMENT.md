@@ -182,6 +182,47 @@ raising `TimeoutStopSec`.
 The standalone runners (Spot, Bybit, OKX) have no systemd unit in this repository, so no
 stop budget is defined for them. Their wait for the client is the same 47 s bound.
 
+### Standalone runners: a websocket worker that ends after `shutdown()` returned
+
+Reproduced and fixed for Binance Spot, Bybit and OKX in `tests/test_standalone_late_finalization.py`
+(real `WebSocketClient`, real `shutdown()`, real `supervise_standalone_runner`; only the socket is faked
+and the worker is a handler that swallows cancellation, released by an explicit gate) -- NOT VERIFIED
+LIVE, not run against a real exchange, on a real host, or under systemd.
+
+Before the fix, with a worker that outlived `shutdown()`, the initial shutdown was correct (worker-reachable
+writers left open, non-zero status latched) but nothing ever closed them once the worker ended: Spot left
+trades/book/quality open, Bybit its five market-data writers, quality writer and WAL, OKX its seven
+market-data writers and quality writer.
+
+Now each runner's closes live in an idempotent `_finalize_storage()` that judges reachability from live
+state, and a `LateFinalizer` (`standalone_failure_policy.py`) arms a done-callback on every storage user
+still alive when `shutdown()` returns: the run task (the client's `start()` lifecycle), the live ingest
+worker and, for Spot, the book-recovery task.
+
+- A callback finalizes only when every user has stopped (`lifecycle_idle`, and for Spot the recovery task
+  done). One user ending while another is alive closes nothing; the other's end retries. If the state
+  cannot be read, storage stays open.
+- Each writer's close is attempted at most once per process (`CloseOnce`). A repeated `shutdown()`, an
+  overlapping callback or an explicit retry returns the first attempt's outcome and never calls `close()`
+  again; a failed close is not retried and its failure report is not duplicated.
+- Order is the venue's existing one: the raw wire writer as soon as ingress is stopped; market-data
+  writers; the quality writer last; on Bybit the WAL after the quality writer's final publish.
+- The latched shutdown status stays non-zero after a late finalization. A late close is not a clean
+  shutdown.
+
+What it does not do:
+
+- It cannot make a worker that ignores cancellation end. A worker that never ends keeps its reachable
+  storage open and the shutdown failed; nothing here claims it was force-stopped.
+- It only runs while the event loop does. If the process is killed first, nothing runs. What
+  `asyncio.run` does at teardown with a worker that never ends was not examined here.
+- `run_okx_capture.py` is a different structure (a capture task, not `WebSocketClient` plus an ingest
+  worker) and was read but not tested: its `finally` closes the raw wire and quality writers after a
+  bounded wait on the capture task. Whether that can close beneath a task that survived cancellation is
+  NOT VERIFIED.
+- The Spot recovery-task case (a cancellation-resistant REST producer ending after the worker) is covered
+  by one test with a gated fake recovery; the other REST-producer paths are unchanged.
+
 ### Quality queue: verified limitations
 
 Reproduced with `tests/test_quality_queue_shutdown_bounds.py` (real `start()` / `_async_shutdown()` /
@@ -197,9 +238,8 @@ against a live exchange, under power loss, or within the 60 s stop budget.
   queue undrained and the quality writer and WAL open. The events are WAL-retained and replayed at the
   next start. If that worker ends later while the process is still running, the late retry (see above)
   finalises the held writers and then the WAL; if it never ends, they stay open until process-level
-  termination, which cannot guarantee that buffered Parquet segments are finalised. Not changed or
-  tested here: the standalone Spot/Bybit/OKX runners, which have their own `shutdown()` and no
-  late-finalization callback for a worker that ends after it returned.
+  termination, which cannot guarantee that buffered Parquet segments are finalised. The standalone
+  Spot/Bybit/OKX runners have their own late retry, described in the next section.
 - A quality-writer failure that the loop survives (`quality_checkpoint_blocked`) does not change the exit
   status: the events stay in the WAL (replayed, possibly as duplicate rows with the same
   `quality_event_id`). The operator signal is the alert and `quality_channel_status()`.

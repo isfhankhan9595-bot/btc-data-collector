@@ -78,6 +78,7 @@ import inspect
 import json
 import signal
 import time
+from typing import Optional
 
 from collector.collector.adapters.binance_spot import BinanceSpotAdapter
 from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
@@ -104,7 +105,9 @@ from collector.collector.raw_capture import (
 from collector.collector.failure_topology import FailureRecord
 from collector.collector.recovery_control import RecoveryController
 from collector.collector.standalone_failure_policy import (
+    CloseOnce,
     DegradedQualityLossReporting,
+    LateFinalizer,
     StandaloneFailurePolicy,
     REST_PRODUCER_CANCEL_BOUND_S,
     await_client_idle,
@@ -234,6 +237,15 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
             stream_group="binance_spot",
             on_fatal=self._on_fatal_storage,
         )
+        # Late finalization (see ``_finalize_storage``): each writer's close is attempted at most
+        # once, and a done-callback on every storage user that outlived ``shutdown()`` retries the
+        # finalization when the LAST of them ends. ``_run_task`` is the supervisor's task running
+        # ``run()`` (i.e. the client's start() lifecycle); it is recorded by ``run()``.
+        self._close_once = CloseOnce()
+        self._run_task = None
+        self._late_finalizer = LateFinalizer(
+            venue=VENUE, finalize=lambda: self._finalize_storage(),
+            users_stopped=self._storage_users_stopped, watched=self._storage_user_tasks)
 
     # -- F5 failure topology ----------------------------------------------------
 
@@ -717,6 +729,7 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         # Request the initial bridge immediately -- the book starts
         # RECOVERING (see quality_events.BookQualityStateMachine) and would
         # otherwise wait for the first diff to arrive before trying.
+        self._run_task = asyncio.current_task()
         self._schedule_recovery("initial_snapshot")
         await self.client.start()
 
@@ -751,29 +764,75 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         if held:
             self.failure_policy.record_shutdown_failure("rest_producer_not_stopped")
             logger.error("spot_storage_left_open_recovery_alive", held=sorted(held))
-        # Each writer is closed only when EVERY producer that can reach it is stopped:
-        #   raw_wire_writer: the receive loop only -> ingress stopped.
-        #   raw_rest_writer / ob_writer / quality_writer: the recovery task (+ the worker for ob/quality).
+        # Each writer is closed only when EVERY producer that can reach it is stopped (see
+        # ``_finalize_storage``). Whatever is still held because a user is alive is finalized by
+        # ``_late_finalizer`` when that user ends -- nothing else would, once this has returned.
+        self._finalize_storage(client_idle)
+        if not client_idle or held:
+            self._late_finalizer.arm()
+
+    # -- storage finalization -------------------------------------------------
+
+    def _recovery_alive(self) -> bool:
+        task = self._recovery_task
+        return task is not None and not task.done()
+
+    def _storage_users_stopped(self) -> bool:
+        """True when NOTHING that can still write this venue's storage is alive: the client's whole
+        lifecycle (start() tail + ingest worker) has ended and so has the book-recovery task."""
+        return bool(getattr(self.client, "lifecycle_idle", True)) and not self._recovery_alive()
+
+    def _storage_user_tasks(self) -> list:
+        """Every task whose end can make a held writer safe to close."""
+        tasks = [self._run_task, self._recovery_task]
+        getter = getattr(self.client, "live_lifecycle_tasks", None)
+        if getter is not None:
+            tasks.extend(getter())
+        return tasks
+
+    def _finalize_storage(self, client_idle: Optional[bool] = None) -> None:
+        """Close, at most once each, every writer whose users are ALL proven stopped. Idempotent.
+
+        ``client_idle`` is the verdict ``shutdown()`` just obtained by waiting for the client; the late
+        callback passes None, which reads the client's live state instead.
+
+        Reachability (who can still write what), judged from LIVE state on every call:
+          raw_wire_writer: the receive loop only            -> ingress stopped.
+          raw_rest_writer: the recovery task                -> recovery ended.
+          trades_writer:   the ingest worker (on_message)   -> client idle.
+          ob_writer:       the worker + the recovery task   -> client idle AND recovery ended.
+          quality_writer:  the worker + the recovery task   -> client idle AND recovery ended; closed
+                           last so every other close failure can still be reported through it.
+        Called by ``shutdown()`` and, once the last live user has ended, by the late-finalization
+        callback. A close already attempted is never repeated (``CloseOnce``)."""
+        recovery_alive = self._recovery_alive()
         if getattr(self.client, "ingress_stopped", True):
             self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
         else:
             logger.error("spot_raw_wire_writer_left_open_ingress_not_stopped")
-        if "raw_rest_writer" not in held:
+        if not recovery_alive:
             self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
+        if client_idle is None:
+            client_idle = bool(getattr(self.client, "lifecycle_idle", True))
         if not client_idle:
             # A worker is still alive: the market-data and quality writers stay open; the failure
             # is latched and the exit status is non-zero.
             return
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BINANCE_SPOT")
-        if "ob_writer" not in held:
-            self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BINANCE_SPOT")
-        if "quality_writer" in held:
-            return          # quality_writer outlives the live recovery; its events stay recoverable
+        if recovery_alive:
+            return          # ob_writer / quality_writer outlive the live recovery; events stay recoverable
+        self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BINANCE_SPOT")
         self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BINANCE_SPOT")
         # Last, so the counts include anything the closes above reported. Cannot raise.
         self._report_quality_channel_final()
 
-    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> None:
+    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> bool:
+        """Close ``writer`` at most once per process (``CloseOnce``); a repeat request returns the
+        first attempt's outcome without calling ``close()`` again."""
+        return self._close_once.run(
+            writer_name, lambda: self._close_writer_attempt(writer, writer_name, exchange))
+
+    def _close_writer_attempt(self, writer, writer_name: str, exchange: str) -> bool:
         """Close one writer; on failure, report it and still return.
 
         Hostile-audit finding (this session): none of these close() calls
@@ -788,6 +847,7 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         """
         try:
             writer.close()
+            return True
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
             if writer_name != "quality_writer":
@@ -800,6 +860,7 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
                 except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
                     logger.error("storage_shutdown_close_failure_report_failed",
                                  writer=writer_name, error=str(sink_exc))
+            return False
 
 
 async def _main(data_dir: str, url: str) -> int:

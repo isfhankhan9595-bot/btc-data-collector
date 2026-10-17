@@ -632,44 +632,66 @@ def test_receive_timestamp_comes_from_the_injected_stamp_not_from_wall_clock_els
 
 
 def test_mutation_restamping_during_processing_is_caught():
-    """Real source mutation (not simulated), run as a clean subprocess to
-    avoid nesting an async test run inside another event loop: makes
-    _process_item call capture_receive_stamp again and overwrite the
-    item's timestamp before calling on_message -- exactly the regression
-    class this invariant guards against. Confirms the test above fails
-    under the mutation, then restores the source and verifies it is
-    byte-identical."""
+    """Real source mutation (not simulated): makes _process_item call
+    capture_receive_stamp again and overwrite the item's timestamp before
+    calling on_message -- exactly the regression class the receive-timestamp
+    invariant guards against -- and confirms the arrival-timestamp test fails
+    under it.
+
+    The mutation is applied to a PRIVATE temporary copy of the source tree and
+    the target test runs there (see ``_isolated_source_mutation``). The
+    original checkout is only ever read: concurrent runs cannot observe each
+    other's mutant, and a killed process cannot leave one behind. A control
+    run on the unmutated copy must pass, so the failure is attributable to the
+    mutation and not to the isolated environment.
+    """
+    import hashlib
     import pathlib
-    import subprocess
     import sys
 
-    path = pathlib.Path(__file__).resolve().parent.parent / "collector" / "websocket_client.py"
-    original = path.read_text()
+    from ._isolated_source_mutation import run_mutation_in_isolated_copy
+
+    package_root = pathlib.Path(__file__).resolve().parent.parent       # .../collector
+    source = package_root / "collector" / "websocket_client.py"
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
     anchor = "await self.on_message(item.data, item.local_receive_ts, connection_id=item.connection_id)"
-    assert anchor in original, "test anchor text not found; _process_item's shape changed"
-    mutated = original.replace(
-        anchor,
-        "import dataclasses as _dc\n"
-        "            item = _dc.replace(item, local_receive_ts=capture_receive_stamp().wall_ms)\n"
-        "            " + anchor,
-        1,
-    )
-    assert mutated != original
-    path.write_text(mutated)
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "--no-header",
-             str(pathlib.Path(__file__).resolve()) +
-             "::test_on_message_receives_the_arrival_timestamp_not_the_processing_timestamp"],
-            cwd=str(path.resolve().parents[2]), capture_output=True, text=True,
+    assert anchor in source.read_text(), "test anchor text not found; _process_item's shape changed"
+
+    def restamp(text: str) -> str:
+        return text.replace(
+            anchor,
+            "import dataclasses as _dc\n"
+            "            item = _dc.replace(item, local_receive_ts=capture_receive_stamp().wall_ms)\n"
+            "            " + anchor,
+            1,
         )
-    finally:
-        path.write_text(original)
-    assert result.returncode != 0, (
-        "mutation (re-stamping during processing) was NOT caught by the timestamp test:\n"
-        + result.stdout[-2000:]
+
+    target = "collector/tests/test_websocket_client.py::test_on_message_receives_the_arrival_timestamp_not_the_processing_timestamp"
+    outcome = run_mutation_in_isolated_copy(
+        source_root=package_root,
+        mutate_relpath="collector/websocket_client.py",
+        transform=restamp,
+        argv_factory=lambda root: [sys.executable, "-m", "pytest", "-q", "--no-header",
+                                   "-p", "no:cacheprovider", target],
+        import_probe="collector.collector.websocket_client",
+        cwd_relpath=".",
+        timeout=120.0,
     )
-    assert path.read_text() == original
+
+    # The original is byte-identical no matter how the subprocesses ended.
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+    assert outcome.source_changed, "mutation did not change the source"
+    assert not outcome.control.timed_out and outcome.control.returncode == 0, (
+        "control run on the UNMUTATED copy did not pass:\n" + outcome.control.output[-2000:]
+    )
+    assert str(source.resolve()) not in outcome.import_origin and "mutation_copy_" in outcome.import_origin, (
+        f"subprocess imported {outcome.import_origin!r}, not the private copy"
+    )
+    assert not outcome.mutated.timed_out, "mutated run timed out:\n" + outcome.mutated.output[-2000:]
+    assert outcome.mutated.returncode not in (0, None), (
+        "mutation (re-stamping during processing) was NOT caught by the timestamp test:\n"
+        + outcome.mutated.output[-2000:]
+    )
 
 
 @pytest.mark.asyncio

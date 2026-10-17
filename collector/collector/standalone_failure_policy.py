@@ -484,6 +484,103 @@ async def cancel_and_wait(task: "Optional[asyncio.Future[Any]]", timeout: float,
     return task.done()
 
 
+class CloseOnce:
+    """At-most-once close registry: a writer's close is ATTEMPTED once per process.
+
+    ``shutdown()`` of a standalone runner can now be reached more than once (the supervisor's call, an
+    explicit retry, and the late-finalization callback below), and a ``ParquetWriter.close()`` is not a
+    safe thing to repeat: a second call after a failed first one would re-raise the latched storage
+    failure and report it again, and re-running a half-finished finalization is not something this
+    code has ever demonstrated to be safe. The first attempt's outcome is therefore recorded and every
+    later request for the same writer returns it WITHOUT calling ``close()`` again.
+    """
+
+    def __init__(self) -> None:
+        self._results: Dict[str, bool] = {}
+
+    def attempted(self, name: str) -> bool:
+        return name in self._results
+
+    def run(self, name: str, close: Callable[[], bool]) -> bool:
+        if name in self._results:
+            return self._results[name]
+        # Recorded BEFORE the call returns control to anything else: a re-entrant request (the close
+        # path reporting a failure, a callback firing from a nested await) must see "attempted".
+        self._results[name] = False
+        self._results[name] = bool(close())
+        return self._results[name]
+
+
+class LateFinalizer:
+    """Finalize storage when the LAST live user of it ends after ``shutdown()`` already returned.
+
+    ``shutdown()`` never closes a writer beneath a live user (an ingest worker that swallowed its
+    cancel, a book-recovery task that did) and returns early, latching an explicit shutdown failure.
+    ``stop()`` and the supervisor's wait cannot make such a user end, and once ``shutdown()`` has
+    returned nothing else would ever close what it held. This arms a done-callback on every still-live
+    user; when one ends, ``finalize`` runs -- but only if ``users_stopped()`` says EVERY user is now
+    stopped (the callback of one user never closes storage another still uses; that user's own end
+    retries). ``finalize`` runs at most once even when callbacks overlap.
+
+    It does not clear the latched failure (a late close is not a clean shutdown) and it cannot make a
+    worker that never ends end: that worker keeps its storage open and the failure stays latched.
+    """
+
+    def __init__(self, *, venue: str, finalize: Callable[[], None],
+                 users_stopped: Callable[[], bool],
+                 watched: Callable[[], Iterable[Any]]) -> None:
+        self.venue = venue
+        self._finalize = finalize
+        self._users_stopped = users_stopped
+        self._watched = watched
+        self._armed: set = set()
+        #: Set once ``finalize`` has been started by a late callback (never reset).
+        self.ran = False
+
+    def arm(self) -> int:
+        """Register on every watched task that is still alive and not yet armed (idempotent)."""
+        count = 0
+        for task in list(self._watched()):
+            if task is None or task.done() or task in self._armed:
+                continue
+            self._armed.add(task)
+            task.add_done_callback(self._on_user_ended)
+            count += 1
+        return count
+
+    def _on_user_ended(self, task: Any) -> None:
+        try:
+            if not task.cancelled():
+                error = task.exception()        # retrieved here: reported, never an unobserved failure
+                if error is not None:
+                    logger.error("late_storage_user_failed_after_shutdown", venue=self.venue,
+                                 error=f"{type(error).__name__}: {error}")
+        except Exception:  # noqa: BLE001 - observing a task must never raise into the loop
+            pass
+        self.retry()
+
+    def retry(self) -> bool:
+        """Run ``finalize`` if every user has stopped and it has not run yet. Never raises."""
+        if self.ran:
+            return False
+        try:
+            stopped = bool(self._users_stopped())
+        except Exception as exc:  # noqa: BLE001 - an unreadable state must fail CLOSED (keep storage open)
+            logger.error("late_finalization_state_check_failed", venue=self.venue,
+                         error=f"{type(exc).__name__}: {exc}")
+            return False
+        if not stopped:
+            return False                        # another user is alive: ITS end retries
+        self.ran = True
+        logger.info("late_shutdown_finalization", venue=self.venue)
+        try:
+            self._finalize()
+        except Exception as exc:  # noqa: BLE001 - per-writer failures are reported inside finalize
+            logger.error("late_shutdown_finalization_failed", venue=self.venue,
+                         error=f"{type(exc).__name__}: {exc}")
+        return True
+
+
 async def supervise_standalone_runner(app: Any, stop: asyncio.Event, *,
                                       task_timeout_s: float = SHUTDOWN_TASK_TIMEOUT_S) -> int:
     """Run ``app`` until a signal, a terminal storage failure, or a crash; shut

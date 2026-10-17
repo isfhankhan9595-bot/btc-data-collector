@@ -52,6 +52,7 @@ import inspect
 import json
 import signal
 import time
+from typing import Optional
 
 from collector.collector.adapters.bybit import BybitAdapter
 from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
@@ -82,6 +83,8 @@ from collector.collector.quality_events import BookQuality, QualityEventType
 from collector.collector.quality_wal import QualityEventWAL, QualityWALCapacityExceeded, QualityWALCorruption
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
 from collector.collector.standalone_failure_policy import (
+    CloseOnce,
+    LateFinalizer,
     StandaloneFailurePolicy,
     await_client_idle,
     build_stream_table,
@@ -220,6 +223,15 @@ class BybitCollectorApp:
             stream_group="bybit",
             on_fatal=self._on_fatal_storage,
         )
+        # Late finalization (see ``_finalize_storage``): each writer's close is attempted at most
+        # once, and a done-callback on every storage user that outlived ``shutdown()`` retries the
+        # finalization when the LAST of them ends. ``_run_task`` is the supervisor's task running
+        # ``run()`` (the client's start() lifecycle); it is recorded by ``run()``.
+        self._close_once = CloseOnce()
+        self._run_task = None
+        self._late_finalizer = LateFinalizer(
+            venue="BYBIT", finalize=lambda: self._finalize_storage(),
+            users_stopped=self._storage_users_stopped, watched=self._storage_user_tasks)
         # F5-QA-04: continuous storage-pressure monitor for THIS runner's data / WAL directories.
         # An invalid threshold configuration raises here: startup fails, nothing is coerced.
         self._disk_emergency = None
@@ -1184,6 +1196,7 @@ class BybitCollectorApp:
 
     async def run(self) -> None:
         self.running = True
+        self._run_task = asyncio.current_task()
         self._disk_task = asyncio.create_task(self._storage_pressure_loop())
         self._start_quality_idle_publisher()
         await self.client.start()
@@ -1220,32 +1233,72 @@ class BybitCollectorApp:
         # which the supervisor does not cancel until this coroutine returns. Wait for it here, before
         # closing any writer the worker can reach. The same CancelledError rule applies to this wait.
         client_idle = await await_client_idle(self.client, self.failure_policy)
-        # The raw wire writer's only user is the receive loop: closed whenever ingress is stopped,
-        # whatever the worker's state (Bybit has no REST producer and no raw_rest writer).
+        # Each writer is closed only when every producer that can reach it is stopped (see
+        # ``_finalize_storage``). If a worker is still alive the market-data and quality writers stay
+        # open and the WAL remains the recovery source; ``_late_finalizer`` finalizes them when the
+        # LAST live user ends -- nothing else would, once this has returned.
+        self._finalize_storage(client_idle)
+        if not client_idle:
+            self._late_finalizer.arm()
+
+    # -- storage finalization ---------------------------------------------------
+
+    def _storage_users_stopped(self) -> bool:
+        """True when NOTHING that can still write this venue's storage is alive: the client's whole
+        lifecycle (start() tail + ingest worker) has ended. Bybit has no REST producer; the quality
+        idle publisher is retired by a cancellation REQUEST at the top of ``shutdown()`` that
+        provably cannot run its tick again (see ``_request_quality_idle_publisher_stop``)."""
+        return bool(getattr(self.client, "lifecycle_idle", True))
+
+    def _storage_user_tasks(self) -> list:
+        """Every task whose end can make a held writer safe to close."""
+        tasks = [self._run_task]
+        getter = getattr(self.client, "live_lifecycle_tasks", None)
+        if getter is not None:
+            tasks.extend(getter())
+        return tasks
+
+    def _finalize_storage(self, client_idle: Optional[bool] = None) -> None:
+        """Close, at most once each, every writer whose users are ALL proven stopped. Idempotent.
+
+        ``client_idle`` is the verdict ``shutdown()`` just obtained by waiting for the client; the late
+        callback passes None, which reads the client's live state instead.
+
+        Reachability, judged from LIVE state on every call:
+          raw_wire_writer: the receive loop only           -> ingress stopped (whatever the worker does).
+          ob/trades/mark/oi/liq writers, quality_writer, quality WAL: the ingest worker (on_message)
+                                                            -> client idle.
+        quality_writer closes LAST among the writers: its close PUBLISHES the final partial segment and
+        thereby checkpoints that segment's WAL seqs. If that publish fails its events stay in the WAL,
+        uncheckpointed, to be replayed by the next startup. Only then is the WAL closed (the publish
+        hook needs it open)."""
         self._close_raw_wire_writer_if_ingress_stopped()
+        if client_idle is None:
+            client_idle = bool(getattr(self.client, "lifecycle_idle", True))
         if not client_idle:
             # A worker is still alive: market-data and quality writers stay open and the WAL
             # remains the recovery source; the failure is latched and the exit status non-zero.
             return
+        if self._close_once.attempted("quality_writer"):
+            return          # a full finalization already ran (checkpoint latch and WAL close included)
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BYBIT")
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BYBIT")
         self._close_writer_reporting_failure(self.mark_writer, "mark_writer", "BYBIT")
         self._close_writer_reporting_failure(self.oi_writer, "oi_writer", "BYBIT")
         self._close_writer_reporting_failure(self.liq_writer, "liq_writer", "BYBIT")
-        # quality_writer closes LAST: its close PUBLISHES the final partial
-        # segment and thereby checkpoints that segment's WAL seqs. If that
-        # publish fails its events stay in the WAL, uncheckpointed, to be
-        # replayed by the next startup. Only then is the WAL closed (the
-        # publish hook needs it open).
         quality_closed = self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BYBIT")
         if not quality_closed:
             self._block_quality_checkpoint("quality_writer_close_failed")
         wal = getattr(self, "_quality_wal", None)
         if wal is not None:
-            try:
-                wal.close()
-            except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
-                logger.error("bybit_quality_wal_close_failed", error=str(exc))
+            def _close_wal() -> bool:
+                try:
+                    wal.close()
+                    return True
+                except Exception as exc:  # noqa: BLE001 - must not abort the rest of shutdown
+                    logger.error("bybit_quality_wal_close_failed", error=str(exc))
+                    return False
+            self._close_once.run("quality_wal", _close_wal)
 
     def _close_raw_wire_writer_if_ingress_stopped(self) -> None:
         if getattr(self.client, "ingress_stopped", True):
@@ -1254,6 +1307,12 @@ class BybitCollectorApp:
             logger.error("bybit_raw_wire_writer_left_open_ingress_not_stopped")
 
     def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> bool:
+        """Close ``writer`` at most once per process (``CloseOnce``); a repeat request returns the
+        first attempt's outcome without calling ``close()`` again."""
+        return self._close_once.run(
+            writer_name, lambda: self._close_writer_attempt(writer, writer_name, exchange))
+
+    def _close_writer_attempt(self, writer, writer_name: str, exchange: str) -> bool:
         """Close one writer; on failure, report it and still return.
 
         Hostile-audit finding (this session): none of these close() calls
