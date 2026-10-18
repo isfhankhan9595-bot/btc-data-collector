@@ -25,12 +25,13 @@ replacement after that stage is invisible to size or mtime comparisons made late
    pass, captures the leading magic and the trailing ``[footer | footer_len | magic]`` window;
 3. compares the SHA-256 and size of what it just read with the supplied byte-verification result, and
    returns ``UNKNOWN_IO`` (never parse facts) if they differ;
-4. parses the *captured* bytes with PyArrow from memory. The parser therefore never reopens the path
-   and never sees a byte that was not part of the hashed, stable observation.
+4. parses the *captured* bytes with PyArrow from memory, in an isolated worker process (see "Parser
+   isolation and resource failures"). The parser therefore never reopens the path and never sees a
+   byte that was not part of the hashed, stable observation.
 
 The cost is one extra full read of every inspected file (O(file size) I/O, memory bounded by
-``READ_CHUNK_BYTES`` plus the footer limit). It is required: it is the only way to tie the parsed
-footer to the earlier digest. Only metadata is parsed; no row group or data page is decoded.
+``READ_CHUNK_BYTES`` plus the footer limit in this process). It is required: it is the only way to tie
+the parsed footer to the earlier digest. Only metadata is parsed; no row group or data page is decoded.
 
 Footer resource bound
 ---------------------
@@ -50,6 +51,70 @@ is reported as ``FOOTER_TOO_LARGE`` -- explicitly NOT as invalid Parquet and NOT
 caller may raise the limit up to ``MAX_ALLOWED_FOOTER_BYTES``. PyArrow's own thrift string/container
 limits are set to the declared footer length, which no string or container can exceed.
 
+Parser isolation and resource failures
+--------------------------------------
+PyArrow's footer parser is native code and cannot be trusted to fail politely. Measured with PyArrow
+24.0.0 on Linux, parsing a *valid* file with 40,000 row groups (a 7.9 MiB footer) needs ~76 MiB of
+address space beyond the interpreter's baseline (about 9.5x the footer, the same ratio for 1k, 5k x 26
+columns, 40k and 100k row groups). With less, the parser either raises
+``OSError("Couldn't deserialize thrift: std::bad_alloc")`` or the whole process dies with ``SIGABRT``
+(``std::terminate``); for most limits tried it was the abort, which no ``except`` clause can catch.
+Two consequences are built in:
+
+* **No footer is parsed in this process.** The captured window is sent to a private worker
+  (``_parquet_footer_worker``, run as ``python -I``) over a bounded binary protocol: a fixed header
+  (footer length, file size, address-space budget) and exactly ``footer_len + 8`` bytes, answered by
+  one fixed 64-byte reply (a code, three integers, an exception *type name*). The worker never gets a
+  path and never opens a file. All hashing, descriptor/path identity checks, prior-digest comparison
+  and result construction stay here. If the worker cannot be started the result is
+  ``UNKNOWN_PARSER_FAILURE``; there is no in-process fallback.
+* **Resource failure is not corruption.** Outcomes of the parse step, all after the full hash pass has
+  matched the prior byte evidence:
+
+  ================================  ===================================================================
+  ``VALID_PARQUET``                 footer parsed and passed the structural checks
+  ``INVALID_PARQUET``               parser reported malformed content (``OSError``/``ArrowException``
+                                    such as a thrift failure) or the footer contradicts itself
+  ``UNSUPPORTED_METADATA``          ``ArrowNotImplementedError``
+  ``UNKNOWN_RESOURCE``              recognised resource exhaustion: ``pa.ArrowMemoryError``,
+                                    ``MemoryError``, or the exact ``std::bad_alloc`` ``OSError``
+                                    signature. Reasons: ``PARQUET_PARSER_RESOURCE_EXHAUSTED`` plus
+                                    ``PARSER_RESOURCE_<ARROW_MEMORY_ERROR|MEMORY_ERROR|STD_BAD_ALLOC>``
+  ``UNKNOWN_PARSER_FAILURE``        no trustworthy result: worker did not start, died (``SIGABRT``,
+                                    ``SIGKILL``...), exited non-zero, timed out, or replied with
+                                    garbage. Reasons: ``PARQUET_PARSER_WORKER_FAILED`` plus
+                                    ``PARSER_WORKER_<SIGNAL_<name>|EXIT_CODE_<n>|NO_REPLY|TIMED_OUT|
+                                    PROTOCOL_ERROR|START_FAILED>``. The cause is *not* assumed to be
+                                    memory exhaustion even when it may be.
+  ================================  ===================================================================
+
+  ``pa.ArrowMemoryError`` is a subclass of ``pa.ArrowException`` and ``MemoryError``, so it is
+  recognised before the generic "malformed content" rule; the ``std::bad_alloc`` signature is matched
+  exactly rather than as a substring, so a footer cannot relabel a parse failure by embedding the text.
+  Any *other* exception in the worker is a programming error and raises
+  ``ParquetParserUnexpectedError`` (type name only); it is never turned into a verdict about the file.
+  For ``UNKNOWN_RESOURCE`` and ``UNKNOWN_PARSER_FAILURE`` every footer-derived field (``num_rows``,
+  ``num_row_groups``, ``num_columns``, ``declared_record_count_matches``,
+  ``marker_claims_corroborated_by_bytes``) is ``None``; the facts of the completed hash pass
+  (``observed_size``, ``observed_sha256``, ``byte_evidence_matches_prior``, ``declared_size_matches``,
+  ``declared_sha256_matches``, ``footer_length`` as the trailer's claim) are kept.
+
+Containment and cost. One worker serves all footers of one ``verify_parquet_metadata`` call (starting
+interpreter + PyArrow costs ~0.16 s, against ~30 us to parse an ordinary small footer in-process, so
+one process per footer would be ~5000x slower; a scan of N files pays the start-up once). The worker is
+killed, never reused, after a resource failure, crash, timeout or malformed reply. Per request the
+parent allows ``WORKER_TIMEOUT_BASE_SECONDS + footer / WORKER_MIN_THROUGHPUT_BYTES_PER_SECOND`` (at
+most ~94 s at the 256 MiB maximum; measured throughput is ~55 MiB/s, the allowance assumes 4 MiB/s) and
+the worker caps its own ``RLIMIT_AS`` at ``already-mapped + WORKER_ADDRESS_SPACE_FACTOR (16) x footer +
+WORKER_ADDRESS_SPACE_SLACK_BYTES (64 MiB)`` (about 1.7x the measured need). Memory at the maximum
+footer limit: this process holds one copy of the footer window (it is handed over without a second
+copy); the worker holds one more plus ~9.5x for the parse, ~2.9 GiB all told, with the worker's address
+space hard-capped at about 4.1 GiB above its baseline. ``RLIMIT_CORE`` is zero in the worker so a
+native abort cannot write a core file. The address-space limit needs Linux (``resource`` and
+``/proc/self/statm``); elsewhere the process isolation and timeout still apply. These numbers are
+measurements of one PyArrow version: re-measure when it is upgraded (the real-parser tests exercise
+the limit in CI).
+
 Honest limits
 -------------
 * This is an observation, not a snapshot transaction: it does not lock the writer. Identity (device,
@@ -60,8 +125,12 @@ Honest limits
 * ``marker_validations`` and ``byte_verifications`` are checked for internal consistency only; a
   caller-built result cannot be authenticated.
 * Exceptions raised by PyArrow while parsing in-memory bytes (including ``OSError``, which PyArrow
-  uses for thrift failures) are content evidence, not I/O failures. Any other exception type is
-  deliberately not caught: an unexpected failure should be loud, not mislabelled.
+  uses for thrift failures) are content evidence, not I/O failures -- except recognised resource
+  failures, which are ``UNKNOWN_RESOURCE``. Any other exception type is deliberately not turned into a
+  verdict: an unexpected failure is loud (``ParquetParserUnexpectedError``), not mislabelled. The
+  ``std::bad_alloc`` signature is the one PyArrow 24.0.0 produced; if a PyArrow upgrade changes it, a
+  resource failure would read as malformed content. The real-parser constrained-memory test is the
+  canary for that.
 * Where safe no-follow descriptor-relative access is unavailable every candidate is ``UNKNOWN_IO``
   (``SAFE_OPEN_UNAVAILABLE``); there is no weaker fallback.
 Diagnostics are fixed codes plus errno *names*; raw exception text and absolute paths never appear.
@@ -71,14 +140,17 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import selectors
+import signal
 import stat as _stat
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
+from . import _parquet_footer_worker as _worker
 from .marker_validation import (
     DeclaredMarkerEvidence,
     MarkerValidation,
@@ -134,6 +206,16 @@ class ParquetMetadataStatus(str, Enum):
     #: Opening, reading, stable inspection, or agreement with the earlier byte evidence could not be
     #: established. Never converted into corruption or absence.
     UNKNOWN_IO = "UNKNOWN_IO"
+    #: The footer was within the configured limit and the bytes matched the earlier evidence, but the
+    #: native parser *recognisably* exhausted a resource (memory) while reading it, so whether the
+    #: metadata is valid was not established. NOT evidence of corruption and NOT a validity claim:
+    #: no parse facts are reported. The byte-level facts of the completed hash pass are kept.
+    UNKNOWN_RESOURCE = "UNKNOWN_RESOURCE"
+    #: The isolated parser worker could not be started, died, timed out, or answered with something
+    #: untrustworthy, so no parse result exists. The cause is deliberately *not* assumed to be memory
+    #: exhaustion (``reasons`` carries the exit signal/code, never process output). NOT evidence of
+    #: corruption; no parse facts; the byte-level facts of the completed hash pass are kept.
+    UNKNOWN_PARSER_FAILURE = "UNKNOWN_PARSER_FAILURE"
 
 
 @dataclass(frozen=True)
@@ -148,7 +230,8 @@ class ParquetMetadataVerification:
     bytes_hashed: int = 0
     #: Footer length declared by the trailer (a claim until the footer parses). ``None`` if unread.
     footer_length: Optional[int] = None
-    #: Parquet metadata facts: set only when ``status`` is ``VALID_PARQUET``, else ``None``.
+    #: Parquet metadata facts: set only when ``status`` is ``VALID_PARQUET``, else ``None`` (this
+    #: includes ``UNKNOWN_RESOURCE`` and ``UNKNOWN_PARSER_FAILURE``: nothing is parsed, nothing claimed).
     num_rows: Optional[int] = None
     num_row_groups: Optional[int] = None
     num_columns: Optional[int] = None
@@ -256,54 +339,260 @@ def _structure_reasons(size: int, head: bytes, window: bytes) -> Tuple[str, ...]
     return tuple(reasons)
 
 
-def _chunk_out_of_bounds(metadata, data_end: int) -> bool:
-    """True only if some column chunk's byte range provably lies outside the data region
-    ``[len(magic), data_end)``. Metadata arithmetic only; no data page is read."""
-    for rg in range(metadata.num_row_groups):
-        group = metadata.row_group(rg)
-        for col in range(group.num_columns):
-            chunk = group.column(col)
-            starts = [o for o in (chunk.dictionary_page_offset, chunk.data_page_offset)
-                      if _is_int(o) and o > 0]
-            if not starts:
-                continue
-            start = min(starts)
-            total = chunk.total_compressed_size
-            if start < len(PARQUET_MAGIC):
-                return True
-            if _is_int(total) and total >= 0 and start + total > data_end:
-                return True
-    return False
+#: Parser isolation tunables. The measurements behind each value are in the module docstring
+#: ("Parser isolation and resource failures"); they are module attributes so tests can drive the real
+#: worker into its failure paths deterministically.
+WORKER_ADDRESS_SPACE_FACTOR = 16
+WORKER_ADDRESS_SPACE_SLACK_BYTES = 64 * 1024 * 1024
+WORKER_TIMEOUT_BASE_SECONDS = 30.0
+WORKER_MIN_THROUGHPUT_BYTES_PER_SECOND = 4 * 1024 * 1024
+_WORKER_SHUTDOWN_GRACE_SECONDS = 2.0
+_WRITE_CHUNK_BYTES = 1024 * 1024
+
+# Pipe I/O with the worker is bound to these names at import time, so nothing that patches or wraps
+# ``os.read`` / ``os.write`` for the *file* read path (fault injection, tests) can intercept the
+# worker protocol.
+_pipe_read = os.read
+_pipe_write = os.write
+
+_RESOURCE_KIND_CODES = {
+    _worker.RESOURCE_ARROW_MEMORY_ERROR: "PARSER_RESOURCE_ARROW_MEMORY_ERROR",
+    _worker.RESOURCE_MEMORY_ERROR: "PARSER_RESOURCE_MEMORY_ERROR",
+    _worker.RESOURCE_STD_BAD_ALLOC: "PARSER_RESOURCE_STD_BAD_ALLOC",
+}
+
+_Parsed = Tuple[ParquetMetadataStatus, Tuple[str, ...], Optional[Tuple[int, int, int]]]
 
 
-def _parse_footer(window: bytes, size: int, footer_len: int):
-    """Parse captured footer bytes from memory. Returns ``(status, reasons, facts)``.
+class ParquetParserUnexpectedError(RuntimeError):
+    """The isolated parser worker raised something that is neither evidence of malformed content,
+    an unsupported feature, nor a recognised resource failure: a programming error. It is raised, never
+    turned into a verdict about the file. The message carries only the exception *type name*."""
 
-    PyArrow's parse of an in-memory buffer cannot perform I/O, so its ``OSError`` (thrift failures)
-    and ``ArrowException`` family are content evidence.
+
+def _address_space_budget(footer_len: int) -> int:
+    """Address space, beyond what the worker already has mapped, that one parse may use."""
+    return WORKER_ADDRESS_SPACE_FACTOR * footer_len + WORKER_ADDRESS_SPACE_SLACK_BYTES
+
+
+def _parse_timeout(footer_len: int) -> float:
+    """Finite wall-clock allowance for one request, including a first-request interpreter start."""
+    return WORKER_TIMEOUT_BASE_SECONDS + footer_len / WORKER_MIN_THROUGHPUT_BYTES_PER_SECOND
+
+
+def _worker_argv() -> Optional[List[str]]:
+    """Command line of the parser worker, or ``None`` if no interpreter can be named (fail closed).
+    The command line never carries a footer, a path to the source file, or any file content."""
+    if not sys.executable:
+        return None
+    return [sys.executable, "-I", _worker.__file__]
+
+
+def _parser_failure(*detail: str) -> _Parsed:
+    return ParquetMetadataStatus.UNKNOWN_PARSER_FAILURE, ("PARQUET_PARSER_WORKER_FAILED", *detail), None
+
+
+def _exit_detail(returncode: Optional[int]) -> str:
+    """A fixed code for how the worker ended. Signal *names* and integer exit codes only; process
+    output is never captured, so none can reach a result."""
+    if returncode is None:
+        return "PARSER_WORKER_EXITED_ABNORMALLY"
+    if returncode < 0:
+        try:
+            return f"PARSER_WORKER_SIGNAL_{signal.Signals(-returncode).name}"
+        except ValueError:
+            return f"PARSER_WORKER_SIGNAL_{-returncode}"
+    if returncode == 0:
+        return "PARSER_WORKER_NO_REPLY"
+    return f"PARSER_WORKER_EXIT_CODE_{returncode}"
+
+
+def _type_name(raw: bytes) -> str:
+    text = raw.rstrip(b"\x00").decode("ascii", "replace")
+    return "".join(ch for ch in text if ch.isalnum() or ch == "_")[: _worker.NAME_BYTES] or "Exception"
+
+
+class _ParserWorker:
+    """One reusable parser child process, owned by a single ``verify_parquet_metadata`` call.
+
+    Started lazily by the first footer that needs parsing and reused for the next ones, because the
+    interpreter plus PyArrow start-up (~0.16 s measured) would otherwise dwarf the parse of an
+    ordinary footer (~30 us). The worker is discarded -- killed, never reused -- after anything but a
+    clean parse verdict, so a damaged or exhausted worker can never influence a later file.
     """
-    try:
-        parsed = pq.ParquetFile(
-            pa.BufferReader(window),
-            thrift_string_size_limit=footer_len,
-            thrift_container_size_limit=footer_len,
+
+    def __init__(self) -> None:
+        self._proc: Optional["subprocess.Popen[bytes]"] = None
+
+    def parse(self, window, size: int, footer_len: int) -> _Parsed:
+        """Parse the captured ``footer + trailer`` window in the worker. ``(status, reasons, facts)``."""
+        if len(window) != footer_len + _TRAILER_BYTES:
+            raise RuntimeError("internal error: captured window does not match the declared footer length")
+        argv = _worker_argv()
+        if argv is None:
+            return _parser_failure("PARSER_WORKER_START_FAILED")
+        if self._proc is None:
+            try:
+                self._proc = subprocess.Popen(
+                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    close_fds=True, cwd=os.sep, start_new_session=True)
+            except OSError as exc:
+                return _parser_failure("PARSER_WORKER_START_FAILED", f"ERRNO_{_errno_name(exc)}")
+        header = _worker.REQUEST_HEADER.pack(
+            _worker.REQUEST_MAGIC, footer_len, size, _address_space_budget(footer_len))
+        kind, reply = self._exchange(header, window, _parse_timeout(footer_len))
+        if kind == "timeout":
+            self._discard()
+            return _parser_failure("PARSER_WORKER_TIMED_OUT")
+        if kind == "closed":
+            return _parser_failure(_exit_detail(self._reap()))
+        return self._interpret(reply)
+
+    def _exchange(self, header: bytes, body, timeout: float) -> Tuple[str, Optional[bytes]]:
+        """Send one request and read exactly one fixed-size reply, never blocking past ``timeout``.
+
+        Returns ``("reply", bytes)``, ``("timeout", None)`` or ``("closed", None)`` (the worker's
+        output pipe ended before a full reply). Reads are capped at the reply size.
+        """
+        proc = self._proc
+        assert proc is not None and proc.stdin is not None and proc.stdout is not None
+        wfd, rfd = proc.stdin.fileno(), proc.stdout.fileno()
+        os.set_blocking(wfd, False)
+        os.set_blocking(rfd, False)
+        parts = [memoryview(header), memoryview(body)]
+        part, offset = 0, 0
+        reply = bytearray()
+        deadline = time.monotonic() + timeout
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(rfd, selectors.EVENT_READ)
+            selector.register(wfd, selectors.EVENT_WRITE)
+            writing = True
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "timeout", None
+                for key, _events in selector.select(remaining):
+                    if key.fd == rfd:
+                        try:
+                            data = _pipe_read(rfd, _worker.REPLY.size - len(reply))
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            return "closed", None
+                        if not data:
+                            return "closed", None
+                        reply.extend(data)
+                        if len(reply) == _worker.REPLY.size:
+                            return "reply", bytes(reply)
+                    elif writing:
+                        try:
+                            written = _pipe_write(wfd, parts[part][offset: offset + _WRITE_CHUNK_BYTES])
+                        except BlockingIOError:
+                            continue
+                        except OSError:        # worker gone or closed its input: the read side reports it
+                            selector.unregister(wfd)
+                            writing = False
+                            continue
+                        offset += written
+                        if offset >= len(parts[part]):
+                            part, offset = part + 1, 0
+                            if part == len(parts):
+                                selector.unregister(wfd)
+                                writing = False
+        finally:
+            selector.close()
+            for view in parts:
+                view.release()
+
+    def _interpret(self, reply: bytes) -> _Parsed:
+        (magic, code, detail, problems, reserved,
+         num_rows, num_rgs, num_cols, raw_name) = _worker.REPLY.unpack(reply)
+        counts = (num_rows, num_rgs, num_cols)
+        well_formed = (
+            magic == _worker.REPLY_MAGIC and reserved == 0 and code in _worker.KNOWN_CODES
+            and (code == _worker.CODE_VALID or counts == (0, 0, 0))
+            and (code == _worker.CODE_RESOURCE or detail == 0)
+            and (code == _worker.CODE_INVALID_STRUCTURE or problems == 0)
+            and (code != _worker.CODE_RESOURCE or detail in _worker.KNOWN_RESOURCE_KINDS)
+            and (code != _worker.CODE_INVALID_STRUCTURE
+                 or (problems != 0 and problems & ~_worker.KNOWN_PROBLEM_BITS == 0))
+            and (code == _worker.CODE_UNEXPECTED or raw_name.rstrip(b"\x00") == b"")
         )
-        metadata = parsed.metadata
-        num_rows, num_rgs, num_cols = metadata.num_rows, metadata.num_row_groups, metadata.num_columns
-        rows_sum = sum(metadata.row_group(i).num_rows for i in range(num_rgs))
-        out_of_bounds = _chunk_out_of_bounds(metadata, size - _TRAILER_BYTES - footer_len)
-    except pa.ArrowNotImplementedError:
-        return ParquetMetadataStatus.UNSUPPORTED_METADATA, ("PARQUET_METADATA_UNSUPPORTED",), None
-    except (OSError, pa.ArrowException):
-        return ParquetMetadataStatus.INVALID_PARQUET, ("PARQUET_FOOTER_PARSE_FAILED",), None
-    problems = []
-    if rows_sum != num_rows:
-        problems.append("PARQUET_ROW_GROUP_ROWS_SUM_MISMATCH")
-    if out_of_bounds:
-        problems.append("PARQUET_COLUMN_CHUNK_OUT_OF_BOUNDS")
-    if problems:
-        return ParquetMetadataStatus.INVALID_PARQUET, tuple(problems), None
-    return ParquetMetadataStatus.VALID_PARQUET, ("PARQUET_METADATA_VALID",), (num_rows, num_rgs, num_cols)
+        if not well_formed:
+            self._discard()
+            return _parser_failure("PARSER_WORKER_PROTOCOL_ERROR")
+        if code == _worker.CODE_VALID:
+            return ParquetMetadataStatus.VALID_PARQUET, ("PARQUET_METADATA_VALID",), counts
+        if code == _worker.CODE_INVALID_PARSE:
+            return ParquetMetadataStatus.INVALID_PARQUET, ("PARQUET_FOOTER_PARSE_FAILED",), None
+        if code == _worker.CODE_INVALID_STRUCTURE:
+            reasons = []
+            if problems & _worker.PROBLEM_ROWS_SUM_MISMATCH:
+                reasons.append("PARQUET_ROW_GROUP_ROWS_SUM_MISMATCH")
+            if problems & _worker.PROBLEM_CHUNK_OUT_OF_BOUNDS:
+                reasons.append("PARQUET_COLUMN_CHUNK_OUT_OF_BOUNDS")
+            return ParquetMetadataStatus.INVALID_PARQUET, tuple(reasons), None
+        if code == _worker.CODE_UNSUPPORTED:
+            return ParquetMetadataStatus.UNSUPPORTED_METADATA, ("PARQUET_METADATA_UNSUPPORTED",), None
+        # Resource failure or an unexpected exception: the worker survived but is not trusted again.
+        self._discard()
+        if code == _worker.CODE_RESOURCE:
+            return (ParquetMetadataStatus.UNKNOWN_RESOURCE,
+                    ("PARQUET_PARSER_RESOURCE_EXHAUSTED", _RESOURCE_KIND_CODES[detail]), None)
+        raise ParquetParserUnexpectedError(
+            f"parquet footer worker raised unexpected {_type_name(raw_name)}")
+
+    @staticmethod
+    def _close_pipes(proc: "subprocess.Popen[bytes]") -> None:
+        for stream in (proc.stdin, proc.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def _reap(self) -> Optional[int]:
+        """Exit status of a worker whose output closed; kill it if it somehow lingers."""
+        proc, self._proc = self._proc, None
+        assert proc is not None
+        returncode: Optional[int] = None
+        try:
+            returncode = proc.wait(timeout=_WORKER_SHUTDOWN_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        self._close_pipes(proc)
+        return returncode
+
+    def _discard(self) -> None:
+        """Kill the worker without ceremony."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        self._close_pipes(proc)
+
+    def close(self) -> None:
+        """End of the verification run: let an idle worker exit on EOF, kill it if it does not."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=_WORKER_SHUTDOWN_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        self._close_pipes(proc)
 
 
 def _inspect_open_file(
@@ -314,6 +603,7 @@ def _inspect_open_file(
     evidence: Optional[DeclaredMarkerEvidence],
     file_flags: int,
     limit: int,
+    worker: _ParserWorker,
 ) -> ParquetMetadataVerification:
     try:
         fd = os.open(filename, file_flags, dir_fd=stream_fd)
@@ -461,7 +751,10 @@ def _inspect_open_file(
         if footer_len is None:  # unreachable: structure passed, so the pre-read trailer was plausible
             return _unknown(rec, "TRAILER_CHANGED_DURING_READ", **base)
 
-        status, reasons, facts = _parse_footer(bytes(window), size, footer_len)
+        # The captured, hashed window goes to the isolated worker as-is (no copy, no path). Whatever
+        # the worker does -- verdict, resource failure, crash, timeout -- is a parser outcome; only
+        # the VALID verdict carries parse facts.
+        status, reasons, facts = worker.parse(window, size, footer_len)
         if status is not ParquetMetadataStatus.VALID_PARQUET:
             return _result(rec, status, *reasons, *mismatch_reasons, footer_length=footer_len, **base)
 
@@ -507,7 +800,9 @@ def verify_parquet_metadata(
 
     Raises ``ValueError``, before any filesystem access and without partial results, if the inputs are
     misaligned or hold an inconsistent or fabricated entry, or if ``max_footer_bytes`` is out of range.
-    These checks establish internal consistency only, not authenticity.
+    These checks establish internal consistency only, not authenticity. Raises
+    ``ParquetParserUnexpectedError`` if the isolated parser worker reports a programming error (never
+    for malformed content, resource exhaustion or a crashed worker: those are results).
 
     Observation, not a snapshot transaction (see the module docstring for the binding argument and the
     resource bound).
@@ -555,6 +850,7 @@ def verify_parquet_metadata(
     root_fd: Optional[Union[int, Tuple[str, ...]]] = None
     raw_fd: Optional[Union[int, Tuple[str, ...]]] = None
     stream_fds: dict[str, Union[int, Tuple[str, ...]]] = {}
+    worker = _ParserWorker()          # lazy: no process is started unless a footer needs parsing
 
     try:
         for rec, prior, candidate in zip(records, priors, candidates):
@@ -589,9 +885,10 @@ def verify_parquet_metadata(
                 continue
             output.append(_inspect_open_file(
                 stream_fd, filename, rec, prior, evidence_by_path.get(rec.relative_path),
-                file_flags, limit,
+                file_flags, limit, worker,
             ))
     finally:
+        worker.close()
         for fd in open_fds:
             try:
                 os.close(fd)
