@@ -106,10 +106,12 @@ killed, never reused, after a resource failure, crash, timeout or malformed repl
 parent allows ``WORKER_TIMEOUT_BASE_SECONDS + footer / WORKER_MIN_THROUGHPUT_BYTES_PER_SECOND`` (at
 most ~94 s at the 256 MiB maximum; measured throughput is ~55 MiB/s, the allowance assumes 4 MiB/s) and
 the worker caps its own ``RLIMIT_AS`` at ``already-mapped + WORKER_ADDRESS_SPACE_FACTOR (16) x footer +
-WORKER_ADDRESS_SPACE_SLACK_BYTES (64 MiB)`` (about 1.7x the measured need). Memory at the maximum
-footer limit: this process holds one copy of the footer window (it is handed over without a second
-copy); the worker holds one more plus ~9.5x for the parse, ~2.9 GiB all told, with the worker's address
-space hard-capped at about 4.1 GiB above its baseline. ``RLIMIT_CORE`` is zero in the worker so a
+WORKER_ADDRESS_SPACE_SLACK_BYTES (64 MiB)``. For the reported 7.9 MiB footer that is 191 MiB against
+~76 MiB measured (the factor alone is ~1.7x the measured 9.5x expansion; the slack covers small
+footers). Memory at the maximum footer limit is an *estimate* extrapolated from the measured ratio, not
+a measurement at that size: this process holds one copy of the footer window (it is handed over
+without a second copy); the worker holds one more plus ~9.5x for the parse, roughly 2.9 GiB all told,
+with the worker's address space hard-capped at about 4.1 GiB above its baseline. ``RLIMIT_CORE`` is zero in the worker so a
 native abort cannot write a core file. The address-space limit needs Linux (``resource`` and
 ``/proc/self/statm``); elsewhere the process isolation and timeout still apply. These numbers are
 measurements of one PyArrow version: re-measure when it is upgraded (the real-parser tests exercise
