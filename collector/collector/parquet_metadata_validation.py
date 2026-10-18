@@ -438,21 +438,26 @@ def _inspect_open_file(
         if evidence is not None and evidence.legacy:
             mismatch_reasons.append("DECLARED_MARKER_LEGACY")
 
-        if oversized:
-            # Reached only after the sequential pass completed on a stable descriptor, the SHA-256
-            # and size equal the prior byte-verification evidence, and the trailer matched the
-            # pre-read. No footer byte was captured, so nothing footer-derived is reported.
-            return _result(
-                rec, ParquetMetadataStatus.FOOTER_TOO_LARGE, "FOOTER_EXCEEDS_LIMIT", *mismatch_reasons,
-                footer_length=footer_len, **base,
-            )
-
+        # Precedence (all after the stable pass and the SHA-256/size match against the prior
+        # byte-verification evidence): structural errors provable from the captured leading magic
+        # and trailer come first, and only a structurally plausible file can be reported as having
+        # an oversized footer. The oversized footer is never buffered, so these checks use only the
+        # 4-byte head and the 8-byte trailer, which are captured in every case.
         structure = _structure_reasons(size, bytes(head), bytes(window))
         if structure:
             declared_len = (int.from_bytes(window[-_TRAILER_BYTES:][:4], "little")
                             if size >= _MIN_PARQUET_BYTES else None)
             return _result(rec, ParquetMetadataStatus.INVALID_PARQUET, *structure, *mismatch_reasons,
                            footer_length=declared_len, **base)
+
+        if oversized:
+            # Basic structure is plausible and the bytes equal the prior evidence. No footer byte
+            # was captured, so nothing footer-derived is reported.
+            return _result(
+                rec, ParquetMetadataStatus.FOOTER_TOO_LARGE, "FOOTER_EXCEEDS_LIMIT", *mismatch_reasons,
+                footer_length=footer_len, **base,
+            )
+
         if footer_len is None:  # unreachable: structure passed, so the pre-read trailer was plausible
             return _unknown(rec, "TRAILER_CHANGED_DURING_READ", **base)
 

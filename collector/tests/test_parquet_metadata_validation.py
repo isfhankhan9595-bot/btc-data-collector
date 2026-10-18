@@ -729,6 +729,54 @@ def test_oversized_footer_is_reported_only_after_the_full_digest_matches_the_pri
     assert result.num_rows is None
 
 
+def test_invalid_leading_magic_is_classified_invalid_parquet_before_oversized_footer(
+        tmp_path, monkeypatch):
+    """Regression: with an unchanged file (digest equals the prior byte-verification evidence), an
+    invalid leading magic used to be masked as FOOTER_TOO_LARGE because the oversized-footer return
+    preceded the structural checks. Precedence: digest match -> provable structural errors ->
+    footer size limit."""
+    good = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    flen = _footer_len(good)
+    assert flen > 1000
+    bad = b"XXXX" + good[4:]                      # leading magic destroyed; trailer still plausible
+    assert bad[:4] != pmv.PARQUET_MAGIC and bad[-4:] == pmv.PARQUET_MAGIC
+    assert _footer_len(bad) == flen and flen <= len(bad) - pmv._MIN_PARQUET_BYTES
+    _put(tmp_path, payload=bad, marker=False)
+
+    # The real byte-verification stage hashes exactly these malformed bytes, so the prior digest
+    # legitimately matches the file under test.
+    discovery, markers, byte_results = _stages(tmp_path)
+    (prior,) = byte_results
+    assert prior.status is SegmentVerificationStatus.HASHED_STABLE
+    assert prior.observed_size == len(bad)
+    assert prior.observed_sha256 == hashlib.sha256(bad).hexdigest()
+
+    sizes = _track_buffer_sizes(monkeypatch)
+    _forbid_parser(monkeypatch)
+    for name in ("read_metadata", "read_table", "read_schema"):
+        monkeypatch.setattr(
+            pmv.pq, name,
+            lambda *a, **k: pytest.fail("an oversized footer must never reach PyArrow"))
+
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
+                                        max_footer_bytes=flen - 1)
+
+    assert result.status is P.INVALID_PARQUET
+    assert result.status is not P.FOOTER_TOO_LARGE
+    assert result.reasons == ("PARQUET_HEAD_MAGIC_INVALID",)
+    assert "FOOTER_EXCEEDS_LIMIT" not in result.reasons
+    # The classification is only reached after the full digest matched the prior evidence.
+    assert result.byte_evidence_matches_prior is True
+    assert result.observed_size == len(bad)
+    assert result.bytes_hashed == len(bad)
+    assert result.observed_sha256 == prior.observed_sha256
+    # No footer-derived facts are fabricated.
+    assert result.footer_length == flen
+    assert result.num_rows is None and result.num_row_groups is None and result.num_columns is None
+    # The oversized footer is never buffered: only the 4-byte head and 8-byte trailer are captured.
+    assert sizes and max(sizes) <= pmv._TRAILER_BYTES < flen
+
+
 def test_buffer_spy_control_a_footer_within_the_limit_is_captured_in_full(tmp_path, monkeypatch):
     """Proves the buffer spy used by the oversized tests can actually see a footer capture."""
     payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
