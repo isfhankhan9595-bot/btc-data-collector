@@ -661,24 +661,187 @@ def test_unexpected_exception_types_are_not_swallowed(tmp_path, monkeypatch):
 # footer resource bound
 # ----------------------------------------------------------------------------------------------
 
+def _track_buffer_sizes(monkeypatch):
+    """Record the length of every ``bytearray`` the verifier grows with ``+=`` (its ``head`` and
+    ``window`` capture buffers). The module-global name shadows the builtin only inside ``pmv``."""
+    sizes = []
+
+    class _Spy(bytearray):
+        def __iadd__(self, other):
+            result = super().__iadd__(other)
+            sizes.append(len(self))
+            return result
+
+    monkeypatch.setattr(pmv, "bytearray", _Spy, raising=False)
+    return sizes
+
+
+def _forbid_parser(monkeypatch):
+    monkeypatch.setattr(pmv.pq, "ParquetFile",
+                        lambda *a, **k: pytest.fail("an oversized footer must never reach the parser"))
+
+
+def _many_row_group_pair():
+    """Two real, distinct Parquet files of exactly the same size with footers > 1000 bytes."""
+    original = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    replacement = _parquet(groups=tuple(((f"w{i:03d}", i),) for i in range(50)))
+    assert len(original) == len(replacement) and original != replacement
+    assert _footer_len(original) > 1000 and _footer_len(replacement) > 1000
+    return original, replacement
+
+
 def test_oversized_footer_is_rejected_before_the_footer_is_buffered_or_parsed(tmp_path, monkeypatch):
     payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
     _put(tmp_path, payload=payload, marker=False)
     discovery, markers, byte_results = _stages(tmp_path)
     flen = _footer_len(payload)
     assert flen > 1000
-    reads = []
-    monkeypatch.setattr(pmv.os, "read", lambda *a: reads.append(a) or _REAL_READ(*a))
-    monkeypatch.setattr(pmv.pq, "ParquetFile",
-                        lambda *a, **k: pytest.fail("an oversized footer must never reach the parser"))
+    sizes = _track_buffer_sizes(monkeypatch)
+    _forbid_parser(monkeypatch)
 
     (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
                                         max_footer_bytes=flen - 1)
     assert result.status is P.FOOTER_TOO_LARGE
     assert result.reasons == ("FOOTER_EXCEEDS_LIMIT",)
     assert result.footer_length == flen
+    assert result.num_rows is None and result.num_row_groups is None and result.num_columns is None
+    # The oversized footer is never buffered: only the 4-byte head and 8-byte trailer are captured.
+    assert sizes and max(sizes) <= pmv._TRAILER_BYTES < flen
+
+
+def test_oversized_footer_is_reported_only_after_the_full_digest_matches_the_prior_evidence(tmp_path):
+    payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    _put(tmp_path, payload=payload)                      # real VALID_V2 marker
+    discovery, markers, byte_results = _stages(tmp_path)
+    (prior,) = byte_results
+    assert prior.status is SegmentVerificationStatus.HASHED_STABLE
+
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
+                                        max_footer_bytes=_footer_len(payload) - 1)
+    assert result.status is P.FOOTER_TOO_LARGE
+    assert result.byte_evidence_matches_prior is True
+    assert result.observed_size == len(payload)
+    assert result.bytes_hashed == len(payload)           # the complete sequential pass finished
+    assert result.observed_sha256 == prior.observed_sha256 == hashlib.sha256(payload).hexdigest()
+    # Byte-level marker comparisons are facts about the hashed bytes; footer-derived ones are not made.
+    assert result.declared_size_matches is True and result.declared_sha256_matches is True
+    assert result.declared_record_count_matches is None
     assert result.num_rows is None
-    assert result.bytes_hashed == 0 and reads == []
+
+
+def test_buffer_spy_control_a_footer_within_the_limit_is_captured_in_full(tmp_path, monkeypatch):
+    """Proves the buffer spy used by the oversized tests can actually see a footer capture."""
+    payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    _put(tmp_path, payload=payload, marker=False)
+    discovery, markers, byte_results = _stages(tmp_path)
+    sizes = _track_buffer_sizes(monkeypatch)
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results)
+    assert result.status is P.VALID_PARQUET
+    assert max(sizes) == pmv._TRAILER_BYTES + _footer_len(payload)
+
+
+@pytest.mark.parametrize("how", ["in_place", "rename"])
+def test_oversized_footer_cannot_bypass_prior_digest_verification_via_same_size_replacement(
+        tmp_path, monkeypatch, how):
+    """Regression: a footer over the limit used to return FOOTER_TOO_LARGE before the file was hashed,
+    so a same-size replacement made after byte verification was reported as an oversized-footer
+    version of the verified file."""
+    original, replacement = _many_row_group_pair()
+    seg = _put(tmp_path, payload=original, marker=False)
+    discovery, markers, byte_results = _stages(tmp_path)
+    (prior,) = byte_results
+    assert prior.status is SegmentVerificationStatus.HASHED_STABLE
+    if how == "in_place":
+        st = seg.stat()
+        seg.write_bytes(replacement)
+        os.utime(seg, ns=(st.st_atime_ns, st.st_mtime_ns))
+    else:
+        other = seg.with_name("replacement.tmp")
+        other.write_bytes(replacement)
+        os.replace(other, seg)
+    assert seg.stat().st_size == prior.observed_size
+    limit = _footer_len(replacement) - 1                 # below the replacement's declared footer
+    sizes = _track_buffer_sizes(monkeypatch)
+    _forbid_parser(monkeypatch)
+
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
+                                        max_footer_bytes=limit)
+    assert result.status is P.UNKNOWN_IO
+    assert result.status is not P.FOOTER_TOO_LARGE
+    assert "FOOTER_EXCEEDS_LIMIT" not in result.reasons
+    assert "BYTES_CHANGED_SINCE_BYTE_VERIFICATION" in result.reasons
+    assert "BYTE_VERIFICATION_SHA256_DIFFERS" in result.reasons
+    assert result.byte_evidence_matches_prior is False
+    assert result.observed_sha256 == hashlib.sha256(replacement).hexdigest() != prior.observed_sha256
+    assert result.bytes_hashed == len(replacement)
+    assert result.footer_length is None
+    assert result.num_rows is None and result.num_row_groups is None and result.num_columns is None
+    assert max(sizes) <= pmv._TRAILER_BYTES
+
+
+def test_oversized_footer_file_that_grows_during_the_pass_is_unknown_not_oversized(tmp_path, monkeypatch):
+    payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    seg = _put(tmp_path, payload=payload, marker=False)
+    discovery, markers, byte_results = _stages(tmp_path)
+    changed = False
+
+    def read_then_append(fd, count):
+        nonlocal changed
+        chunk = _REAL_READ(fd, count)
+        if chunk and not changed:
+            changed = True
+            with seg.open("ab") as handle:
+                handle.write(b"x")
+        return chunk
+
+    monkeypatch.setattr(pmv.os, "read", read_then_append)
+    _forbid_parser(monkeypatch)
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
+                                        max_footer_bytes=_footer_len(payload) - 1)
+    assert result.status is P.UNKNOWN_IO
+    assert "SEGMENT_GREW_DURING_READ" in result.reasons
+    assert result.num_rows is None
+
+
+def test_oversized_footer_file_replaced_during_the_pass_is_unknown_not_oversized(tmp_path, monkeypatch):
+    payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    seg = _put(tmp_path, payload=payload, marker=False)
+    discovery, markers, byte_results = _stages(tmp_path)
+    replaced = False
+
+    def read_then_replace(fd, count):
+        nonlocal replaced
+        chunk = _REAL_READ(fd, count)
+        if chunk and not replaced:
+            replaced = True
+            other = seg.with_name("swap.tmp")
+            other.write_bytes(seg.read_bytes())          # identical bytes, different inode
+            os.replace(other, seg)
+        return chunk
+
+    monkeypatch.setattr(pmv.os, "read", read_then_replace)
+    _forbid_parser(monkeypatch)
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
+                                        max_footer_bytes=_footer_len(payload) - 1)
+    assert result.status is P.UNKNOWN_IO
+    assert "SEGMENT_REPLACED_DURING_READ" in result.reasons
+
+
+def test_oversized_footer_with_a_trailer_that_changes_between_preread_and_pass_fails_closed(
+        tmp_path, monkeypatch):
+    payload = _parquet(groups=tuple(((f"v{i:03d}", i),) for i in range(50)))
+    _put(tmp_path, payload=payload, marker=False)
+    discovery, markers, byte_results = _stages(tmp_path)
+    flen = _footer_len(payload)
+    # The pre-read reports a different (still oversized, still plausible) trailer than the pass reads.
+    lying = struct.pack("<I", flen + 1) + b"PAR1"
+    monkeypatch.setattr(pmv.os, "pread", lambda fd, n, off: lying)
+    _forbid_parser(monkeypatch)
+    (result,) = verify_parquet_metadata(tmp_path, discovery, markers, byte_results,
+                                        max_footer_bytes=flen - 1)
+    assert result.status is P.UNKNOWN_IO
+    assert result.reasons == ("TRAILER_CHANGED_DURING_READ",)
+    assert result.byte_evidence_matches_prior is True
 
 
 def test_footer_exactly_at_the_limit_is_accepted(tmp_path):
