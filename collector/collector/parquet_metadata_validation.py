@@ -35,7 +35,11 @@ footer to the earlier digest. Only metadata is parsed; no row group or data page
 Footer resource bound
 ---------------------
 The trailing 4-byte length is read and checked *before* any footer bytes are buffered or handed to the
-parser. ``DEFAULT_MAX_FOOTER_BYTES`` (32 MiB) is derived from the writer, not chosen arbitrarily:
+parser. A footer over the limit is never buffered or parsed, but the file still gets the full hashing
+pass and must match the prior byte evidence before ``FOOTER_TOO_LARGE`` is reported; a mismatch is
+``UNKNOWN_IO``, exactly as for any other file.
+
+``DEFAULT_MAX_FOOTER_BYTES`` (32 MiB) is derived from the writer, not chosen arbitrarily:
 ``ParquetWriter`` flushes one row group per ``write_table`` call (>= 1 row each) and rotates segments
 at ``segment_rows`` (5,000 by default, never configured higher in this repository); the widest
 repository schema has 26 columns and PyArrow 24 measured about 110-120 bytes of footer per column
@@ -122,7 +126,8 @@ class ParquetMetadataStatus(str, Enum):
     #: Actual file content demonstrates a malformed Parquet structure (see ``reasons``).
     INVALID_PARQUET = "INVALID_PARQUET"
     #: The trailer declares a footer larger than the configured limit. The footer was not buffered or
-    #: parsed. This is a resource decision, not evidence of corruption.
+    #: parsed, but the file's bytes were fully hashed and proved equal to the earlier byte evidence
+    #: first. This is a resource decision, not evidence of corruption.
     FOOTER_TOO_LARGE = "FOOTER_TOO_LARGE"
     #: The parser reported a feature it does not support. Not proof of corruption, not readable.
     UNSUPPORTED_METADATA = "UNSUPPORTED_METADATA"
@@ -344,6 +349,7 @@ def _inspect_open_file(
         window_len = min(size, _TRAILER_BYTES)
         footer_len: Optional[int] = None
         pre_trailer: Optional[bytes] = None
+        oversized = False
         if size >= _MIN_PARQUET_BYTES:
             try:
                 pre_trailer = _read_trailer(fd, size)
@@ -356,19 +362,13 @@ def _inspect_open_file(
             if pre_trailer[4:] == PARQUET_MAGIC and 0 < declared <= size - _MIN_PARQUET_BYTES:
                 footer_len = declared
                 if declared > limit:
-                    try:
-                        second = os.fstat(fd)
-                        same_path = _path_still_names(stream_fd, filename, first)
-                    except OSError as exc:
-                        return _unknown(rec, "SEGMENT_STABILITY_CHECK_FAILED",
-                                        f"ERRNO_{_errno_name(exc)}", observed_size=size)
-                    if not same_path or _stable_identity(first) != _stable_identity(second):
-                        return _unknown(rec, "SEGMENT_CHANGED_DURING_READ", observed_size=size)
-                    return _result(
-                        rec, ParquetMetadataStatus.FOOTER_TOO_LARGE, "FOOTER_EXCEEDS_LIMIT",
-                        observed_size=size, footer_length=declared,
-                    )
-                window_len = _TRAILER_BYTES + declared
+                    # A resource decision about the footer, not a reason to skip byte identity: keep
+                    # the capture window at the 8-byte trailer (the footer is never buffered or
+                    # parsed) but still run the full hashing pass below, and only report
+                    # FOOTER_TOO_LARGE once that pass has proved the bytes equal the prior evidence.
+                    oversized = True
+                else:
+                    window_len = _TRAILER_BYTES + declared
 
         # One bounded sequential pass over the single descriptor: hash everything, capture only the
         # leading magic and the trailing window.
@@ -437,6 +437,15 @@ def _inspect_open_file(
             mismatch_reasons.append("DECLARED_SHA256_MISMATCH")
         if evidence is not None and evidence.legacy:
             mismatch_reasons.append("DECLARED_MARKER_LEGACY")
+
+        if oversized:
+            # Reached only after the sequential pass completed on a stable descriptor, the SHA-256
+            # and size equal the prior byte-verification evidence, and the trailer matched the
+            # pre-read. No footer byte was captured, so nothing footer-derived is reported.
+            return _result(
+                rec, ParquetMetadataStatus.FOOTER_TOO_LARGE, "FOOTER_EXCEEDS_LIMIT", *mismatch_reasons,
+                footer_length=footer_len, **base,
+            )
 
         structure = _structure_reasons(size, bytes(head), bytes(window))
         if structure:
