@@ -82,11 +82,13 @@ from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import BookQuality, QualityEventType
 from collector.collector.quality_wal import QualityEventWAL, QualityWALCapacityExceeded, QualityWALCorruption
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
+from collector.collector.loop_teardown import run_bounded, teardown_exit_status
 from collector.collector.standalone_failure_policy import (
     CloseOnce,
     LateFinalizer,
     StandaloneFailurePolicy,
     await_client_idle,
+    writer_already_failed,
     build_stream_table,
     supervise_standalone_runner,
     tag_route,
@@ -1326,11 +1328,14 @@ class BybitCollectorApp:
         last precisely so this reporting path works.
         """
         closed_ok = True
+        was_failed = writer_already_failed(writer)
         try:
             writer.close()
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
             closed_ok = False
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
+            if not was_failed:      # a healthy writer failed to publish its final segment: never exit 0
+                self.failure_policy.record_shutdown_failure(f"writer_close_failed:{writer_name}")
             if writer_name != "quality_writer":
                 try:
                     self._persist_quality_event({
@@ -1381,6 +1386,15 @@ async def _run_supervised(app: "BybitCollectorApp", stop: asyncio.Event) -> int:
     return status
 
 
+def _entry(data_dir: str, url: str) -> int:
+    """The process entry: ``_main`` under a BOUNDED event-loop teardown (``loop_teardown``).
+
+    ``asyncio.run`` would wait without limit for a task that swallowed its cancellation, ignoring SIGTERM and
+    SIGINT meanwhile and losing the latched exit status to a SIGKILL. Never returns 0 with a task left alive."""
+    status, stuck = run_bounded(_main(data_dir, url))
+    return teardown_exit_status(status, stuck)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="data")
@@ -1390,4 +1404,4 @@ if __name__ == "__main__":
     logger.info("bybit_collector_starting", url=args.url, data_dir=args.data_dir,
                note="requires outbound access to stream.bybit.com:443; "
                     "not available in every environment")
-    raise SystemExit(asyncio.run(_main(args.data_dir, args.url)))
+    raise SystemExit(_entry(args.data_dir, args.url))

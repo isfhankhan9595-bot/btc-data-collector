@@ -38,6 +38,7 @@ from collector.collector.failure_topology import FailureRecord
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RawCapture
+from collector.collector.loop_teardown import run_bounded, teardown_exit_status
 from collector.collector.standalone_failure_policy import (
     CloseOnce, DegradedQualityLossReporting, LateFinalizer, StandaloneFailurePolicy, await_client_idle,
     build_stream_table)
@@ -416,13 +417,13 @@ def main(argv=None) -> int:
         channels = sorted(OKXAdapter().declared_channels())
     app = OKXCaptureApp(channels, args.inst_id, args.data_dir, args.url)
     duration = None if args.forever else args.duration
-    status = asyncio.run(app.run(duration))
+    status, stuck = run_bounded(app.run(duration))
     if app.failure_policy.terminal_failure is not None:
         status = {**status, "terminal_failure": app.failure_policy.terminal_failure.as_dict()}
     if app.failure_policy.shutdown_failure is not None:
         status = {**status, "shutdown_failure": app.failure_policy.shutdown_failure}
     print(json.dumps(status, indent=2, default=str))
-    return app.exit_code
+    return teardown_exit_status(app.exit_code, stuck)
 
 
 if __name__ == "__main__":

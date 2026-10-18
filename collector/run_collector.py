@@ -57,7 +57,8 @@ from collector.collector.failure_topology import (
     classify_stream,
 )
 from collector.collector.websocket_client import WebSocketClient
-from collector.collector.standalone_failure_policy import EXIT_RUN_TASK_CRASHED
+from collector.collector.standalone_failure_policy import EXIT_RUN_TASK_CRASHED, writer_already_failed
+from collector.collector.loop_teardown import run_bounded, teardown_exit_status
 
 STREAM_INACTIVE_STARTUP_SECONDS = 60
 #: Extra wait, after the hard-cancel fallback, for a client's tail to retire its worker
@@ -2501,11 +2502,14 @@ class CollectorApp:
         if writer is None:
             return True
         closed_ok = True
+        was_failed = writer_already_failed(writer)
         try:
             writer.close()
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
             closed_ok = False
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
+            if not was_failed:      # a healthy writer failed to publish its final segment: never exit 0
+                self._record_shutdown_failure(f"writer_close_failed:{writer_name}")
             if writer_name != "quality_writer":
                 try:
                     self._persist_quality_event({
@@ -2532,8 +2536,9 @@ def main(app_factory=None) -> int:
     and nothing in a worker calls it."""
     validate_telegram_startup()
     app = (app_factory or CollectorApp)()
+    stuck: list = []
     try:
-        asyncio.run(app.start())
+        _, stuck = run_bounded(app.start())
     except KeyboardInterrupt:
         pass
     except Exception as exc:  # noqa: BLE001
@@ -2543,7 +2548,7 @@ def main(app_factory=None) -> int:
         # EXIT_FATAL_STORAGE, not whatever the teardown tripped over afterwards.
         logger.error("collector_exception_after_terminal_failure",
                      error=f"{type(exc).__name__}: {exc}")
-    return app.exit_code
+    return teardown_exit_status(app.exit_code, stuck)
 
 
 if __name__ == "__main__":

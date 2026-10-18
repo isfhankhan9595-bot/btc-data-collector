@@ -56,7 +56,7 @@ __all__ = [
     "DEDUP_DEFAULT_STREAM", "ROUTE_TAG_ATTRIBUTE", "tag_route", "build_stream_table",
     "StandaloneFailurePolicy", "supervise_standalone_runner", "await_client_idle", "cancel_and_wait", "REST_PRODUCER_CANCEL_BOUND_S",
     "NO_QUALITY_WAL_NOTE", "UNCONFIRMED_QUALITY_EVENT_NOTE", "is_bounded_report_point",
-    "DegradedQualityLossReporting",
+    "DegradedQualityLossReporting", "writer_already_failed",
 ]
 
 #: Exit status when the application task died of an exception that is NOT a
@@ -421,6 +421,19 @@ class DegradedQualityLossReporting:
                 note=_final_quality_note(lost, unconfirmed))
         except Exception:  # noqa: BLE001 - a final report must never mask a failure or stop cleanup
             pass
+
+
+def writer_already_failed(writer: Any) -> bool:
+    """True when ``writer`` had ALREADY latched a storage failure before shutdown tried to close it.
+
+    Such a failure was reported (and classified) when it happened; a close that merely re-raises it is not
+    a new shutdown failure. A close that fails on a writer that was healthy is: its final segment was not
+    published and nothing else has said so. Unknown or non-standard writers count as healthy, so a failed
+    close is reported rather than hidden."""
+    try:
+        return writer.failure_snapshot() is not None
+    except Exception:  # noqa: BLE001 - never let the check itself break a close path
+        return False
 
 
 async def await_client_idle(client: Any, policy: "StandaloneFailurePolicy") -> bool:
