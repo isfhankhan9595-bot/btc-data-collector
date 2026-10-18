@@ -74,7 +74,8 @@ Two consequences are built in:
   ================================  ===================================================================
   ``VALID_PARQUET``                 footer parsed and passed the structural checks
   ``INVALID_PARQUET``               parser reported malformed content (``OSError``/``ArrowException``
-                                    such as a thrift failure) or the footer contradicts itself
+                                    such as a thrift failure, or ``UnicodeDecodeError`` from an
+                                    undecodable column name) or the footer contradicts itself
   ``UNSUPPORTED_METADATA``          ``ArrowNotImplementedError``
   ``UNKNOWN_RESOURCE``              recognised resource exhaustion: ``pa.ArrowMemoryError``,
                                     ``MemoryError``, or the exact ``std::bad_alloc`` ``OSError``
@@ -85,14 +86,22 @@ Two consequences are built in:
                                     garbage. Reasons: ``PARQUET_PARSER_WORKER_FAILED`` plus
                                     ``PARSER_WORKER_<SIGNAL_<name>|EXIT_CODE_<n>|NO_REPLY|TIMED_OUT|
                                     PROTOCOL_ERROR|START_FAILED>``. The cause is *not* assumed to be
-                                    memory exhaustion even when it may be.
+                                    memory exhaustion even when it may be. Also: the worker replied
+                                    validly but reported an exception that says nothing about the file
+                                    (see below). Reasons: ``PARQUET_PARSER_UNEXPECTED_EXCEPTION`` plus
+                                    ``PARSER_EXCEPTION_<sanitised exception type name>``.
   ================================  ===================================================================
 
   ``pa.ArrowMemoryError`` is a subclass of ``pa.ArrowException`` and ``MemoryError``, so it is
   recognised before the generic "malformed content" rule; the ``std::bad_alloc`` signature is matched
   exactly rather than as a substring, so a footer cannot relabel a parse failure by embedding the text.
-  Any *other* exception in the worker is a programming error and raises
-  ``ParquetParserUnexpectedError`` (type name only); it is never turned into a verdict about the file.
+  Any *other* exception in the worker (not malformed-content evidence, not an unsupported feature, not
+  a recognised resource failure) says nothing about the file. That one file is
+  ``UNKNOWN_PARSER_FAILURE`` with only the exception's sanitised *type name* in ``reasons`` (never its
+  text), the worker is retired, and every other file in the call is processed and reported normally:
+  one file's parser outcome never discards another file's result. It is never turned into
+  ``INVALID_PARQUET`` and never into a validity claim. A defect in this module's own code is a different
+  thing: it is not a parser outcome and propagates as an ordinary exception.
   For ``UNKNOWN_RESOURCE`` and ``UNKNOWN_PARSER_FAILURE`` every footer-derived field (``num_rows``,
   ``num_row_groups``, ``num_columns``, ``declared_record_count_matches``,
   ``marker_claims_corroborated_by_bytes``) is ``None``; the facts of the completed hash pass
@@ -127,9 +136,12 @@ Honest limits
 * ``marker_validations`` and ``byte_verifications`` are checked for internal consistency only; a
   caller-built result cannot be authenticated.
 * Exceptions raised by PyArrow while parsing in-memory bytes (including ``OSError``, which PyArrow
-  uses for thrift failures) are content evidence, not I/O failures -- except recognised resource
-  failures, which are ``UNKNOWN_RESOURCE``. Any other exception type is deliberately not turned into a
-  verdict: an unexpected failure is loud (``ParquetParserUnexpectedError``), not mislabelled. The
+  uses for thrift failures, and ``UnicodeDecodeError`` for an undecodable column name) are content
+  evidence, not I/O failures -- except recognised resource failures, which are ``UNKNOWN_RESOURCE``.
+  Any other exception type is deliberately not turned into a verdict about the file: it is
+  ``UNKNOWN_PARSER_FAILURE`` for that file alone, never mislabelled as corruption. A systemic worker
+  defect therefore appears as ``UNKNOWN_PARSER_FAILURE`` on every parsed file (never as a valid
+  result); a caller should treat a whole batch of them as an operational alarm. The
   ``std::bad_alloc`` signature is the one PyArrow 24.0.0 produced; if a PyArrow upgrade changes it, a
   resource failure would read as malformed content. The real-parser constrained-memory test is the
   canary for that.
@@ -213,10 +225,11 @@ class ParquetMetadataStatus(str, Enum):
     #: metadata is valid was not established. NOT evidence of corruption and NOT a validity claim:
     #: no parse facts are reported. The byte-level facts of the completed hash pass are kept.
     UNKNOWN_RESOURCE = "UNKNOWN_RESOURCE"
-    #: The isolated parser worker could not be started, died, timed out, or answered with something
-    #: untrustworthy, so no parse result exists. The cause is deliberately *not* assumed to be memory
-    #: exhaustion (``reasons`` carries the exit signal/code, never process output). NOT evidence of
-    #: corruption; no parse facts; the byte-level facts of the completed hash pass are kept.
+    #: The isolated parser worker could not be started, died, timed out, answered with something
+    #: untrustworthy, or reported an exception that says nothing about the file, so no parse result
+    #: exists. The cause is deliberately *not* assumed to be memory exhaustion (``reasons`` carries the
+    #: exit signal/code or the exception type name, never process output or exception text). NOT
+    #: evidence of corruption; no parse facts; the byte-level facts of the completed hash pass are kept.
     UNKNOWN_PARSER_FAILURE = "UNKNOWN_PARSER_FAILURE"
 
 
@@ -364,12 +377,6 @@ _RESOURCE_KIND_CODES = {
 }
 
 _Parsed = Tuple[ParquetMetadataStatus, Tuple[str, ...], Optional[Tuple[int, int, int]]]
-
-
-class ParquetParserUnexpectedError(RuntimeError):
-    """The isolated parser worker raised something that is neither evidence of malformed content,
-    an unsupported feature, nor a recognised resource failure: a programming error. It is raised, never
-    turned into a verdict about the file. The message carries only the exception *type name*."""
 
 
 def _address_space_budget(footer_len: int) -> int:
@@ -542,8 +549,11 @@ class _ParserWorker:
         if code == _worker.CODE_RESOURCE:
             return (ParquetMetadataStatus.UNKNOWN_RESOURCE,
                     ("PARQUET_PARSER_RESOURCE_EXHAUSTED", _RESOURCE_KIND_CODES[detail]), None)
-        raise ParquetParserUnexpectedError(
-            f"parquet footer worker raised unexpected {_type_name(raw_name)}")
+        # CODE_UNEXPECTED, a well-formed reply: the parser raised something that is not evidence about
+        # this file. That is this file's outcome, not a reason to lose the other files' results; it is
+        # neither corruption nor a validity claim, and only the sanitised type name is carried.
+        return (ParquetMetadataStatus.UNKNOWN_PARSER_FAILURE,
+                ("PARQUET_PARSER_UNEXPECTED_EXCEPTION", f"PARSER_EXCEPTION_{_type_name(raw_name)}"), None)
 
     @staticmethod
     def _close_pipes(proc: "subprocess.Popen[bytes]") -> None:
@@ -802,9 +812,10 @@ def verify_parquet_metadata(
 
     Raises ``ValueError``, before any filesystem access and without partial results, if the inputs are
     misaligned or hold an inconsistent or fabricated entry, or if ``max_footer_bytes`` is out of range.
-    These checks establish internal consistency only, not authenticity. Raises
-    ``ParquetParserUnexpectedError`` if the isolated parser worker reports a programming error (never
-    for malformed content, resource exhaustion or a crashed worker: those are results).
+    These checks establish internal consistency only, not authenticity. Nothing a file or the parser
+    does raises: malformed content, resource exhaustion, a crashed or hung worker and an unexpected
+    parser exception are all per-file results, so one file's outcome never discards another's. (A defect
+    in this module's own code is not a parser outcome and propagates.)
 
     Observation, not a snapshot transaction (see the module docstring for the binding argument and the
     resource bound).

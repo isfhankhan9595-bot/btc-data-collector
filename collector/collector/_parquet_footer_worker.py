@@ -64,7 +64,7 @@ CODE_INVALID_PARSE = 2          # parser reported malformed content (thrift/form
 CODE_INVALID_STRUCTURE = 3      # footer parsed but contradicts itself; ``problems`` says how
 CODE_UNSUPPORTED = 4            # parser reported an unsupported feature
 CODE_RESOURCE = 5               # parser exhausted a resource; ``detail`` says which kind
-CODE_UNEXPECTED = 6             # any other exception: a programming error, to be raised loudly
+CODE_UNEXPECTED = 6             # any other exception: says nothing about the file; type name only
 KNOWN_CODES = frozenset({CODE_VALID, CODE_INVALID_PARSE, CODE_INVALID_STRUCTURE, CODE_UNSUPPORTED,
                          CODE_RESOURCE, CODE_UNEXPECTED})
 
@@ -110,7 +110,14 @@ def classify_exception(exc: BaseException) -> Outcome:
     Order matters: ``pa.ArrowMemoryError`` is both a ``MemoryError`` and a ``pa.ArrowException``, so
     memory exhaustion is recognised *before* the generic ``ArrowException``/``OSError`` rule that
     means "malformed content". Only exception types that are positive evidence of malformed content
-    are classified as such; everything else is ``CODE_UNEXPECTED`` and must be loud.
+    are classified as such; everything else is ``CODE_UNEXPECTED``, which the parent reports for that
+    one file as an unknown parser outcome (type name only) -- never as a verdict about the file.
+
+    ``UnicodeDecodeError`` is malformed-content evidence: PyArrow decodes the footer's column names to
+    ``str``, so invalid UTF-8 in an encoded name raises it (reproduced with PyArrow 24.0.0 by changing
+    one byte of a name), and the only input here is the in-memory footer. It is a ``ValueError``, so
+    neither the ``OSError`` nor the ``pa.ArrowException`` rule covers it. The rule is deliberately this
+    narrow: ``ValueError``, ``UnicodeError`` and ``UnicodeEncodeError`` stay ``CODE_UNEXPECTED``.
     """
     if isinstance(exc, pa.ArrowNotImplementedError):
         return Outcome(CODE_UNSUPPORTED)
@@ -120,7 +127,7 @@ def classify_exception(exc: BaseException) -> Outcome:
         return Outcome(CODE_RESOURCE, detail=RESOURCE_MEMORY_ERROR)
     if isinstance(exc, OSError) and str(exc).rstrip() == BAD_ALLOC_OSERROR_MESSAGE:
         return Outcome(CODE_RESOURCE, detail=RESOURCE_STD_BAD_ALLOC)
-    if isinstance(exc, (OSError, pa.ArrowException)):
+    if isinstance(exc, (OSError, pa.ArrowException, UnicodeDecodeError)):
         return Outcome(CODE_INVALID_PARSE)
     return Outcome(CODE_UNEXPECTED, name=type(exc).__name__)
 
@@ -148,9 +155,10 @@ def _chunk_out_of_bounds(metadata, data_end: int) -> bool:
 def parse_footer(window, size: int, footer_len: int) -> Outcome:
     """Parse captured footer bytes from memory. Pure; the only I/O is the parser reading ``window``.
 
-    PyArrow's parse of an in-memory buffer cannot perform I/O, so its ``OSError`` (thrift failures)
-    and ``ArrowException`` family are content evidence -- except for the recognised resource
-    failures, which are classified first (see ``classify_exception``).
+    PyArrow's parse of an in-memory buffer cannot perform I/O, so its ``OSError`` (thrift failures),
+    ``ArrowException`` family and ``UnicodeDecodeError`` (invalid UTF-8 in a decoded name) are content
+    evidence -- except for the recognised resource failures, which are classified first (see
+    ``classify_exception``).
     """
     try:
         parsed = pq.ParquetFile(

@@ -220,6 +220,39 @@ def _many_row_groups(count: int) -> bytes:
     return _parquet(groups=tuple(((f"v{i:06d}", i),) for i in range(count)))
 
 
+CORRUPT_COLUMN = "price_col"
+_CORRUPT_SCHEMA = pa.schema([("ts", pa.int64()), (CORRUPT_COLUMN, pa.string())])
+
+
+def _parquet_with_unique_column() -> bytes:
+    """Valid real Parquet (3 rows, 2 row groups, 2 columns) with a column name no other fixture uses."""
+    buf = io.BytesIO()
+    writer = pq.ParquetWriter(buf, _CORRUPT_SCHEMA, compression="NONE")
+    for rows in ((("aaaa", 1), ("bbbb", 2)), (("cccc", 3),)):
+        writer.write_table(pa.table(
+            {"ts": [r[1] for r in rows], CORRUPT_COLUMN: [r[0] for r in rows]}, schema=_CORRUPT_SCHEMA))
+    writer.close()
+    return buf.getvalue()
+
+
+def _parquet_with_corrupt_column_name() -> bytes:
+    """Real Parquet whose footer holds one invalid UTF-8 byte inside the encoded name of a column.
+
+    The corruption is a single-byte substitution at the first occurrence of the (unique) column name in
+    the footer, which is the schema element PyArrow decodes; the later ``path_in_schema`` copies are not
+    decoded by PyArrow 24.0.0 and do not reproduce the failure. File size, both magics and the declared
+    footer length are untouched, so this is a structurally plausible file whose footer cannot be decoded
+    -- not a byte flip that merely damages a magic. ``test_the_corrupt_footer_fixture_...`` proves in a
+    child process that it raises ``UnicodeDecodeError`` in the pinned PyArrow.
+    """
+    data = bytearray(_parquet_with_unique_column())
+    footer_start = len(data) - 8 - _footer_len(bytes(data))
+    at = data.find(CORRUPT_COLUMN.encode(), footer_start, len(data) - 8)
+    assert at != -1, "the column name must appear in the footer"
+    data[at] = 0xFF
+    return bytes(data)
+
+
 def _snapshot(root: Path):
     out = {}
     for directory, subdirs, names in os.walk(root, followlinks=False):
@@ -797,19 +830,20 @@ def test_footer_whose_row_group_counts_do_not_sum_to_its_total_is_invalid(tmp_pa
 @pytest.mark.parametrize("expression", [
     "RuntimeError('boom')", "ValueError('boom')", "KeyError('boom')", "AssertionError('boom')",
 ])
-def test_unexpected_programmer_errors_are_not_swallowed_into_invalid_parquet(
+def test_unexpected_parser_exceptions_are_an_unknown_outcome_never_invalid_or_valid_parquet(
         tmp_path, injected_parse, expression):
-    """Unexpected-error control (the replacement for the old MemoryError-propagation test): an error
-    that is neither malformed-content evidence, an unsupported feature nor a recognised resource
-    failure must stay loud. It must NOT become INVALID_PARQUET (or any other verdict about the file)."""
+    """Unexpected-error control: an exception that is neither malformed-content evidence, an unsupported
+    feature nor a recognised resource failure says nothing about the file. It must NOT become
+    INVALID_PARQUET and must never become VALID_PARQUET: the file is UNKNOWN_PARSER_FAILURE, with no
+    parse facts and only the exception's *type name* (never its text or a path) in the reasons."""
     injected_parse(_raises(expression.replace("'boom'", repr("boom " + str(tmp_path)))))
-    _put(tmp_path, marker=False)
-    discovery, markers, byte_results = _stages(tmp_path)
-    with pytest.raises(pmv.ParquetParserUnexpectedError) as caught:
-        verify_parquet_metadata(tmp_path, discovery, markers, byte_results)
-    message = str(caught.value)
-    assert expression.split("(")[0] in message, "the exception *type* is reported"
-    assert "boom" not in message and str(tmp_path) not in message, "never the exception text or a path"
+    payload, result = _verify_one(tmp_path)
+    type_name = expression.split("(")[0]
+    assert result.status is P.UNKNOWN_PARSER_FAILURE
+    assert result.reasons == ("PARQUET_PARSER_UNEXPECTED_EXCEPTION", f"PARSER_EXCEPTION_{type_name}")
+    _assert_no_parse_facts(result)
+    _assert_byte_facts_kept(result, payload)
+    assert "boom" not in repr(result) and str(tmp_path) not in repr(result)
 
 
 def test_a_recognised_memory_error_is_a_resource_outcome_not_a_crash_and_not_corruption(
@@ -1192,8 +1226,23 @@ def test_worker_classifies_parser_exceptions(exc, code, detail):
     assert (outcome.code, outcome.detail) == (code, detail)
 
 
+def test_worker_classifies_a_unicode_decode_error_as_malformed_footer_content():
+    """Test A. PyArrow decodes the footer's column names to ``str``; invalid UTF-8 there raises
+    ``UnicodeDecodeError`` (a ``ValueError``, not an ``OSError``/``ArrowException``). For in-memory
+    footer bytes that is positive evidence of malformed content, not a programming error."""
+    exc = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    assert not isinstance(exc, (OSError, pa.ArrowException)), "why the generic rule did not cover it"
+    outcome = _WORKER.classify_exception(exc)
+    assert outcome.code == _WORKER.CODE_INVALID_PARSE
+    assert (outcome.detail, outcome.problems, outcome.name) == (0, 0, "")
+    assert (outcome.num_rows, outcome.num_row_groups, outcome.num_columns) == (0, 0, 0)
+
+
 @pytest.mark.parametrize("exc", [RuntimeError("x"), ValueError("x"), KeyError("x"), AssertionError("x"),
-                                 TypeError("x"), AttributeError("x")])
+                                 TypeError("x"), AttributeError("x"),
+                                 # the new rule is narrow: only *decoding* failures are content evidence
+                                 UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"),
+                                 UnicodeError("x")])
 def test_worker_classifies_anything_else_as_unexpected_with_only_the_type_name(exc):
     outcome = _WORKER.classify_exception(exc)
     assert outcome.code == _WORKER.CODE_UNEXPECTED
@@ -1364,6 +1413,8 @@ def test_an_untrustworthy_worker_reply_is_a_parser_failure_never_a_verdict(
      ("PARQUET_PARSER_RESOURCE_EXHAUSTED", "PARSER_RESOURCE_MEMORY_ERROR"), None),
     ("send(5, detail=3)", P.UNKNOWN_RESOURCE,
      ("PARQUET_PARSER_RESOURCE_EXHAUSTED", "PARSER_RESOURCE_STD_BAD_ALLOC"), None),
+    ("send(6, name=b'RuntimeError')", P.UNKNOWN_PARSER_FAILURE,
+     ("PARQUET_PARSER_UNEXPECTED_EXCEPTION", "PARSER_EXCEPTION_RuntimeError"), None),
 ])
 def test_each_well_formed_worker_reply_maps_to_exactly_one_documented_outcome(
         tmp_path, scripted_worker, reply, status, reasons, facts):
@@ -1377,14 +1428,22 @@ def test_each_well_formed_worker_reply_maps_to_exactly_one_documented_outcome(
         _assert_no_parse_facts(result)
 
 
-def test_a_worker_reported_programming_error_is_raised_with_only_its_sanitised_type_name(
+def test_a_worker_reported_unexpected_exception_is_a_file_outcome_with_only_its_sanitised_type_name(
         tmp_path, scripted_worker):
     scripted_worker("read_request(); send(6, name=b'../etc; Runtime-Error')")
-    _put(tmp_path)
-    discovery, markers, byte_results = _stages(tmp_path)
-    with pytest.raises(pmv.ParquetParserUnexpectedError) as caught:
-        verify_parquet_metadata(tmp_path, discovery, markers, byte_results)
-    assert str(caught.value) == "parquet footer worker raised unexpected etcRuntimeError"
+    payload, result = _verify_one(tmp_path)
+    assert result.status is P.UNKNOWN_PARSER_FAILURE
+    assert result.reasons == ("PARQUET_PARSER_UNEXPECTED_EXCEPTION", "PARSER_EXCEPTION_etcRuntimeError")
+    _assert_no_parse_facts(result)
+    _assert_byte_facts_kept(result, payload)
+    assert "/" not in repr(result.reasons) and ";" not in repr(result.reasons)
+
+
+def test_a_worker_reply_with_an_empty_exception_name_gets_the_generic_type_name(tmp_path, scripted_worker):
+    scripted_worker("read_request(); send(6, name=b'')")
+    _payload, result = _verify_one(tmp_path)
+    assert result.status is P.UNKNOWN_PARSER_FAILURE
+    assert result.reasons == ("PARQUET_PARSER_UNEXPECTED_EXCEPTION", "PARSER_EXCEPTION_Exception")
 
 
 def test_worker_start_failure_fails_closed_and_never_falls_back_to_in_process_parsing(
@@ -1450,6 +1509,7 @@ while True:
     ("send(2)", True),
     ("send(4)", True),
     ("send(5, detail=2)", False),               # a resource failure retires it
+    ("send(6, name=b'RuntimeError')", False),   # an unexpected exception retires it too
     ("os.abort()", False),                      # a crash retires it
 ])
 def test_the_worker_is_reused_after_clean_verdicts_and_replaced_after_any_failure(
@@ -1486,6 +1546,137 @@ def test_a_crash_on_one_file_does_not_affect_the_files_after_it(tmp_path, script
     _assert_no_parse_facts(results[0])
     assert results[0].reasons[1] == "PARSER_WORKER_SIGNAL_SIGABRT"
     assert len(set(log.read_text().split())) == 2, "exactly one replacement worker was started"
+
+
+# ----------------------------------------------------------------------------------------------
+# one file's parser outcome must not take the batch down (PR #114 review: corrupt footer ->
+# UnicodeDecodeError -> CODE_UNEXPECTED -> the whole call raised and healthy neighbours were lost)
+# ----------------------------------------------------------------------------------------------
+
+_BATCH = tuple(f"2026-10-18-02-00000{index}.seg" for index in (1, 2, 3))
+
+
+def test_the_corrupt_footer_fixture_really_raises_unicode_decode_error_in_pyarrow():
+    """Fixture control, run in a disposable child process (never in this one): the damaged footer makes
+    the pinned PyArrow raise ``UnicodeDecodeError`` -- the exact failure the review reported -- while
+    the file stays structurally plausible, so it reaches the parser instead of failing on a magic."""
+    payload = _parquet_with_corrupt_column_name()
+    footer_len = _footer_len(payload)
+    assert len(payload) == len(_parquet_with_unique_column()), "a substitution, not an insertion"
+    assert pmv._structure_reasons(len(payload), payload[:4], payload[-(footer_len + 8):]) == ()
+    child = textwrap.dedent('''
+        import sys
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        data = sys.stdin.buffer.read()
+        footer_len = int.from_bytes(data[-8:-4], "little")
+        try:
+            pq.ParquetFile(pa.BufferReader(data[-(footer_len + 8):]),
+                           thrift_string_size_limit=footer_len, thrift_container_size_limit=footer_len)
+        except BaseException as exc:
+            print(type(exc).__name__)
+        else:
+            print("PARSED")
+    ''')
+    done = subprocess.run([sys.executable, "-I", "-c", child], input=payload,
+                          capture_output=True, timeout=120)
+    assert done.stdout.decode().strip() == "UnicodeDecodeError", done.stderr.decode()[-300:]
+
+
+def test_a_corrupt_column_name_in_one_footer_is_that_files_verdict_and_its_neighbours_still_verify(
+        tmp_path):
+    """Test B -- the primary acceptance criterion. healthy -> damaged -> healthy through real discovery,
+    marker validation, byte verification and the real isolated parser. The footer is damaged *before*
+    the stages run, so the byte stage's digest legitimately matches the damaged bytes and the file
+    reaches the parser. Nothing is simulated."""
+    healthy, damaged = _parquet(), _parquet_with_corrupt_column_name()
+    for name, payload in zip(_BATCH, (healthy, damaged, healthy)):
+        _put(tmp_path, name=name, payload=payload, record_count=3)
+    discovery, markers, byte_results, results = _run(tmp_path)
+
+    assert [r.relative_path for r in discovery.records] == [f"raw/trades/{name}" for name in _BATCH]
+    assert all(m.status is MarkerValidationStatus.VALID_V2 for m in markers)
+    assert all(b.status is SegmentVerificationStatus.HASHED_STABLE for b in byte_results)
+    assert byte_results[1].observed_sha256 == hashlib.sha256(damaged).hexdigest()
+    assert byte_results[1].declared_sha256_matches is True, "the evidence describes the damaged bytes"
+
+    assert len(results) == 3
+    assert [r.relative_path for r in results] == [r.relative_path for r in discovery.records]
+    assert [r.status for r in results] == [P.VALID_PARQUET, P.INVALID_PARQUET, P.VALID_PARQUET]
+    for index in (0, 2):
+        good = results[index]
+        assert good.reasons == ("PARQUET_METADATA_VALID",)
+        assert (good.num_rows, good.num_row_groups, good.num_columns) == (3, 2, 2)
+        assert good.declared_record_count_matches is True
+        assert good.marker_claims_corroborated_by_bytes is True
+    bad = results[1]
+    assert bad.reasons == ("PARQUET_FOOTER_PARSE_FAILED",)
+    _assert_no_parse_facts(bad)               # no row/row-group/column counts, no record-count confirmation
+    _assert_byte_facts_kept(bad, damaged)
+    _assert_fixed_diagnostics(bad, tmp_path, "utf-8", "codec", "0xff", "invalid start byte")
+
+
+_ONE_FILE_FAILS = '''
+    _real = mod.pq.ParquetFile
+
+    def fake(source, *a, **k):
+        data = source.read()
+        if {marker!r} in data:
+            raise {exception}
+        source.seek(0)
+        return _real(source, *a, **k)
+'''
+
+
+def _fail_only_for_the_unique_column_file(injected_parse, exception: str):
+    """The production worker, with the real parser for every footer except the one that carries the
+    unique column name, for which the parser raises ``exception``."""
+    injected_parse(_ONE_FILE_FAILS.format(marker=CORRUPT_COLUMN.encode(), exception=exception))
+
+
+def test_an_unexpected_parser_exception_on_one_file_is_an_unknown_outcome_for_that_file_only(
+        tmp_path, injected_parse):
+    """Test C. A parser exception that is not evidence about the file must not be called corruption, must
+    not fabricate a result, must not leak its text -- and must not discard the neighbours' results."""
+    secret = "SECRET-" + str(tmp_path)
+    _fail_only_for_the_unique_column_file(injected_parse, f"RuntimeError({'boom ' + secret!r})")
+    poisoned = _parquet_with_unique_column()          # valid Parquet: the failure is injected, not real
+    for name, payload in zip(_BATCH, (_parquet(), poisoned, _parquet())):
+        _put(tmp_path, name=name, payload=payload, record_count=3)
+    discovery, _markers, _byte_results, results = _run(tmp_path)
+
+    assert [r.relative_path for r in results] == [r.relative_path for r in discovery.records]
+    assert [r.status for r in results] == [P.VALID_PARQUET, P.UNKNOWN_PARSER_FAILURE, P.VALID_PARQUET]
+    odd = results[1]
+    assert odd.status is not P.INVALID_PARQUET and odd.status is not P.VALID_PARQUET
+    assert odd.reasons == ("PARQUET_PARSER_UNEXPECTED_EXCEPTION", "PARSER_EXCEPTION_RuntimeError")
+    _assert_no_parse_facts(odd)
+    _assert_byte_facts_kept(odd, poisoned)
+    text = repr(odd)
+    for forbidden in ("boom", "SECRET", str(tmp_path), "Traceback"):
+        assert forbidden not in text
+    for index in (0, 2):
+        assert (results[index].num_rows, results[index].num_row_groups) == (3, 2)
+        assert results[index].declared_record_count_matches is True
+
+
+def test_a_parent_side_programming_defect_is_still_loud_and_is_never_a_file_verdict(
+        tmp_path, scripted_worker, monkeypatch):
+    """The distinction that must survive: a *reply* saying "unexpected exception" is a per-file outcome,
+    but a defect in the verifier's own code is not swallowed into one."""
+    with pytest.raises(RuntimeError, match="internal error"):
+        pmv._ParserWorker().parse(b"x" * 5, 100, 10)             # inconsistent window/length: our bug
+
+    scripted_worker("read_request(); send(6, name=b'RuntimeError')")
+
+    def broken(_raw):
+        raise ZeroDivisionError("a bug in the parent while building the result")
+
+    monkeypatch.setattr(pmv, "_type_name", broken)
+    _put(tmp_path)
+    discovery, markers, byte_results = _stages(tmp_path)
+    with pytest.raises(ZeroDivisionError):
+        verify_parquet_metadata(tmp_path, discovery, markers, byte_results)
 
 
 # ----------------------------------------------------------------------------------------------
