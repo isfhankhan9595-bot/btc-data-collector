@@ -815,3 +815,45 @@ def test_ordinary_short_nonzero_reads_are_not_errors(tmp_path, monkeypatch):
     assert requested[-1] == 1
     assert all(count <= chunk_size for count in requested[:-1])
     assert len(requested) - 1 > len(payload) // chunk_size, "short reads force extra requests"
+
+
+def test_read_requests_never_exceed_remaining_observed_bytes_under_midloop_growth(
+    tmp_path, monkeypatch
+):
+    """The loop is bounded by the size observed at open: when the file grows between data
+    chunks, no request may ask for more than the bytes still owed from that observed size.
+
+    Dropping the ``min(READ_CHUNK_BYTES, remaining)`` cap would let the loop read into the
+    appended bytes (and report a different reason), which the static-file chunk-size test
+    cannot see. The append uses ``Path.open`` (not ``os.read``), so it never re-enters the
+    wrapper; the call counter turns a runaway loop into a failure instead of a hang."""
+    chunk_size = 8
+    payload = bytes(range(36))                      # chunks of 8, 8, 8, 8, 4
+    segment = _put(tmp_path, payload=payload, marker=False)
+    discovery = discover_sources(tmp_path)
+    markers = validate_markers(tmp_path, discovery)
+    monkeypatch.setattr(sv, "READ_CHUNK_BYTES", chunk_size)
+    calls = 0
+    requested = []
+
+    def read_with_growth(fd, count):
+        nonlocal calls
+        calls += 1
+        requested.append(count)
+        if calls > 40:
+            raise AssertionError("the read loop is not bounded by the initially observed size")
+        if calls == 2:
+            with segment.open("ab") as handle:
+                handle.write(b"Z" * 100)
+        return _REAL_READ(fd, count)
+
+    monkeypatch.setattr(sv.os, "read", read_with_growth)
+    (result,) = verify_segment_bytes(tmp_path, discovery, markers)
+    monkeypatch.undo()
+
+    assert result.status is S.UNKNOWN_IO
+    assert result.reasons == ("SEGMENT_GREW_DURING_READ",)
+    assert result.bytes_hashed == len(payload)
+    assert result.observed_size == len(payload)
+    assert result.observed_sha256 is None
+    assert requested == [8, 8, 8, 8, 4, 1]
