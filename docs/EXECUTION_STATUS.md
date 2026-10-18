@@ -1778,3 +1778,39 @@ growth characterization was replaced with an assertion that the WAL remains at/b
 all blocked-period event reasons appear in Parquet. Exact-commit GitHub CI is pending; no local checkout
 is available in this implementation environment. No claim is made yet that this is tested/merged or
 verified on a live VPS. Real ENOSPC, power loss and deployed supervisor behavior remain unverified.
+
+### PR #111 follow-up — isolate the mutation test; late worker completion in the standalone runners — IMPLEMENTED ON BRANCH; CI PENDING
+
+Starting point verified live: head `98c1aa3933b4ccc1b1a8e10c67c4bb0c24a828d8`, base `0fd033a5fc00c1b68687245c27b73c46920a290b`
+(= `main`), open, draft, CI run #589 successful on that head.
+
+**Task A -- mutation test isolation (FACT).** `test_mutation_restamping_during_processing_is_caught` rewrote the tracked
+`collector/websocket_client.py` and restored it in `finally`. It now mutates a private temporary copy
+(`tests/_isolated_source_mutation.py`) and runs the target test there; the original is only read, with a control run on
+the unmutated copy, an import-origin check and a byte-hash check. `tests/test_isolated_source_mutation.py` (7 tests)
+pins: original byte-identical after a failing, surviving, timed-out and raising mutant; copy removed in every case;
+8 concurrent runs see only their own mutant while a watcher polls the original; an aliasing (hardlink) copy is refused.
+No lock is used. Measured with 6 concurrent invocations and a 1 ms watcher: old test, scratch clone -- 18 runs, 5 failed,
+5,869 transient deviations, mutant left in the tree; new test, real checkout -- 30 runs, 0 failed, 0 deviations,
+`git status` unchanged.
+
+**Task B -- late worker completion (FACT, reproduced then fixed).** Spot, Bybit and OKX `shutdown()` returned early on a
+non-idle client with the worker-reachable writers open and a non-zero status latched (correct), but nothing closed them
+when the worker later ended. Fix: `CloseOnce` and `LateFinalizer` in `standalone_failure_policy.py`; each runner's closes
+moved into an idempotent `_finalize_storage()`; done-callbacks on the run task, live worker and (Spot) recovery task.
+`tests/test_standalone_late_finalization.py` (21 tests: per venue -- storage open and writable while the worker is alive,
+finalized once in order after it ends, never-ending worker stays open and failed, overlapping callbacks and repeated
+`shutdown()`, a failing close attempted and reported once; Bybit WAL after quality; Spot recovery task; primitives).
+Disabling `arm()` in the three runners makes 4 of them fail. `tests/test_shutdown_finalization.py` was retargeted from
+`BybitCollectorApp.shutdown` to `_finalize_storage` (where the closes now live); the quality-writer-closes-last assertion
+is unchanged.
+
+**Local verification (uncommitted tree).** Full suite run sequentially, `cd collector && pytest -q tests` with CI's
+`PYTHONPATH`: Python 3.12 -- 3490 passed, 1 skipped, 1 xfailed; Python 3.11.15 -- 3490 passed, 1 skipped, 1 xfailed.
+`compileall`, the CI import checks, `check_standalone` and `git diff --check` clean. The tracked tree was byte-identical
+before and after each full run.
+
+**Limitations (NOT VERIFIED / not done).** Nothing live: no real exchange, host or systemd. `run_okx_capture.py` was read
+but not tested. Behaviour of `asyncio.run` teardown with a worker that never ends was not examined. A worker that never
+ends still leaves its storage open and the shutdown failed -- there is no force-stop. This does not claim standalone
+parity beyond the paths above. CI on the pushed head is recorded on the PR, not here.

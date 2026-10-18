@@ -132,7 +132,7 @@ def test_bybit_runner_quality_writer_closes_last_so_other_failures_are_reportabl
         import ast
         import inspect
         import textwrap
-        source = textwrap.dedent(inspect.getsource(run_bybit_collector.BybitCollectorApp.shutdown))
+        source = textwrap.dedent(inspect.getsource(run_bybit_collector.BybitCollectorApp._finalize_storage))
         tree = ast.parse(source)
         calls = [n.args[1].value for n in ast.walk(tree)
                 if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "_close_writer_reporting_failure"

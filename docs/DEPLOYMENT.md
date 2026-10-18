@@ -73,25 +73,181 @@ All of them now exit `70` on a terminal (raw-evidence) storage failure and `1` i
 task crashed of an ordinary exception, so any supervisor that restarts on non-zero will treat both
 as failures; see `F5_FATAL_STORAGE_TOPOLOGY.md`.
 
-## Shutdown contract (offline analysis only -- NOT VERIFIED LIVE)
-
-Traced from source, not assumed:
+## Shutdown contract (traced from source and exercised with fake sockets -- NOT VERIFIED LIVE)
 
 ```
 SIGTERM -> CollectorApp._async_shutdown()
-  -> self.running = False
-  -> cancel + await the recovery task
+  -> running = False; recovery latch set (no new REST producer can start)
+  -> cancel every REST producer (startup recovery, recovery task, OI poller); wait at most
+       WS_FALLBACK_SLACK_S (1 s) for the recovery task. Whether any producer ENDED is judged
+       later from its task state by shutdown(), never from a wait having returned
   -> drain integrity quality events, await the quality-queue task
-  -> self.shutdown(): ws_client.stop() for each client, then cancel every task in self.tasks
+  -> _stop_ws_clients(): client.stop() for each client, then wait (NOT cancel) for each
+       client's start() tail: receive loop ended -> ingest queue drained -> worker retired
+  -> shutdown(): every writer closed, quality writer last, then the WAL
 ```
 
-`self.tasks` includes each `WebSocketClient.start()` coroutine -- the one that contains
-P0-1's own graceful drain (`await asyncio.wait_for(self._ingest_queue.join(), timeout=30.0)`).
-`shutdown()` cancels that task immediately after calling `ws_client.stop()`, so static
-reading does not show the 30s drain being awaited to completion in this path before
-cancellation reaches it. `TimeoutStopSec=60` is kept as generous margin, not as a
-proven wait for that drain -- whether it completes in practice depends on asyncio task
-scheduling this analysis cannot settle without running it. **NOT VERIFIED LIVE.**
+If a client is not idle after its own bound, the runner hard-cancels the tasks, waits once
+more, and then **fails closed**: the exit status is non-zero, the market-data writers, the
+quality writer, the quality queue and the WAL are left untouched (the WAL is the recovery
+source), and each raw writer is closed only when its own producers are stopped:
+`raw_wire_writer` <- receive loop only (ingress stopped); `raw_rest_writer` <- recovery task
+and OI poller (stopped, and none can start once shutdown began).
+
+### A REST producer that ignores cancellation
+
+Traced from source and exercised with a coroutine that swallows every `CancelledError`, including
+in a child process running the real `main()` under a real SIGTERM
+(`tests/test_ws_shutdown_runner_exit.py`, `tests/test_ws_shutdown_late_producer.py`,
+`tests/test_ws_shutdown_startup_recovery.py`) -- NOT VERIFIED LIVE.
+
+What the application controls:
+
+- No REST producer starts once shutdown began. The latch is set before anything is cancelled, and
+  the startup recovery, `_schedule_recovery` and the OI poller start are all gated by it.
+- Every tracked producer (startup recovery, recovery task, OI poller) is sent a cancel.
+- A producer that is still running keeps exactly the storage it can reach open
+  (`REST_PRODUCER_REACH`): raw REST capture, reconstructed book rows (recovery) or `oi_writer`
+  (poller), and the quality writer + WAL. Everything else is finalised. Nothing is ever closed
+  beneath a live producer, including by a later `shutdown()` call.
+- A non-zero status (`rest_producer_not_stopped`, 1) is latched in `CollectorApp.exit_code`.
+- Every exit from `start()` after the startup preflight reaches the same finalization: a normal
+  return, an exception from the startup recovery or any task (it is re-raised afterwards, so
+  `main()` still fails with its traceback), and the caller cancelling `start()` (finalization runs,
+  then the cancellation propagates). The wait for a recovery that ignores a cancel of `start()` is
+  bounded by `WS_FALLBACK_SLACK_S`.
+- If a producer that outlived `shutdown()` ends later, a done-callback retries `shutdown()`: it
+  drains the quality queue, closes the remaining writers once each, then `quality_writer`, then the
+  WAL. A late close is not a clean shutdown: the latched status stays non-zero.
+- The quality persistence loop is waited for within fixed bounds, never without a deadline
+  (`_stop_quality_consumer`, used by `start()`'s finalization and by `_async_shutdown`): up to
+  `QUALITY_DRAIN_BOUND_S` (1 s) for it to hand every queued event to the quality writer, up to
+  `QUALITY_CONSUMER_STOP_BOUND_S` (0.5 s) for it to leave on its own, then it is told to leave and
+  cancelled (`WS_FALLBACK_SLACK_S`, 1 s). A timeout is logged (`quality_queue_drain_incomplete`), never
+  read as a completed drain, and loses no event: every queued event already has a WAL record that holds
+  the checkpoint back, `shutdown()` drains what is left synchronously once no websocket client can still
+  enqueue, and anything not drained stays in the WAL for the next start. A loop that still has not ended
+  is a user of the quality writer like a REST producer: `shutdown()` keeps that writer and the WAL open,
+  closes everything else, latches `quality_consumer_not_stopped` (status 1) and the late retry finalizes
+  both once the loop ends. The loop's own exception is logged and never replaces the caller's
+  cancellation or the original exception of `start()`.
+
+What it does not control:
+
+- Cancellation is a request. A coroutine that swallows it cannot be stopped by the application.
+- While such a task exists the process does not return the latched status. With a startup
+  recovery under SIGTERM, `start()` stays parked in `_run_startup_recovery`; with the OI poller,
+  `start()` returns after its own bounded waits, but `asyncio.run` then waits for the task in its
+  teardown. Either way `main()` returns only once the task ends.
+- A producer that never ends is ended only by process-level termination: systemd's SIGKILL at
+  `TimeoutStopSec`, which reports the kill, not the latched status. Its reachable writers and the
+  quality WAL are then never finalised by this process (the WAL stays the recovery source for
+  quality events). Nothing in the code guarantees that shutdown completes within 60 s; the bounds in
+  the next table cover the websocket part only.
+- The late retry only runs while the event loop does. If the process is killed first, nothing runs.
+  It does not retire a websocket worker: it cannot make a worker that ignores cancellation end. It
+  only reacts when one ends. Each client's `start()` task and live ingest worker carry the same
+  done-callback, which retries `shutdown()` only once every websocket client is idle
+  (`lifecycle_idle`), every REST producer has ended and the quality loop has ended. A late close after
+  `ws_client_worker_not_retired` keeps that failure latched (non-zero status): it is not a clean shutdown.
+
+### Stop budget vs `TimeoutStopSec=60`
+
+| Step | Bound | Source |
+|---|---|---|
+| opening handshake in progress when stop lands | 0 (cancelled by `stop()`) | `_connect_or_stop` |
+| close handshake + subscribe/quality-event slack | 10 + 2 s | websockets `close_timeout` default (pinned by a test), `CONNECTION_PHASE_SLACK_S` |
+| ingest-queue drain | 30 s | `shutdown_drain_timeout_s` |
+| worker retirement | 5 s | `worker_retire_timeout_s` |
+| **client graceful bound** (`shutdown_deadline_s`) | **47 s** | sum of the above |
+| hard-cancel fallback, only if the graceful bound was exceeded | +6 s | `worker_retire_timeout_s + WS_FALLBACK_SLACK_S` |
+| **bounded websocket part, worst case** | **53 s** | |
+| left for everything else | **7 s** (`FINALIZATION_RESERVE_S`) | |
+
+The "everything else" is NOT bounded by code and has not been measured: finalization (flush,
+fsync, rename, directory fsync) of about ten Parquet writers, the WAL close and interpreter
+teardown. The one wait inside it that has a code bound is the stop of the quality persistence
+loop: at most `QUALITY_DRAIN_BOUND_S` + `QUALITY_CONSUMER_STOP_BOUND_S` + `WS_FALLBACK_SLACK_S`
+= 2.5 s, reached only when the loop is stalled, dead or outpaced (normally milliseconds), and
+chosen, not measured on the host. It is spent BEFORE the websocket stop, so it comes out of the
+7 s reserve. A full-queue drain through a slow `fsync` can exceed `QUALITY_DRAIN_BOUND_S`
+(1000 queued events took about 2.3 s on the development sandbox, two segment publishes; that is
+not host data): the drain then finishes in `shutdown()`'s synchronous pass instead, with the same
+total work. 7 s is the arithmetic remainder, not a demonstrated
+sufficient margin. A test fails if any client timeout is raised without raising
+`TimeoutStopSec`. Measure writer finalization on the real host before relying on it; if it
+can exceed ~7 s, lower `shutdown_drain_timeout_s` (30 s -> 20 s buys 10 s) rather than
+raising `TimeoutStopSec`.
+
+The standalone runners (Spot, Bybit, OKX) have no systemd unit in this repository, so no
+stop budget is defined for them. Their wait for the client is the same 47 s bound.
+
+### Standalone runners: a websocket worker that ends after `shutdown()` returned
+
+Reproduced and fixed for Binance Spot, Bybit and OKX in `tests/test_standalone_late_finalization.py`
+(real `WebSocketClient`, real `shutdown()`, real `supervise_standalone_runner`; only the socket is faked
+and the worker is a handler that swallows cancellation, released by an explicit gate) -- NOT VERIFIED
+LIVE, not run against a real exchange, on a real host, or under systemd.
+
+Before the fix, with a worker that outlived `shutdown()`, the initial shutdown was correct (worker-reachable
+writers left open, non-zero status latched) but nothing ever closed them once the worker ended: Spot left
+trades/book/quality open, Bybit its five market-data writers, quality writer and WAL, OKX its seven
+market-data writers and quality writer.
+
+Now each runner's closes live in an idempotent `_finalize_storage()` that judges reachability from live
+state, and a `LateFinalizer` (`standalone_failure_policy.py`) arms a done-callback on every storage user
+still alive when `shutdown()` returns: the run task (the client's `start()` lifecycle), the live ingest
+worker and, for Spot, the book-recovery task.
+
+- A callback finalizes only when every user has stopped (`lifecycle_idle`, and for Spot the recovery task
+  done). One user ending while another is alive closes nothing; the other's end retries. If the state
+  cannot be read, storage stays open.
+- Each writer's close is attempted at most once per process (`CloseOnce`). A repeated `shutdown()`, an
+  overlapping callback or an explicit retry returns the first attempt's outcome and never calls `close()`
+  again; a failed close is not retried and its failure report is not duplicated.
+- Order is the venue's existing one: the raw wire writer as soon as ingress is stopped; market-data
+  writers; the quality writer last; on Bybit the WAL after the quality writer's final publish.
+- The latched shutdown status stays non-zero after a late finalization. A late close is not a clean
+  shutdown.
+
+What it does not do:
+
+- It cannot make a worker that ignores cancellation end. A worker that never ends keeps its reachable
+  storage open and the shutdown failed; nothing here claims it was force-stopped.
+- It only runs while the event loop does. If the process is killed first, nothing runs. What
+  `asyncio.run` does at teardown with a worker that never ends was not examined here.
+- `run_okx_capture.py` is a different structure (a capture task, not `WebSocketClient` plus an ingest
+  worker) and was read but not tested: its `finally` closes the raw wire and quality writers after a
+  bounded wait on the capture task. Whether that can close beneath a task that survived cancellation is
+  NOT VERIFIED.
+- The Spot recovery-task case (a cancellation-resistant REST producer ending after the worker) is covered
+  by one test with a gated fake recovery; the other REST-producer paths are unchanged.
+
+### Quality queue: verified limitations
+
+Reproduced with `tests/test_quality_queue_shutdown_bounds.py` (real `start()` / `_async_shutdown()` /
+`shutdown()`, only the network edge and the websocket clients faked) -- not verified on a live host,
+against a live exchange, under power loss, or within the 60 s stop budget.
+
+- Only websocket-client events use the queue (`_websocket_quality_event`). Events from REST producers
+  and handlers are persisted synchronously and never queued.
+- `task_done()` means the loop handled the event (handed it to the quality writer), not that it is in a
+  published segment: publication happens at 500 rows, 30 s idle or writer close, and the WAL checkpoint
+  advances only then. "Drained" is therefore not "durable".
+- A websocket worker that is still alive when `shutdown()` runs (`ws_client_worker_not_retired`) leaves the
+  queue undrained and the quality writer and WAL open. The events are WAL-retained and replayed at the
+  next start. If that worker ends later while the process is still running, the late retry (see above)
+  finalises the held writers and then the WAL; if it never ends, they stay open until process-level
+  termination, which cannot guarantee that buffered Parquet segments are finalised. The standalone
+  Spot/Bybit/OKX runners have their own late retry, described in the next section.
+- A quality-writer failure that the loop survives (`quality_checkpoint_blocked`) does not change the exit
+  status: the events stay in the WAL (replayed, possibly as duplicate rows with the same
+  `quality_event_id`). The operator signal is the alert and `quality_channel_status()`.
+- If the loop is cancelled or dies, the `quality_queue_overflow:total=...` summary row it writes on exit is
+  not written. The overflowed events themselves were each persisted directly (or WAL-retained); only the
+  aggregate record is skipped.
+- Nothing can bound a loop that blocks the event loop itself (a synchronous call that never returns):
+  every deadline here is an event-loop timer.
 
 ## Telegram credentials
 

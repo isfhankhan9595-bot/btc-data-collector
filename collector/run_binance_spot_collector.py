@@ -78,6 +78,7 @@ import inspect
 import json
 import signal
 import time
+from typing import Optional
 
 from collector.collector.adapters.binance_spot import BinanceSpotAdapter
 from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
@@ -103,10 +104,17 @@ from collector.collector.raw_capture import (
 )
 from collector.collector.failure_topology import FailureRecord
 from collector.collector.recovery_control import RecoveryController
+from collector.collector.loop_teardown import run_bounded, teardown_exit_status
 from collector.collector.standalone_failure_policy import (
+    CloseOnce,
     DegradedQualityLossReporting,
+    LateFinalizer,
     StandaloneFailurePolicy,
+    REST_PRODUCER_CANCEL_BOUND_S,
+    await_client_idle,
+    writer_already_failed,
     build_stream_table,
+    cancel_and_wait,
     supervise_standalone_runner,
     tag_route,
 )
@@ -116,6 +124,12 @@ from collector.collector.utils import logger
 from collector.collector.websocket_client import WebSocketClient
 
 VENUE = "BINANCE_SPOT"
+
+
+#: Storage the Spot book recovery (``_recover_book``) can still write, traced through every method it
+#: calls (tests/test_ws_rest_producer_reach.py recomputes it with an AST closure): raw REST capture, the
+#: snapshot-derived orderbook rows, and quality events. A live recovery keeps exactly this open.
+SPOT_RECOVERY_REACH = frozenset({"raw_rest_writer", "ob_writer", "quality_writer"})
 
 
 class BinanceSpotCollectorApp(DegradedQualityLossReporting):
@@ -225,6 +239,15 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
             stream_group="binance_spot",
             on_fatal=self._on_fatal_storage,
         )
+        # Late finalization (see ``_finalize_storage``): each writer's close is attempted at most
+        # once, and a done-callback on every storage user that outlived ``shutdown()`` retries the
+        # finalization when the LAST of them ends. ``_run_task`` is the supervisor's task running
+        # ``run()`` (i.e. the client's start() lifecycle); it is recorded by ``run()``.
+        self._close_once = CloseOnce()
+        self._run_task = None
+        self._late_finalizer = LateFinalizer(
+            venue=VENUE, finalize=lambda: self._finalize_storage(),
+            users_stopped=self._storage_users_stopped, watched=self._storage_user_tasks)
 
     # -- F5 failure topology ----------------------------------------------------
 
@@ -574,6 +597,11 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
     # -- recovery -------------------------------------------------------------
 
     def _schedule_recovery(self, reason: str) -> bool:
+        if getattr(self, "_recovery_closed", False):
+            # Shutdown has begun. The ingest worker stays alive while it drains and this is on
+            # its on_message path: a recovery started now would be a REST producer that
+            # nothing cancels and that reaches raw_rest_writer.
+            return False
         if self.failure_policy.terminal_failure is not None or \
                 self.failure_policy.route_is_isolated("orderbook"):
             # F5: a recovery only feeds the order-book route. With that route cut
@@ -703,10 +731,12 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         # Request the initial bridge immediately -- the book starts
         # RECOVERING (see quality_events.BookQualityStateMachine) and would
         # otherwise wait for the first diff to arrive before trying.
+        self._run_task = asyncio.current_task()
         self._schedule_recovery("initial_snapshot")
         await self.client.start()
 
     async def shutdown(self) -> None:
+        self._recovery_closed = True       # before anything awaits: no new REST producer
         # Every step is guarded: none may stop the writer closes below, which
         # are what make buffered rows durable. ``WebSocketClient.stop()`` is a
         # plain method returning ``None``; awaiting it unconditionally raised
@@ -717,18 +747,94 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("spot_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
-        if self._recovery_task is not None and not self._recovery_task.done():
-            self._recovery_task.cancel()
-            await asyncio.gather(self._recovery_task, return_exceptions=True)
-        self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
-        self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
+        # Bounded: a recovery that ignores cancellation must not hang shutdown past the unit's
+        # TimeoutStopSec. Whether it ended is judged below (after the client is idle), never assumed.
+        await cancel_and_wait(self._recovery_task, REST_PRODUCER_CANCEL_BOUND_S, "spot_recovery_task")
+        # ``stop()`` only REQUESTS shutdown. The receive loop, the queue drain and
+        # the ingest worker's retirement all finish inside the client's own
+        # start() task (this app's run_task), which is not cancelled until this
+        # coroutine returns -- so the clients must be waited for here, before any
+        # writer their worker can reach is closed.
+        client_idle = await await_client_idle(self.client, self.failure_policy)
+        # The worker, alive during that wait, can start a new recovery (``_schedule_recovery`` is on its
+        # on_message path), and the first one may have ignored its cancel. Judge liveness NOW, after the
+        # clients are idle: cancel again (bounded) and, if a producer is still running, hold exactly the
+        # storage it can still write open (SPOT_RECOVERY_REACH) and make the failure visible.
+        recovery_ended = await cancel_and_wait(self._recovery_task, REST_PRODUCER_CANCEL_BOUND_S,
+                                               "spot_recovery_task")
+        held = frozenset() if recovery_ended else SPOT_RECOVERY_REACH
+        if held:
+            self.failure_policy.record_shutdown_failure("rest_producer_not_stopped")
+            logger.error("spot_storage_left_open_recovery_alive", held=sorted(held))
+        # Each writer is closed only when EVERY producer that can reach it is stopped (see
+        # ``_finalize_storage``). Whatever is still held because a user is alive is finalized by
+        # ``_late_finalizer`` when that user ends -- nothing else would, once this has returned.
+        self._finalize_storage(client_idle)
+        if not client_idle or held:
+            self._late_finalizer.arm()
+
+    # -- storage finalization -------------------------------------------------
+
+    def _recovery_alive(self) -> bool:
+        task = self._recovery_task
+        return task is not None and not task.done()
+
+    def _storage_users_stopped(self) -> bool:
+        """True when NOTHING that can still write this venue's storage is alive: the client's whole
+        lifecycle (start() tail + ingest worker) has ended and so has the book-recovery task."""
+        return bool(getattr(self.client, "lifecycle_idle", True)) and not self._recovery_alive()
+
+    def _storage_user_tasks(self) -> list:
+        """Every task whose end can make a held writer safe to close."""
+        tasks = [self._run_task, self._recovery_task]
+        getter = getattr(self.client, "live_lifecycle_tasks", None)
+        if getter is not None:
+            tasks.extend(getter())
+        return tasks
+
+    def _finalize_storage(self, client_idle: Optional[bool] = None) -> None:
+        """Close, at most once each, every writer whose users are ALL proven stopped. Idempotent.
+
+        ``client_idle`` is the verdict ``shutdown()`` just obtained by waiting for the client; the late
+        callback passes None, which reads the client's live state instead.
+
+        Reachability (who can still write what), judged from LIVE state on every call:
+          raw_wire_writer: the receive loop only            -> ingress stopped.
+          raw_rest_writer: the recovery task                -> recovery ended.
+          trades_writer:   the ingest worker (on_message)   -> client idle.
+          ob_writer:       the worker + the recovery task   -> client idle AND recovery ended.
+          quality_writer:  the worker + the recovery task   -> client idle AND recovery ended; closed
+                           last so every other close failure can still be reported through it.
+        Called by ``shutdown()`` and, once the last live user has ended, by the late-finalization
+        callback. A close already attempted is never repeated (``CloseOnce``)."""
+        recovery_alive = self._recovery_alive()
+        if getattr(self.client, "ingress_stopped", True):
+            self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "BINANCE_SPOT")
+        else:
+            logger.error("spot_raw_wire_writer_left_open_ingress_not_stopped")
+        if not recovery_alive:
+            self._close_writer_reporting_failure(self.raw_rest_writer, "raw_rest_writer", "BINANCE_SPOT")
+        if client_idle is None:
+            client_idle = bool(getattr(self.client, "lifecycle_idle", True))
+        if not client_idle:
+            # A worker is still alive: the market-data and quality writers stay open; the failure
+            # is latched and the exit status is non-zero.
+            return
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "BINANCE_SPOT")
+        if recovery_alive:
+            return          # ob_writer / quality_writer outlive the live recovery; events stay recoverable
         self._close_writer_reporting_failure(self.ob_writer, "ob_writer", "BINANCE_SPOT")
         self._close_writer_reporting_failure(self.quality_writer, "quality_writer", "BINANCE_SPOT")
         # Last, so the counts include anything the closes above reported. Cannot raise.
         self._report_quality_channel_final()
 
-    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> None:
+    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> bool:
+        """Close ``writer`` at most once per process (``CloseOnce``); a repeat request returns the
+        first attempt's outcome without calling ``close()`` again."""
+        return self._close_once.run(
+            writer_name, lambda: self._close_writer_attempt(writer, writer_name, exchange))
+
+    def _close_writer_attempt(self, writer, writer_name: str, exchange: str) -> bool:
         """Close one writer; on failure, report it and still return.
 
         Hostile-audit finding (this session): none of these close() calls
@@ -741,10 +847,14 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
         every writer except quality_writer itself, which is always closed
         last precisely so this reporting path works.
         """
+        was_failed = writer_already_failed(writer)
         try:
             writer.close()
+            return True
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
+            if not was_failed:      # a healthy writer failed to publish its final segment: never exit 0
+                self.failure_policy.record_shutdown_failure(f"writer_close_failed:{writer_name}")
             if writer_name != "quality_writer":
                 try:
                     self._persist_quality_event({
@@ -755,6 +865,7 @@ class BinanceSpotCollectorApp(DegradedQualityLossReporting):
                 except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
                     logger.error("storage_shutdown_close_failure_report_failed",
                                  writer=writer_name, error=str(sink_exc))
+            return False
 
 
 async def _main(data_dir: str, url: str) -> int:
@@ -775,6 +886,15 @@ async def _main(data_dir: str, url: str) -> int:
     return await supervise_standalone_runner(app, stop)
 
 
+def _entry(data_dir: str, url: str) -> int:
+    """The process entry: ``_main`` under a BOUNDED event-loop teardown (``loop_teardown``).
+
+    ``asyncio.run`` would wait without limit for a task that swallowed its cancellation, ignoring SIGTERM and
+    SIGINT meanwhile and losing the latched exit status to a SIGKILL. Never returns 0 with a task left alive."""
+    status, stuck = run_bounded(_main(data_dir, url))
+    return teardown_exit_status(status, stuck)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="data")
@@ -784,4 +904,4 @@ if __name__ == "__main__":
                note="requires outbound access to stream.binance.com:9443 and "
                     "api.binance.com; not available in every environment "
                     "(see docs/EXECUTION_STATUS.md)")
-    raise SystemExit(asyncio.run(_main(args.data_dir, args.url)))
+    raise SystemExit(_entry(args.data_dir, args.url))

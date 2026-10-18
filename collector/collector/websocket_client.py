@@ -37,6 +37,100 @@ class Keepalive:
         if self.interval_s <= 0 or self.timeout_s <= 0:
             raise ValueError("keepalive interval_s and timeout_s must be positive")
 
+class WorkerRetirementError(RuntimeError):
+    """The ingest worker could not be retired within its bound.
+
+    Deliberately NOT a ``FatalStorageError``: this is a lifecycle failure, not
+    a storage-policy verdict. It exists so a worker that is still alive after
+    shutdown surfaces as an explicit, terminal failure instead of the runner
+    closing storage beneath it and reporting success.
+    """
+
+
+#: Returned by ``_next_frame`` when the receive loop must end (the iterator is
+#: exhausted, or shutdown ingress was stopped while no frame was in hand).
+_STREAM_END = object()
+
+
+#: Shutdown-budget inputs (see ``WebSocketClient.shutdown_deadline_s``).
+#: ``websockets`` closes a connection within its ``close_timeout``, which this
+#: client does not override: the library default (10 s, pinned by a test) is the
+#: bound. The opening handshake (``open_timeout``, also 10 s) is NOT part of the
+#: post-stop budget because stop() cancels it (``_connect_or_stop``).
+CLOSE_HANDSHAKE_S = 10.0
+#: Allowance for the quality-event / subscribe work around the close handshake.
+CONNECTION_PHASE_SLACK_S = 2.0
+#: What the 60 s systemd TimeoutStopSec leaves for everything the code does NOT
+#: bound (quality drain, ~10 writer finalizations incl. fsync, WAL close,
+#: interpreter teardown). It is TimeoutStopSec minus the bounded websocket part
+#: today (60 - 47 - 6): an allowance, NOT a measurement. Raising any client timeout
+#: without raising TimeoutStopSec fails test_ws_shutdown_producers.
+FINALIZATION_RESERVE_S = 7.0
+
+
+class _ResumedAwaitable:
+    """Continue a coroutine that was already stepped once by hand (``yield from`` delegation).
+
+    Re-yields what the coroutine yielded (the future the event loop must wait on), then feeds
+    its result -- or exception, cancellation included -- back in until it returns."""
+
+    def __init__(self, coro, yielded):
+        self._coro, self._yielded = coro, yielded
+
+    def __await__(self):
+        coro, to_yield = self._coro, self._yielded
+        while True:
+            try:
+                sent = yield to_yield
+            except GeneratorExit:
+                coro.close()
+                raise
+            except BaseException as exc:  # noqa: BLE001 - forwarded into the coroutine verbatim
+                try:
+                    to_yield = coro.throw(exc)
+                except StopIteration as stop:
+                    return stop.value
+            else:
+                try:
+                    to_yield = coro.send(sent)
+                except StopIteration as stop:
+                    return stop.value
+
+
+def _start_receive_without_eager_tasks(coro, loop):
+    """Python < 3.12 equivalent of ``Task(coro, eager_start=True)``.
+
+    Steps ``coro`` once by hand: if it finishes without ever suspending (a frame is already
+    available) the returned future is already done, so the receive loop does not yield to the
+    event loop between buffered frames -- exactly what the plain ``async for`` it replaced did,
+    and what lets a burst fill the bounded queue and register backpressure. If it suspends, the
+    rest runs in an ordinary task. (``ensure_future`` instead costs one loop turn per frame,
+    which changes that scheduling: the burst/backpressure tests fail on 3.11 with it.)"""
+    try:
+        yielded = coro.send(None)
+    except StopIteration as done:
+        future = loop.create_future()
+        future.set_result(done.value)
+        return future
+    except Exception as exc:  # noqa: BLE001 - surfaced through the future, as a Task would
+        future = loop.create_future()
+        future.set_exception(exc)
+        return future
+
+    async def _rest():
+        return await _ResumedAwaitable(coro, yielded)
+    return loop.create_task(_rest())
+
+
+async def _anext_or_end(iterator):
+    """One ``__anext__`` of ``iterator``; ``_STREAM_END`` instead of raising
+    ``StopAsyncIteration`` (which must not travel through a Task)."""
+    try:
+        return await iterator.__anext__()
+    except StopAsyncIteration:
+        return _STREAM_END
+
+
 @dataclass(frozen=True)
 class IngestItem:
     """One received frame: already decoded and already durably captured,
@@ -175,6 +269,20 @@ class WebSocketClient:
         #: Upper bound on how long shutdown waits for the worker to drain the
         #: ingest queue. Firing is counted, not just logged.
         self.shutdown_drain_timeout_s = 30.0
+        #: Upper bound on how long shutdown waits for the *cancelled* worker to
+        #: actually finish. Distinct from the drain timeout: after the drain gives
+        #: up (or is interrupted) the worker is cancelled, and a worker that still
+        #: has not ended after this long is a terminal retirement failure.
+        self.worker_retire_timeout_s = 5.0
+        #: Queued-but-never-processed frames abandoned by an interrupted or
+        #: timed-out drain, and the in-flight item (if any) a cancelled worker was
+        #: holding. Both are INCLUDED in ``frames_abandoned_at_shutdown``; they are
+        #: broken out so the accounting identity is checkable without
+        #: double-counting a queued item and an in-flight one.
+        self.frames_abandoned_queued = 0
+        self.frames_abandoned_in_flight = 0
+        #: True once a worker could not be retired (see WorkerRetirementError).
+        self.worker_retirement_failed = False
         self.raw_capture_callback_failures = 0
         #: True from the first callback failure until the next success. One
         #: quality event per failure *streak*, not per frame: a callback that
@@ -201,6 +309,19 @@ class WebSocketClient:
         #: drains and ``join()`` completes without any frame being processed.
         self._discard_mode = False
         self.discard_reason: Optional[str] = None
+        # --- shutdown lifecycle ------------------------------------------
+        #: Latched by stop(): ingress is closed for good. start() on a stopped
+        #: client runs no connection loop (a stop() that lands before start()'s
+        #: first turn is therefore not lost).
+        self._stop_requested = False
+        #: Future completed by stop(); raced against every receive and every
+        #: reconnect backoff so a quiet socket / a long sleep cannot hold
+        #: shutdown hostage. Created lazily inside the running loop.
+        self._stop_future: Optional[asyncio.Future] = None
+        #: start() has been entered / has finished its shutdown tail (drain +
+        #: worker retirement). ``wait_stopped`` is built on these.
+        self._lifecycle_started = False
+        self._lifecycle_finished: Optional[asyncio.Event] = None
         #: Queued frames dropped unprocessed in discard mode (their raw copy,
         #: if the raw boundary still held, already exists: see _consume).
         self.frames_discarded = 0
@@ -294,7 +415,46 @@ class WebSocketClient:
         return "connection_id" in parameters
 
     async def start(self):
-        if self._discard_mode:
+        """Run the connection loop, then ALWAYS run the shutdown tail.
+
+        The tail (drain the ingest queue, retire the worker) used to run only
+        when the receive loop ended by itself, so a cancelled start() -- which is
+        what a runner's shutdown does -- skipped it and left the separate worker
+        task alive and able to use storage the runner was about to close. It now
+        runs in a ``finally``: on normal exit, on error, and on cancellation.
+        """
+        self._lifecycle_started = True
+        if self._lifecycle_finished is None:
+            self._lifecycle_finished = asyncio.Event()
+        self._lifecycle_finished.clear()
+        try:
+            try:
+                await self._run_connection_loop()
+            finally:
+                # STOP RECEIVING -> DRAIN PROCESSING QUEUE -> STOP WORKER -> EXIT.
+                # The receive loop has exited (or been cancelled), so nothing more
+                # can be enqueued and the drain is bounded, not a race against new
+                # arrivals. A stuck worker (e.g. a wedged downstream write) cannot
+                # hang shutdown: the drain times out (counted, logged, quality
+                # event), the worker is cancelled, and retirement is itself
+                # bounded -- a worker that survives that raises
+                # WorkerRetirementError rather than being quietly orphaned.
+                await self._drain_and_stop_worker()
+        finally:
+            self._lifecycle_finished.set()
+        if self.fatal_error is not None and self.on_fatal is None:
+            # No application classifier was wired: the failure must not
+            # evaporate into a quietly-finished task.
+            raise self.fatal_error
+
+    async def _run_connection_loop(self):
+        if self._stop_requested:
+            # stop() landed before this loop's first turn: ingress is closed for
+            # good, so there is nothing to connect to (only the tail runs).
+            self.running = False
+            self.connected = False
+            logger.info("websocket_start_skipped_stop_requested", stream_group=self.stream_group)
+        elif self._discard_mode:
             # Terminal latch (a failed-writer fatal): the client is never
             # revived by start(). ``running`` stays False so the loop below is
             # skipped and only the shutdown tail runs (nothing to drain, and
@@ -312,7 +472,11 @@ class WebSocketClient:
             try:
                 connection = websockets.connect(self.url)
                 if hasattr(connection, "__await__"):
-                    connection = await connection
+                    # stop() must not wait out the opening handshake (open_timeout,
+                    # 10 s): that is time shutdown_deadline_s does not budget.
+                    connection = await self._connect_or_stop(connection)
+                    if connection is _STREAM_END:
+                        break
 
                 async with connection as ws:
                     if self._discard_mode:
@@ -416,50 +580,247 @@ class WebSocketClient:
                     break
                 self.retry_delay = delay
                 logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=delay)
-                await asyncio.sleep(delay)
+                await self._interruptible_sleep(delay)
 
-        # STOP RECEIVING -> DRAIN PROCESSING QUEUE -> STOP WORKER -> EXIT.
-        # By this point self.running is False and no more frames can be
-        # enqueued (the receive loop has exited), so draining here is
-        # bounded, not a race against new arrivals. An explicit timeout
-        # keeps a stuck worker (e.g. a wedged downstream write) from
-        # hanging shutdown forever -- the timeout firing is itself an
-        # observable, logged condition, not a silent hang.
-        await self._drain_and_stop_worker()
-        if self.fatal_error is not None and self.on_fatal is None:
-            # No application classifier was wired: the failure must not
-            # evaporate into a quietly-finished task.
-            raise self.fatal_error
 
     async def _drain_and_stop_worker(self) -> None:
-        """Drain the ingest queue (bounded), then stop the worker.
+        """Drain the ingest queue (bounded), then retire the worker.
 
-        Extracted from start() unchanged in behaviour so the timeout path is
-        testable; the timeout is an attribute instead of a literal.
+        The worker is retired on EVERY exit from the drain -- normal completion,
+        timeout, or a cancellation landing while the drain is waiting -- so a
+        cancelled start() can never leave a live, unowned worker behind.
+        Accounting: a drain that gives up (timeout or interruption) counts the
+        frames still *queued* as abandoned; the single item the worker may be
+        holding in flight is counted separately, by the worker itself, when its
+        cancellation lands (see ``_process_queue``). ``qsize()`` never includes
+        the in-flight item, so the two are never double-counted.
         """
-        if self._worker_task is not None:
+        worker = self._worker_task
+        if worker is None:
+            return
+        queued_counted = False
+        try:
             try:
                 await asyncio.wait_for(self._ingest_queue.join(), timeout=self.shutdown_drain_timeout_s)
             except asyncio.TimeoutError:
                 # Frames still queued when the drain gives up will not reach
                 # on_message in this run. Their raw copy already exists (raw
                 # capture precedes the enqueue), so this is lost *processing*,
-                # not lost raw evidence -- but it was logged only, uncounted,
-                # unlike the sibling shutdown-abandonment path. qsize() does
-                # not include an item the worker is mid-way through.
-                remaining = self._ingest_queue.qsize()
-                self.frames_abandoned_at_shutdown += remaining
+                # not lost raw evidence.
+                queued_counted = True
+                remaining = self._abandon_queued_frames()
                 logger.error("ingest_queue_drain_timeout", remaining=remaining)
                 if self.on_quality_event:
                     self.on_quality_event(
                         "ERROR", f"ingest_queue_drain_timeout:{remaining}",
                         self.connection_id, self.stream_group)
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            except BaseException:
+                # Cancelled (or otherwise interrupted) while draining: whatever
+                # is still queued will not be processed by this run. Count it
+                # here, once, then let the cancellation continue after the
+                # worker has been retired in the ``finally`` below.
+                queued_counted = True
+                remaining = self._abandon_queued_frames()
+                logger.error("ingest_queue_drain_interrupted", remaining=remaining)
+                if self.on_quality_event:
+                    self.on_quality_event(
+                        "ERROR", f"ingest_queue_drain_interrupted:{remaining}",
+                        self.connection_id, self.stream_group)
+                raise
+        finally:
+            await self._retire_worker(worker)
+
+    def _abandon_queued_frames(self) -> int:
+        """Count the frames still sitting in the queue as abandoned (not the
+        in-flight one: ``qsize()`` excludes an item the worker has dequeued)."""
+        remaining = self._ingest_queue.qsize()
+        self.frames_abandoned_queued += remaining
+        self.frames_abandoned_at_shutdown += remaining
+        return remaining
+
+    async def _retire_worker(self, worker: "asyncio.Task") -> None:
+        """Cancel ``worker`` and wait, bounded, until it has actually ended.
+
+        The reference is cleared only once the worker is truly done. A worker
+        that survives ``worker_retire_timeout_s`` is NOT forgotten: the reference
+        is kept, ``worker_retirement_failed`` latches, and WorkerRetirementError
+        is raised so no caller can mistake it for a clean shutdown. Cancellation
+        of this coroutine itself propagates (it is never swallowed); the worker's
+        own cancel has already been requested by then.
+        """
+        if not worker.done():
+            worker.cancel()
+        _, pending = await asyncio.wait({worker}, timeout=self.worker_retire_timeout_s)
+        if pending:
+            self.worker_retirement_failed = True
+            logger.error("ingest_worker_retirement_failed",
+                         stream_group=self.stream_group, timeout_s=self.worker_retire_timeout_s)
+            if self.on_quality_event:
+                self.on_quality_event(
+                    "ERROR", "ingest_worker_retirement_failed",
+                    self.connection_id, self.stream_group)
+            raise WorkerRetirementError(
+                f"ingest worker for {self.stream_group!r} still running "
+                f"{self.worker_retire_timeout_s}s after cancellation")
+        if not worker.cancelled() and worker.exception() is not None:
+            # Observe it so it is never "exception was never retrieved".
+            logger.error("ingest_worker_ended_with_error", stream_group=self.stream_group,
+                         error=f"{type(worker.exception()).__name__}: {worker.exception()}")
+        if self._worker_task is worker:
             self._worker_task = None
+
+    def _stop_signal(self) -> "asyncio.Future":
+        """The future stop() completes. Created lazily inside the running loop;
+        already complete if stop() was requested before it existed."""
+        future = self._stop_future
+        if future is None or future.get_loop() is not asyncio.get_running_loop():
+            future = asyncio.get_running_loop().create_future()
+            self._stop_future = future
+        if self._stop_requested and not future.done():
+            future.set_result(None)
+        return future
+
+    async def _next_frame(self, iterator):
+        """Next frame from ``iterator``, or ``_STREAM_END``.
+
+        Races the receive against stop(). If stop wins while no frame is in hand,
+        the pending receive is cancelled (cancelling ``recv`` is safe in
+        ``websockets``: it cannot lose a message) and awaited, so no receive task
+        outlives the call. If a frame and the stop complete together the frame is
+        returned -- the caller's own ``running`` check decides its fate, exactly
+        as before.
+
+        Scheduling is deliberately unchanged for the common case: the receive is
+        started eagerly (Python >= 3.12), so a frame that is already available
+        completes without suspending and the loop does not yield to the event
+        loop between buffered frames -- the same behaviour as the plain
+        ``async for`` this replaced, which is what lets a burst fill the bounded
+        queue and register backpressure. On older interpreters (3.11) the same is achieved by
+        stepping the receive once by hand (``_start_receive_without_eager_tasks``).
+        """
+        if self._stop_requested:
+            return _STREAM_END
+        coro = _anext_or_end(iterator)
+        loop = asyncio.get_running_loop()
+        try:
+            receive = asyncio.Task(coro, loop=loop, eager_start=True)
+        except TypeError:                      # Python < 3.12: no eager tasks
+            receive = _start_receive_without_eager_tasks(coro, loop)
+        if not receive.done():
+            stop = self._stop_signal()
+            try:
+                await asyncio.wait({receive, stop}, return_when=asyncio.FIRST_COMPLETED)
+            except BaseException:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+                raise
+        if receive.done():
+            return receive.result()
+        receive.cancel()
+        await asyncio.gather(receive, return_exceptions=True)
+        return _STREAM_END
+
+    async def _connect_or_stop(self, pending):
+        """Await the opening handshake ``pending`` unless stop() lands first.
+
+        Returns the connection, or ``_STREAM_END`` when stop won (the handshake is
+        cancelled -- ``websockets`` aborts the transport on cancellation -- and
+        awaited, so nothing outlives the call). A connect error propagates exactly
+        as the plain ``await`` did. A connection that completed together with stop
+        is returned: the caller's ``async with`` closes it and its receive loop
+        consumes nothing because ingress is already stopped.
+        """
+        if self._stop_requested:
+            return _STREAM_END
+        attempt = asyncio.ensure_future(pending)
+        stop = self._stop_signal()
+        try:
+            await asyncio.wait({attempt, stop}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            attempt.cancel()
+            await asyncio.gather(attempt, return_exceptions=True)
+            raise
+        if attempt.done():
+            return attempt.result()
+        attempt.cancel()
+        await asyncio.gather(attempt, return_exceptions=True)
+        return _STREAM_END
+
+    async def _interruptible_sleep(self, delay: float) -> None:
+        """``asyncio.sleep(delay)`` that stop() can cut short (reconnect backoff
+        can be up to a minute; shutdown must not wait it out)."""
+        if self._stop_requested:
+            return
+        stop = self._stop_signal()
+        sleeper = asyncio.ensure_future(asyncio.sleep(delay))
+        try:
+            await asyncio.wait({sleeper, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not sleeper.done():
+                sleeper.cancel()
+                await asyncio.gather(sleeper, return_exceptions=True)
+
+    def live_lifecycle_tasks(self) -> list:
+        """Tasks that keep ``lifecycle_idle`` False without being the ``start()`` task itself: the ingest
+        worker while it is alive. A worker that survived its bounded retirement outlives ``start()``, so
+        its end is the only event that makes the client idle again; a caller that must act then (the
+        runner's late finalization) registers a done-callback on it. Empty when nothing is alive."""
+        worker = self._worker_task
+        return [worker] if worker is not None and not worker.done() else []
+
+    @property
+    def worker_active(self) -> bool:
+        """True while an ingest worker task exists and has not ended."""
+        worker = self._worker_task
+        return worker is not None and not worker.done()
+
+    @property
+    def ingress_stopped(self) -> bool:
+        """True when the receive loop can no longer call ``on_raw_frame`` -- the only
+        producer of the raw-wire writer. Independent of the worker and of whether
+        start() has finished: once stop() has returned (or start()'s lifecycle has
+        ended) no frame can be captured, because ``_consume`` has no ``await``
+        between its ``running`` check and the capture."""
+        if self._stop_requested:
+            return True
+        return bool(self._lifecycle_started and self._lifecycle_finished is not None
+                    and self._lifecycle_finished.is_set())
+
+    @property
+    def lifecycle_idle(self) -> bool:
+        """True when nothing of this client can still touch storage: start() is
+        not mid-lifecycle (never entered, or its tail has finished) and no ingest
+        worker is alive. Synchronous, so a non-async ``shutdown()`` can gate
+        writer closes on it."""
+        if self.worker_active:
+            return False
+        if self._lifecycle_started and self._lifecycle_finished is not None:
+            return self._lifecycle_finished.is_set()
+        return True
+
+    @property
+    def shutdown_deadline_s(self) -> float:
+        """Worst-case time start() needs after stop(): the connection's close
+        handshake (websockets ``close_timeout``, 10 s) plus slack, the bounded
+        drain and the bounded worker retirement. The opening handshake is not
+        included because stop() cancels it. Runners use it as their wait bound."""
+        return (CLOSE_HANDSHAKE_S + CONNECTION_PHASE_SLACK_S
+                + self.shutdown_drain_timeout_s + self.worker_retire_timeout_s)
+
+    async def wait_stopped(self, timeout_s: float) -> bool:
+        """Wait (bounded) for this client's whole lifecycle to finish.
+
+        True when start() was never entered, or has completed its tail (drain +
+        worker retirement) -- and no worker is still alive. False on timeout, or
+        if a worker survived. Never raises on timeout and never cancels anything:
+        the caller decides what a False means.
+        """
+        if self._lifecycle_started and self._lifecycle_finished is not None:
+            try:
+                await asyncio.wait_for(self._lifecycle_finished.wait(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                return False
+        return not self.worker_active
 
     @staticmethod
     def _monotonic() -> float:
@@ -509,7 +870,13 @@ class WebSocketClient:
         canonical events -- the actually unbounded-latency, per-venue work)
         remains decoupled into the worker, which is what P0-1 was for.
         """
-        async for msg in ws:
+        iterator = ws.__aiter__()
+        while True:
+            # Race every receive against stop(): a quiet or blocked socket must
+            # not hold shutdown until the exchange happens to send another frame.
+            msg = await self._next_frame(iterator)
+            if msg is _STREAM_END:
+                break
             if not self.running:
                 break
             # Capture arrival time before anything else, including before
@@ -679,6 +1046,19 @@ class WebSocketClient:
                 # so a typed fatal is classified by the application and can
                 # never be counted as an ordinary processing error.
                 self._handle_fatal(exc, "worker")
+            except asyncio.CancelledError:
+                # Retirement cancelled the worker while this item was in flight.
+                # It is neither processed nor a processing failure: it is work
+                # intentionally abandoned at shutdown, counted exactly once
+                # (``task_done()`` still runs once, in ``finally``).
+                self.frames_abandoned_in_flight += 1
+                self.frames_abandoned_at_shutdown += 1
+                logger.error("ingest_item_abandoned_in_flight", stream_group=self.stream_group)
+                if self.on_quality_event:
+                    self.on_quality_event(
+                        "ERROR", "ingest_item_abandoned_in_flight",
+                        item.connection_id, self.stream_group)
+                raise
             except Exception as exc:  # noqa: BLE001 - isolate one bad item
                 self.processing_errors += 1
                 logger.error("ingest_item_processing_failed",
@@ -768,5 +1148,19 @@ class WebSocketClient:
         return False
 
     def stop(self):
+        """Close ingress for good and wake anything waiting on the network.
+
+        Synchronous and idempotent (runners call it as a plain method). Setting
+        ``running = False`` alone does not wake a receive loop parked on a quiet
+        socket or a reconnect backoff sleep, so this also completes the stop
+        future those waits are raced against.
+        """
+        self._stop_requested = True
         self.running = False
         self.connected = False
+        future = self._stop_future
+        if future is not None and not future.done():
+            try:
+                future.set_result(None)
+            except RuntimeError:   # its loop is already closed: nothing left to wake
+                pass

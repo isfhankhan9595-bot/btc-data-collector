@@ -49,13 +49,14 @@ from .failure_topology import (
 )
 from .storage_errors import FatalStorageError
 from .utils import logger, send_telegram_alert
+from .websocket_client import WorkerRetirementError
 
 __all__ = [
     "EXIT_FATAL_STORAGE", "EXIT_RUN_TASK_CRASHED", "SHUTDOWN_TASK_TIMEOUT_S",
     "DEDUP_DEFAULT_STREAM", "ROUTE_TAG_ATTRIBUTE", "tag_route", "build_stream_table",
-    "StandaloneFailurePolicy", "supervise_standalone_runner",
+    "StandaloneFailurePolicy", "supervise_standalone_runner", "await_client_idle", "cancel_and_wait", "REST_PRODUCER_CANCEL_BOUND_S",
     "NO_QUALITY_WAL_NOTE", "UNCONFIRMED_QUALITY_EVENT_NOTE", "is_bounded_report_point",
-    "DegradedQualityLossReporting",
+    "DegradedQualityLossReporting", "writer_already_failed",
 ]
 
 #: Exit status when the application task died of an exception that is NOT a
@@ -158,12 +159,26 @@ class StandaloneFailurePolicy:
         #: Set the moment a TERMINATE verdict latches; the supervisor waits on it.
         self.terminal_event = asyncio.Event()
         self._reporting = False
+        #: First explicit shutdown failure (a websocket ingest worker that could
+        #: not be retired). Distinct from ``terminal_failure``: no storage verdict
+        #: was reached, but a shutdown that could not run its ordering must never
+        #: exit 0.
+        self.shutdown_failure: Optional[str] = None
+
+    def record_shutdown_failure(self, reason: str) -> None:
+        """Latch a terminal shutdown failure (first reason wins). Never raises."""
+        if self.shutdown_failure is None:
+            self.shutdown_failure = reason
+        logger.error("runner_shutdown_terminal_failure", venue=self.venue, reason=reason,
+                     exit_status=EXIT_RUN_TASK_CRASHED)
 
     # -- classification ------------------------------------------------------
 
     @property
     def exit_code(self) -> int:
-        return EXIT_FATAL_STORAGE if self.terminal_failure is not None else 0
+        if self.terminal_failure is not None:
+            return EXIT_FATAL_STORAGE
+        return EXIT_RUN_TASK_CRASHED if self.shutdown_failure is not None else 0
 
     def on_fatal(self, exc: BaseException, origin: str = "handler", *,
                  route: Optional[str] = None) -> str:
@@ -408,6 +423,47 @@ class DegradedQualityLossReporting:
             pass
 
 
+def writer_already_failed(writer: Any) -> bool:
+    """True when ``writer`` had ALREADY latched a storage failure before shutdown tried to close it.
+
+    Such a failure was reported (and classified) when it happened; a close that merely re-raises it is not
+    a new shutdown failure. A close that fails on a writer that was healthy is: its final segment was not
+    published and nothing else has said so. Unknown or non-standard writers count as healthy, so a failed
+    close is reported rather than hidden."""
+    try:
+        return writer.failure_snapshot() is not None
+    except Exception:  # noqa: BLE001 - never let the check itself break a close path
+        return False
+
+
+async def await_client_idle(client: Any, policy: "StandaloneFailurePolicy") -> bool:
+    """Wait (bounded) until ``client`` can no longer touch storage.
+
+    Call it AFTER ``client.stop()`` and BEFORE closing any writer the client's
+    ingest worker or callbacks can reach. ``stop()`` only requests the shutdown;
+    the receive loop, the queue drain and the worker's retirement all happen in
+    the client's own ``start()`` task, which the supervisor does not cancel until
+    ``shutdown()`` has returned -- so closing writers straight after ``stop()``
+    put storage beneath a still-live worker. Returns False (and latches an
+    explicit ``shutdown_failure`` on ``policy``, which makes the exit status
+    non-zero) when the client is not idle within its own documented bound; the
+    caller must then NOT close those writers. A client double without
+    ``wait_stopped`` counts as idle. Never raises.
+    """
+    waiter = getattr(client, "wait_stopped", None)
+    if waiter is None:
+        return True
+    try:
+        idle = bool(await waiter(getattr(client, "shutdown_deadline_s", 60.0)))
+    except Exception as exc:  # noqa: BLE001 - a broken wait must fail CLOSED, not skip the check
+        logger.error("runner_client_wait_failed", venue=policy.venue,
+                     error=f"{type(exc).__name__}: {exc}")
+        idle = False
+    if not idle:
+        policy.record_shutdown_failure("ws_client_worker_not_retired")
+    return idle
+
+
 async def _bounded_wait(task: "asyncio.Future[Any]", timeout: float, what: str) -> None:
     """Wait for ``task`` without ever blocking forever, and retrieve its outcome
     so it can never become an unobserved background task."""
@@ -416,6 +472,126 @@ async def _bounded_wait(task: "asyncio.Future[Any]", timeout: float, what: str) 
     done, _ = await asyncio.wait({task}, timeout=timeout)
     if not done:
         logger.error("runner_task_did_not_stop_in_time", task=what, timeout_s=timeout)
+
+
+#: How long a runner waits for a REST producer (book-recovery task) to end after cancelling it. The
+#: same bound as run_collector.WS_FALLBACK_SLACK_S (tests/test_ws_rest_producer_reach.py asserts the
+#: two stay equal). A producer that outlives it is reported, never assumed gone.
+REST_PRODUCER_CANCEL_BOUND_S = 1.0
+
+
+async def cancel_and_wait(task: "Optional[asyncio.Future[Any]]", timeout: float, what: str) -> bool:
+    """Cancel ``task`` and wait (at most ``timeout``) for it; True iff it has ended.
+
+    Built on ``_bounded_wait`` so the existing "did not stop in time" logging is reused. It
+    never swallows a cancellation of the CALLER (``asyncio.wait`` re-raises it), and it never
+    returns True for a task that is still running -- a cancellation-resistant producer is the
+    caller's to report."""
+    if task is None:
+        return True
+    if not task.done():
+        task.cancel()
+        await _bounded_wait(task, timeout, what)
+    if task.done() and not task.cancelled():
+        task.exception()                    # mark retrieved: never an unobserved background failure
+    return task.done()
+
+
+class CloseOnce:
+    """At-most-once close registry: a writer's close is ATTEMPTED once per process.
+
+    ``shutdown()`` of a standalone runner can now be reached more than once (the supervisor's call, an
+    explicit retry, and the late-finalization callback below), and a ``ParquetWriter.close()`` is not a
+    safe thing to repeat: a second call after a failed first one would re-raise the latched storage
+    failure and report it again, and re-running a half-finished finalization is not something this
+    code has ever demonstrated to be safe. The first attempt's outcome is therefore recorded and every
+    later request for the same writer returns it WITHOUT calling ``close()`` again.
+    """
+
+    def __init__(self) -> None:
+        self._results: Dict[str, bool] = {}
+
+    def attempted(self, name: str) -> bool:
+        return name in self._results
+
+    def run(self, name: str, close: Callable[[], bool]) -> bool:
+        if name in self._results:
+            return self._results[name]
+        # Recorded BEFORE the call returns control to anything else: a re-entrant request (the close
+        # path reporting a failure, a callback firing from a nested await) must see "attempted".
+        self._results[name] = False
+        self._results[name] = bool(close())
+        return self._results[name]
+
+
+class LateFinalizer:
+    """Finalize storage when the LAST live user of it ends after ``shutdown()`` already returned.
+
+    ``shutdown()`` never closes a writer beneath a live user (an ingest worker that swallowed its
+    cancel, a book-recovery task that did) and returns early, latching an explicit shutdown failure.
+    ``stop()`` and the supervisor's wait cannot make such a user end, and once ``shutdown()`` has
+    returned nothing else would ever close what it held. This arms a done-callback on every still-live
+    user; when one ends, ``finalize`` runs -- but only if ``users_stopped()`` says EVERY user is now
+    stopped (the callback of one user never closes storage another still uses; that user's own end
+    retries). ``finalize`` runs at most once even when callbacks overlap.
+
+    It does not clear the latched failure (a late close is not a clean shutdown) and it cannot make a
+    worker that never ends end: that worker keeps its storage open and the failure stays latched.
+    """
+
+    def __init__(self, *, venue: str, finalize: Callable[[], None],
+                 users_stopped: Callable[[], bool],
+                 watched: Callable[[], Iterable[Any]]) -> None:
+        self.venue = venue
+        self._finalize = finalize
+        self._users_stopped = users_stopped
+        self._watched = watched
+        self._armed: set = set()
+        #: Set once ``finalize`` has been started by a late callback (never reset).
+        self.ran = False
+
+    def arm(self) -> int:
+        """Register on every watched task that is still alive and not yet armed (idempotent)."""
+        count = 0
+        for task in list(self._watched()):
+            if task is None or task.done() or task in self._armed:
+                continue
+            self._armed.add(task)
+            task.add_done_callback(self._on_user_ended)
+            count += 1
+        return count
+
+    def _on_user_ended(self, task: Any) -> None:
+        try:
+            if not task.cancelled():
+                error = task.exception()        # retrieved here: reported, never an unobserved failure
+                if error is not None:
+                    logger.error("late_storage_user_failed_after_shutdown", venue=self.venue,
+                                 error=f"{type(error).__name__}: {error}")
+        except Exception:  # noqa: BLE001 - observing a task must never raise into the loop
+            pass
+        self.retry()
+
+    def retry(self) -> bool:
+        """Run ``finalize`` if every user has stopped and it has not run yet. Never raises."""
+        if self.ran:
+            return False
+        try:
+            stopped = bool(self._users_stopped())
+        except Exception as exc:  # noqa: BLE001 - an unreadable state must fail CLOSED (keep storage open)
+            logger.error("late_finalization_state_check_failed", venue=self.venue,
+                         error=f"{type(exc).__name__}: {exc}")
+            return False
+        if not stopped:
+            return False                        # another user is alive: ITS end retries
+        self.ran = True
+        logger.info("late_shutdown_finalization", venue=self.venue)
+        try:
+            self._finalize()
+        except Exception as exc:  # noqa: BLE001 - per-writer failures are reported inside finalize
+            logger.error("late_shutdown_finalization_failed", venue=self.venue,
+                         error=f"{type(exc).__name__}: {exc}")
+        return True
 
 
 async def supervise_standalone_runner(app: Any, stop: asyncio.Event, *,
@@ -489,7 +665,9 @@ async def supervise_standalone_runner(app: Any, stop: asyncio.Event, *,
             elif late is not None:
                 logger.error("runner_task_failed_during_shutdown", venue=policy.venue,
                              error=f"{type(late).__name__}: {late}")
+                if isinstance(late, WorkerRetirementError):
+                    policy.record_shutdown_failure("ws_client_worker_not_retired")
         await asyncio.gather(stop_task, terminal_task, return_exceptions=True)
     if policy.terminal_failure is not None:
         return EXIT_FATAL_STORAGE
-    return EXIT_RUN_TASK_CRASHED if crashed else 0
+    return EXIT_RUN_TASK_CRASHED if (crashed or policy.shutdown_failure is not None) else 0

@@ -39,6 +39,7 @@ import inspect
 import json
 import signal
 import time
+from typing import Optional
 
 from collector.collector.adapters.okx import OKXAdapter
 from collector.collector.segment_dedup import StreamSpec, attach_segment_dedup, bind_arg
@@ -69,9 +70,14 @@ from collector.collector.failure_topology import FailureRecord
 from collector.collector.parquet_writer import ParquetWriter
 from collector.collector.quality_events import QualityEventType
 from collector.collector.raw_capture import RAW_WIRE_SCHEMA, RawCapture, RawWireRecord
+from collector.collector.loop_teardown import run_bounded, teardown_exit_status
 from collector.collector.standalone_failure_policy import (
+    CloseOnce,
     DegradedQualityLossReporting,
+    LateFinalizer,
     StandaloneFailurePolicy,
+    await_client_idle,
+    writer_already_failed,
     build_stream_table,
     supervise_standalone_runner,
     tag_route,
@@ -205,6 +211,15 @@ class OKXCollectorApp(DegradedQualityLossReporting):
             stream_group="okx",
             on_fatal=self._on_fatal_storage,
         )
+        # Late finalization (see ``_finalize_storage``): each writer's close is attempted at most
+        # once, and a done-callback on every storage user that outlived ``shutdown()`` retries the
+        # finalization when the LAST of them ends. ``_run_task`` is the supervisor's task running
+        # ``run()`` (the client's start() lifecycle); it is recorded by ``run()``.
+        self._close_once = CloseOnce()
+        self._run_task = None
+        self._late_finalizer = LateFinalizer(
+            venue="OKX", finalize=lambda: self._finalize_storage(),
+            users_stopped=self._storage_users_stopped, watched=self._storage_user_tasks)
 
     # -- F5 failure topology ------------------------------------------------
 
@@ -479,6 +494,7 @@ class OKXCollectorApp(DegradedQualityLossReporting):
     # -- lifecycle ------------------------------------------------------------
 
     async def run(self) -> None:
+        self._run_task = asyncio.current_task()
         await self.client.start()
 
     async def shutdown(self) -> None:
@@ -492,7 +508,53 @@ class OKXCollectorApp(DegradedQualityLossReporting):
                 await stopped
         except Exception as exc:  # noqa: BLE001
             logger.error("okx_client_stop_failed", error=f"{type(exc).__name__}: {exc}")
-        self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "OKX")
+        # ``stop()`` only REQUESTS shutdown; the drain and the worker's retirement
+        # finish inside the client's own start() task (this app's run_task, not
+        # cancelled until this coroutine returns). Wait for it before closing any
+        # writer the worker can reach.
+        client_idle = await await_client_idle(self.client, self.failure_policy)
+        # Each writer is closed only when every producer that can reach it is stopped (see
+        # ``_finalize_storage``). If a worker is still alive everything it can reach stays open;
+        # ``_late_finalizer`` finalizes it when the LAST live user ends -- nothing else would, once
+        # this has returned.
+        self._finalize_storage(client_idle)
+        if not client_idle:
+            self._late_finalizer.arm()
+
+    # -- storage finalization ---------------------------------------------------
+
+    def _storage_users_stopped(self) -> bool:
+        """True when NOTHING that can still write this venue's storage is alive: the client's whole
+        lifecycle (start() tail + ingest worker) has ended. OKX has no REST producer."""
+        return bool(getattr(self.client, "lifecycle_idle", True))
+
+    def _storage_user_tasks(self) -> list:
+        """Every task whose end can make a held writer safe to close."""
+        tasks = [self._run_task]
+        getter = getattr(self.client, "live_lifecycle_tasks", None)
+        if getter is not None:
+            tasks.extend(getter())
+        return tasks
+
+    def _finalize_storage(self, client_idle: Optional[bool] = None) -> None:
+        """Close, at most once each, every writer whose users are ALL proven stopped. Idempotent.
+
+        ``client_idle`` is the verdict ``shutdown()`` just obtained by waiting for the client; the late
+        callback passes None, which reads the client's live state instead.
+
+        Reachability, judged from LIVE state on every call:
+          raw_wire_writer: the receive loop only           -> ingress stopped (whatever the worker does).
+          trades, trades_all, mark, index, funding, oi, liq writers and quality_writer: the ingest
+          worker (on_message)                              -> client idle. quality_writer closes last so
+          every other close failure can still be reported through it."""
+        self._close_raw_wire_writer_if_ingress_stopped()
+        if client_idle is None:
+            client_idle = bool(getattr(self.client, "lifecycle_idle", True))
+        if not client_idle:
+            # A worker is still alive: everything the worker can reach stays open.
+            return
+        if self._close_once.attempted("quality_writer"):
+            return          # a full finalization already ran
         self._close_writer_reporting_failure(self.trades_writer, "trades_writer", "OKX")
         self._close_writer_reporting_failure(self.trades_all_writer, "trades_all_writer", "OKX")
         self._close_writer_reporting_failure(self.mark_writer, "mark_writer", "OKX")
@@ -504,7 +566,19 @@ class OKXCollectorApp(DegradedQualityLossReporting):
         # Last, so the counts include anything the closes above reported. Cannot raise.
         self._report_quality_channel_final()
 
-    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> None:
+    def _close_raw_wire_writer_if_ingress_stopped(self) -> None:
+        if getattr(self.client, "ingress_stopped", True):
+            self._close_writer_reporting_failure(self.raw_wire_writer, "raw_wire_writer", "OKX")
+        else:
+            logger.error("okx_raw_wire_writer_left_open_ingress_not_stopped")
+
+    def _close_writer_reporting_failure(self, writer, writer_name: str, exchange: str) -> bool:
+        """Close ``writer`` at most once per process (``CloseOnce``); a repeat request returns the
+        first attempt's outcome without calling ``close()`` again."""
+        return self._close_once.run(
+            writer_name, lambda: self._close_writer_attempt(writer, writer_name, exchange))
+
+    def _close_writer_attempt(self, writer, writer_name: str, exchange: str) -> bool:
         """Close one writer; on failure, report it and still return.
 
         Hostile-audit finding (this session): none of these close() calls
@@ -517,10 +591,14 @@ class OKXCollectorApp(DegradedQualityLossReporting):
         every writer except quality_writer itself, which is always closed
         last precisely so this reporting path works.
         """
+        was_failed = writer_already_failed(writer)
         try:
             writer.close()
+            return True
         except Exception as exc:  # noqa: BLE001 - must not abort closing the rest
             logger.error("storage_shutdown_close_failed", writer=writer_name, error=str(exc))
+            if not was_failed:      # a healthy writer failed to publish its final segment: never exit 0
+                self.failure_policy.record_shutdown_failure(f"writer_close_failed:{writer_name}")
             if writer_name != "quality_writer":
                 try:
                     self._persist_quality_event({
@@ -531,6 +609,7 @@ class OKXCollectorApp(DegradedQualityLossReporting):
                 except Exception as sink_exc:  # noqa: BLE001 - reporting must not itself abort shutdown
                     logger.error("storage_shutdown_close_failure_report_failed",
                                  writer=writer_name, error=str(sink_exc))
+            return False
 
 
 async def _main(data_dir: str, url: str) -> int:
@@ -548,6 +627,15 @@ async def _main(data_dir: str, url: str) -> int:
     return await supervise_standalone_runner(app, stop)
 
 
+def _entry(data_dir: str, url: str) -> int:
+    """The process entry: ``_main`` under a BOUNDED event-loop teardown (``loop_teardown``).
+
+    ``asyncio.run`` would wait without limit for a task that swallowed its cancellation, ignoring SIGTERM and
+    SIGINT meanwhile and losing the latched exit status to a SIGKILL. Never returns 0 with a task left alive."""
+    status, stuck = run_bounded(_main(data_dir, url))
+    return teardown_exit_status(status, stuck)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="data")
@@ -556,4 +644,4 @@ if __name__ == "__main__":
     logger.info("okx_collector_starting", url=args.url, data_dir=args.data_dir,
                note="requires outbound access to ws.okx.com:8443; "
                     "not available in every environment (see docs/EXECUTION_STATUS.md)")
-    raise SystemExit(asyncio.run(_main(args.data_dir, args.url)))
+    raise SystemExit(_entry(args.data_dir, args.url))
