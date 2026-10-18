@@ -154,6 +154,18 @@ def _marker_evidence(rec: SourceRecord, marker: MarkerValidation):
         raise ValueError(
             f"VALID_V2 marker for {rec.relative_path!r} has inconsistent marker presence"
         )
+    # The result must also agree with the discovery record it claims to describe. Discovery is
+    # the evidence for what existed at the marker path, so VALID_V2 is only coherent when that
+    # record saw a regular file there. Agreement is stated explicitly (it follows from the two
+    # REGULAR_FILE requirements) so the invariant survives an edit to either one.
+    if (
+        rec.marker_presence is not MarkerPresence.REGULAR_FILE
+        or marker.marker_presence is not rec.marker_presence
+    ):
+        raise ValueError(
+            f"VALID_V2 marker for {rec.relative_path!r} contradicts the discovery record's "
+            "marker presence"
+        )
     if not isinstance(marker.reasons, tuple) or "MARKER_SCHEMA_2_VALID" not in marker.reasons:
         raise ValueError(
             f"VALID_V2 marker for {rec.relative_path!r} lacks schema-validation evidence"
@@ -339,9 +351,10 @@ def verify_segment_bytes(
 
     Raises ValueError, before any filesystem access and without producing partial
     results, if marker_validations is misaligned with discovery or holds an
-    inconsistent or fabricated entry (wrong presence, missing schema-validation
-    reason, evidence on a non-VALID_V2 result, or declared fields that violate the
-    schema-2 marker contract). These checks establish internal consistency only:
+    inconsistent or fabricated entry (wrong presence, presence that contradicts the
+    discovery record, missing schema-validation reason, evidence on a non-VALID_V2
+    result, or declared fields that violate the schema-2 marker contract). These
+    checks establish internal consistency only:
     a caller-built MarkerValidation cannot be authenticated, so a stable hash says
     nothing about whether the supplied marker claims are authentic.
 
